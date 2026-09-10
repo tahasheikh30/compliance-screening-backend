@@ -4,6 +4,10 @@ screening.db
 cache/*
 !cache/.gitkeep
 evidence/*.pdf
-evidence/screenshots/
+evidence/screenshots/*
 !evidence/.gitkeep
+!evidence/screenshots/.gitkeep
 .venv/
+.env
+.env.*
+!.env.example

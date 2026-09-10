@@ -70,6 +70,7 @@ def check(applicant_name: str, threshold: int = 60) -> dict:
             "score": None,
             "detail": "UNSC cache not populated — run refresh_cache() first.",
             "source_url": UNSC_XML_URL,
+            "available": False,
         }
 
     best_name, best_score = None, 0
@@ -83,4 +84,5 @@ def check(applicant_name: str, threshold: int = 60) -> dict:
         "score": best_score,
         "detail": f"Checked against {len(names)} UNSC names/aliases.",
         "source_url": UNSC_XML_URL,
+        "available": True,
     }

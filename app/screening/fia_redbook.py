@@ -125,9 +125,10 @@ def check(applicant_name: str, threshold: int = 60) -> dict:
         return {
             "matched_entry": None,
             "score": None,
-            "detail": "FIA Red Book cache not populated — run refresh_cache() first.",
+            "detail": "FIA Red Book cache not populated — upload a PDF via /api/admin/fia-redbook/upload first.",
             "source_url": FIA_PUBLICATIONS_PAGE,
             "page_number": None,
+            "available": False,
         }
 
     best_name, best_score = None, 0
@@ -146,6 +147,7 @@ def check(applicant_name: str, threshold: int = 60) -> dict:
         "detail": f"Checked against {len(names)} names in cached Red Book edition.",
         "source_url": FIA_PUBLICATIONS_PAGE,
         "page_number": page_number,
+        "available": True,
     }
 
 

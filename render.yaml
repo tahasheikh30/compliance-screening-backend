@@ -5,12 +5,14 @@ services:
     buildCommand: "pip install -r requirements.txt"
     startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.12.7
       - key: ALLOWED_ORIGINS
         value: "https://your-frontend.vercel.app"
+      - key: API_KEY
+        generateValue: true   # Render will generate and store a random secret
+      # - key: ANTHROPIC_API_KEY
+      #   value: "set this in the Render dashboard, not here — used for Claude-based adverse media search"
       # - key: ADVERSE_MEDIA_API_KEY
-      #   value: "set this in the Render dashboard, not here, if you go with a vendor"
+      #   value: "set this in the Render dashboard, not here, if you go with a dedicated AML vendor instead"
     disk:
       name: screening-data
       mountPath: /opt/render/project/src/data
