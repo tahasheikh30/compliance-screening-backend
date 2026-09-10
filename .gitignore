@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+screening.db
+cache/*
+!cache/.gitkeep
+evidence/*.pdf
+evidence/screenshots/
+!evidence/.gitkeep
+.venv/
