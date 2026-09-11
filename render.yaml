@@ -2,6 +2,7 @@ services:
   - type: web
     name: account-screening-backend
     runtime: python
+    plan: starter
     buildCommand: "pip install -r requirements.txt"
     startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
     envVars:
@@ -9,6 +10,8 @@ services:
         value: "https://your-frontend.vercel.app"
       - key: API_KEY
         generateValue: true   # Render will generate and store a random secret
+      - key: STORAGE_DIR
+        value: "/opt/render/project/src/data"   # must match disk.mountPath below exactly
       # - key: ANTHROPIC_API_KEY
       #   value: "set this in the Render dashboard, not here — used for Claude-based adverse media search"
       # - key: ADVERSE_MEDIA_API_KEY
@@ -17,3 +20,21 @@ services:
       name: screening-data
       mountPath: /opt/render/project/src/data
       sizeGB: 1
+
+# Starter plan (~$7/month) + a 1GB persistent disk (~$0.25/month) —
+# always-on (no cold starts), and local storage (SQLite DB, cached
+# watchlists, evidence PDFs) survives spin-downs and redeploys, unlike
+# free tier.
+#
+# IMPORTANT: attaching a disk only mounts a filesystem path — it does NOT
+# by itself tell this app to use it. The STORAGE_DIR env var above is what
+# actually does that (see app/config.py). If you rename the disk's
+# mountPath, update STORAGE_DIR to match, or the app will silently keep
+# writing to its default location inside the container instead of the
+# persistent disk, and you'll lose data on the next spin-down without any
+# error telling you why.
+#
+# To go back to free tier instead: set `plan: free`, delete the `disk:`
+# block (free tier doesn't support disks), and delete the STORAGE_DIR
+# line (falls back to a container-local path — see backend/README.md
+# "Deploying on the free tier instead" for what that trades off).

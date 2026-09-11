@@ -121,45 +121,81 @@ open-by-default:
   structured JSON verdict, screenshot the cited sources) applies to Gemini
   too if you'd prefer it.
 
-## Deploying to Render
+## Deploying to Render (Starter + persistent disk)
 
-1. Push this folder as its own repo, connect it to Render as a new Web
-   Service (Python runtime).
-2. Render will pick up `render.yaml` automatically if you use "Blueprint"
-   deploy, or set manually:
-   - Build command: `pip install -r requirements.txt`
-   - Start command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
-3. Set environment variables in the Render dashboard:
-   - `ALLOWED_ORIGINS` = your Vercel frontend URL(s), comma-separated
-   - `ADVERSE_MEDIA_API_KEY` / `ADVERSE_MEDIA_ENDPOINT` if using a vendor
+`render.yaml` is set up for Render's **Starter plan (~$7/month) plus a 1GB
+persistent disk (~$0.25/month)** — always-on (no cold starts), and the
+SQLite database, cached watchlists, and evidence PDFs all survive
+spin-downs and redeploys, since they live on the attached disk rather than
+the container's ephemeral local storage.
 
-### Important: persistent storage
+### Step-by-step
 
-Render's default filesystem is **ephemeral** — it resets on every deploy
-and restart. That means your SQLite database, cached watchlists, and
-**evidence PDFs will be lost** unless you attach a persistent disk.
+1. Push this `backend/` folder as its own Git repo (GitHub/GitLab/Bitbucket).
+2. In the Render dashboard: **New +** → **Blueprint** → connect that repo.
+   Render reads `render.yaml` directly — plan, disk, build/start commands
+   are already set.
+   (Alternatively: **New +** → **Web Service**, and fill in the fields
+   manually — instance type **Starter**, add a 1GB disk mounted at
+   `/opt/render/project/src/data`, build command
+   `pip install -r requirements.txt`, start command
+   `uvicorn app.main:app --host 0.0.0.0 --port $PORT`, and set the
+   `STORAGE_DIR` env var to that same mount path — see the warning below
+   about why this last step isn't optional.)
+3. Under **Environment**, confirm/add:
+   - `API_KEY` — `render.yaml` auto-generates one; copy it from the
+     dashboard once deployed (or set your own, see Security section above)
+   - `STORAGE_DIR` — must exactly match the disk's mount path
+     (`/opt/render/project/src/data` if you used the Blueprint/`render.yaml`
+     route). **Attaching a disk alone does nothing** — this env var is what
+     actually tells the app to write there instead of to the container's
+     ephemeral local storage. Get this wrong (or forget it) and the app
+     will run fine, evidence downloads will work fine, everything will look
+     fine — right up until the next spin-down silently wipes it all, with
+     no error to warn you.
+   - `ALLOWED_ORIGINS` — your Vercel frontend URL, e.g.
+     `https://your-app.vercel.app` (update and redeploy once you know it)
+   - `ANTHROPIC_API_KEY` or `ADVERSE_MEDIA_API_KEY` if using either for
+     adverse media
+4. Deploy. Note the `.onrender.com` URL — you'll need it for the
+   frontend's `VITE_API_BASE_URL`.
+5. Once live, initialize the caches (replace both placeholders):
+   ```bash
+   curl -X POST https://your-backend.onrender.com/api/admin/refresh-unsc \
+     -H "X-API-Key: your-api-key"
+   curl -X POST https://your-backend.onrender.com/api/admin/fia-redbook/upload \
+     -H "X-API-Key: your-api-key" \
+     -F "file=@/path/to/redbook.pdf"
+   ```
+   Because the disk persists, you only need to do this once — not after
+   every redeploy.
 
-`render.yaml` already requests a 1GB persistent disk mounted at
-`/opt/render/project/src/data`. All storage paths in this app read from
-`app/config.py`, which respects a `STORAGE_DIR` env var — Render sets this
-automatically when you use the disk config in `render.yaml`. If you're
-setting things up manually in the dashboard instead, add a disk and set
-`STORAGE_DIR` to its mount path yourself.
+### Deploying on the free tier instead
 
-For anything beyond a pilot, consider moving to Render's managed Postgres
-(free tier available) for the database and S3-compatible object storage
-(Cloudflare R2, AWS S3) for evidence PDFs — more durable than a single disk,
-and works across multiple instances if you ever scale up.
+If you'd rather not pay the ~$7.25/month, you can run this on Render's free
+tier — set `plan: free` in `render.yaml` and delete the `disk:` block
+entirely (free tier doesn't support disks). The trade-off: the service
+sleeps after 15 minutes idle (~30–60s cold start on the next request), and
+— the one that actually matters — **local files, including the SQLite
+database and every evidence PDF, are wiped on every spin-down, not just on
+redeploys.** Fine for demoing to compliance; not fine for evidence you need
+to still be there next week. See the "Do you need an API key?" section
+above and the earlier conversation in this project for the full trade-off
+writeup, including the free Neon+R2 alternative if you want to stay at $0
+without losing persistence (not yet built into this code — ask if you want
+it).
 
 ## Playwright (only needed for the adverse-media fallback)
 
-If you're not using a vendor API and want the search+screenshot fallback to
-work on Render, add this to your build command:
+If you're not using a vendor API or `ANTHROPIC_API_KEY`, and want the
+raw search+screenshot fallback to work on Render, add this to your build
+command:
 
 ```
 pip install -r requirements.txt && playwright install --with-deps chromium
 ```
 
-This adds real weight to the build and Render's free tier may struggle with
-it — another reason to prefer a vendor API for adverse media once you're
-past the pilot stage.
+This adds real weight to the build and Render's free tier (512MB RAM) may
+struggle to run a real Chromium instance reliably — another reason to
+prefer `ANTHROPIC_API_KEY` or a vendor for adverse media once you're past
+pure local testing.
