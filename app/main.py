@@ -13,7 +13,8 @@ Endpoints:
     GET  /api/applicants/{id}       -> full result detail for one applicant
     GET  /api/evidence/{result_id}  -> download the evidence PDF for a hit
     POST /api/admin/refresh-unsc    -> refresh the UNSC cache
-    POST /api/admin/fia-redbook/upload -> upload a Red Book PDF manually
+    POST /api/admin/fia-redbook/upload -> upload a Red Book PDF manually (replaces the current edition; old one is archived, not lost)
+    GET  /api/admin/fia-redbook/status -> what edition is currently loaded, and when
     POST /api/admin/refresh         -> legacy combined refresh (UNSC + FIA scrape)
 """
 
@@ -305,8 +306,18 @@ async def upload_fia_redbook(request: Request, file: UploadFile = File(...)):
         # both are attacker-controlled and easy to spoof.
         raise HTTPException(400, "File does not look like a valid PDF")
 
-    result = fia_redbook.ingest_uploaded_pdf(contents)
+    result = fia_redbook.ingest_uploaded_pdf(contents, original_filename=file.filename)
     return result
+
+
+@app.get("/api/admin/fia-redbook/status", dependencies=[Depends(require_api_key)])
+def fia_redbook_status(request: Request):
+    """
+    What Red Book edition is currently loaded (filename, when it was
+    loaded, how many names, how many older editions are archived) — check
+    this to confirm an upload actually took, without re-uploading anything.
+    """
+    return fia_redbook.get_status()
 
 
 @app.post("/api/admin/refresh", dependencies=[Depends(require_api_key)])

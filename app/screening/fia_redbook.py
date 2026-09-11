@@ -21,6 +21,8 @@ screenshot — the evidence is a rendered image of the actual PDF page
 containing the matched entry.
 """
 
+import hashlib
+import json
 import re
 from pathlib import Path
 from datetime import datetime, timezone
@@ -28,13 +30,70 @@ import requests
 from rapidfuzz import fuzz
 import pdfplumber
 import pymupdf as fitz  # PyMuPDF, for rendering a specific page as an image
-from app.config import CACHE_DIR
+from app.config import CACHE_DIR, FIA_REDBOOK_ARCHIVE_DIR
 
 FIA_PUBLICATIONS_PAGE = "https://www.fia.gov.pk/press-pub"
 FIA_BASE = "https://www.fia.gov.pk"
 
 PDF_CACHE = CACHE_DIR / "fia_redbook_latest.pdf"
 NAMES_CACHE = CACHE_DIR / "fia_redbook_names.txt"
+# Small JSON sidecar describing whatever edition is *currently* loaded —
+# so a compliance analyst can check what's active (GET /api/admin/fia-redbook/status)
+# without having to re-upload anything just to find out.
+META_CACHE = CACHE_DIR / "fia_redbook_meta.json"
+
+
+def _archive_current_edition() -> Path | None:
+    """
+    Copies the PDF (and parsed names) that are about to be replaced into
+    FIA_REDBOOK_ARCHIVE_DIR, timestamped, before overwriting the live cache.
+
+    This is what makes "just upload the new one" safe to do carelessly: the
+    old edition is never silently deleted, only superseded. If a past
+    screening HIT is ever questioned, you can pull the exact edition that
+    was active at the time from the archive rather than reconstructing it.
+    """
+    if not PDF_CACHE.exists():
+        return None
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive_pdf = FIA_REDBOOK_ARCHIVE_DIR / f"{ts}_redbook.pdf"
+    archive_pdf.write_bytes(PDF_CACHE.read_bytes())
+    if NAMES_CACHE.exists():
+        (FIA_REDBOOK_ARCHIVE_DIR / f"{ts}_names.txt").write_text(
+            NAMES_CACHE.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+    return archive_pdf
+
+
+def _write_metadata(source: str, names_found: int, original_filename: str | None = None) -> dict:
+    meta = {
+        "source": source,  # "upload" or "scrape"
+        "original_filename": original_filename,
+        "names_found": names_found,
+        "sha256": hashlib.sha256(PDF_CACHE.read_bytes()).hexdigest(),
+        "loaded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    META_CACHE.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return meta
+
+
+def get_status() -> dict:
+    """
+    What edition is currently loaded, and when/how it got there — so you
+    can confirm a swap worked (or check staleness) without downloading
+    anything. Backs GET /api/admin/fia-redbook/status.
+    """
+    if not META_CACHE.exists():
+        return {
+            "configured": False,
+            "detail": "No Red Book edition cached yet — upload one via "
+                       "POST /api/admin/fia-redbook/upload.",
+        }
+    meta = json.loads(META_CACHE.read_text(encoding="utf-8"))
+    meta["configured"] = True
+    archived = sorted(FIA_REDBOOK_ARCHIVE_DIR.glob("*_redbook.pdf"))
+    meta["previous_editions_archived"] = len(archived)
+    return meta
 
 
 def find_latest_pdf_url() -> str | None:
@@ -59,16 +118,19 @@ def refresh_cache() -> dict:
 
     resp = requests.get(url, timeout=60)
     resp.raise_for_status()
+
+    _archive_current_edition()
     PDF_CACHE.write_bytes(resp.content)
 
     names = _extract_names_from_pdf(PDF_CACHE)
     NAMES_CACHE.write_text("\n".join(names), encoding="utf-8")
+    meta = _write_metadata("scrape", len(names), original_filename=url)
 
     return {
         "status": "REFRESHED",
         "source_url": url,
         "names_found": len(names),
-        "refreshed_at": datetime.now(timezone.utc).isoformat(),
+        "refreshed_at": meta["loaded_at"],
         "note": "Have a compliance analyst spot-check parsed names before "
                 "trusting this edition in production.",
     }
@@ -95,19 +157,25 @@ def _extract_names_from_pdf(pdf_path: Path) -> list[str]:
     return list(dict.fromkeys(names))  # de-dupe, preserve order
 
 
-def ingest_uploaded_pdf(pdf_bytes: bytes) -> dict:
+def ingest_uploaded_pdf(pdf_bytes: bytes, original_filename: str | None = None) -> dict:
     """
     Use this instead of refresh_cache() when you're uploading the Red Book
     PDF yourself (e.g. downloaded manually from fia.gov.pk and reviewed by
     a compliance analyst first). Skips the scraper entirely.
+
+    This is a straight swap: whatever edition was previously live gets
+    archived (see _archive_current_edition) and the upload becomes the new
+    active edition — one call, no separate "delete the old one" step.
     """
+    _archive_current_edition()
     PDF_CACHE.write_bytes(pdf_bytes)
     names = _extract_names_from_pdf(PDF_CACHE)
     NAMES_CACHE.write_text("\n".join(names), encoding="utf-8")
+    meta = _write_metadata("upload", len(names), original_filename=original_filename)
     return {
         "status": "INGESTED",
         "names_found": len(names),
-        "ingested_at": datetime.now(timezone.utc).isoformat(),
+        "ingested_at": meta["loaded_at"],
         "note": "Spot-check a sample of these names against the PDF before "
                 "relying on this edition — table layout varies by year.",
     }
