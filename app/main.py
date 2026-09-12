@@ -14,9 +14,12 @@ Endpoints:
     GET  /api/evidence/{result_id}  -> download the evidence PDF for a hit
     GET  /api/admin/near-misses     -> audit log of scores that came close to a threshold without crossing it
     POST /api/admin/refresh-unsc    -> refresh the UNSC cache
+    POST /api/admin/refresh-ofac    -> refresh the OFAC SDN + Consolidated Non-SDN caches
+    POST /api/admin/refresh-uksl    -> refresh the UK Sanctions List cache
     POST /api/admin/fia-redbook/upload -> upload a Red Book PDF manually (replaces the current edition; old one is archived, not lost)
     GET  /api/admin/fia-redbook/status -> what edition is currently loaded, and when
-    POST /api/admin/refresh         -> legacy combined refresh (UNSC + FIA scrape)
+    POST /api/admin/refresh         -> combined refresh of every source with a free automated feed (UNSC, OFAC,
+                                        UKSL, FIA scrape) — partial failures are reported per-source, not fatal
 """
 
 from pathlib import Path
@@ -34,7 +37,7 @@ from slowapi.errors import RateLimitExceeded
 from app import database as db
 from app.config import SCREENSHOT_DIR, MATCH_THRESHOLD, REVIEW_THRESHOLD
 from app.schemas import ScreenRequest, ScreenResponse, ScreeningResultOut, ApplicantSummary, NearMissEntry
-from app.screening import unsc, fia_redbook, adverse_media
+from app.screening import unsc, ofac, uksl, fia_redbook, adverse_media
 from app import evidence
 from app.auth import require_api_key
 
@@ -127,6 +130,67 @@ def _log_near_miss_if_any(applicant_id: int, source: str, result: dict, now: str
         )
 
 
+def _process_structured_source(
+    applicant_id: int, req: ScreenRequest, now: str,
+    source_key: str, evidence_source_label: str, result: dict,
+    statuses: list, results_out: list,
+):
+    """
+    Shared handling for any source whose evidence is purely structured
+    data — no webpage/PDF screenshot to embed. UNSC, OFAC, and UKSL all
+    fit this shape (a downloaded list, matched by name, nothing to
+    photograph); FIA Red Book (renders a PDF page image) and Adverse
+    Media (screenshots a webpage) don't, so those two stay as their own
+    blocks below rather than being folded into this helper.
+
+    Behavior is intentionally identical to the original UNSC-only block
+    this replaced — same HIT/else branching, same evidence-PDF call
+    shape, same near-miss logging — just parameterized by source name so
+    adding OFAC/UKSL didn't mean copy-pasting ~35 lines twice more.
+    Mutates `statuses` and `results_out` in place (matches the calling
+    style already used for FIA Red Book and Adverse Media below).
+    """
+    status = _status_for(result)
+    statuses.append(status)
+    _log_near_miss_if_any(applicant_id, source_key, result, now)
+    if status == "HIT":
+        result_id = db.insert_result(
+            applicant_id, source_key, result["matched_entry"], result["score"],
+            status, result["detail"], None, now,
+            cnic_match=result.get("cnic_match", False),
+        )
+        pdf_path = evidence.generate_evidence_pdf(
+            req.full_name, req.cnic, evidence_source_label,
+            result["matched_entry"], result["score"], result["source_url"],
+            image_path=None,  # structured data feed, not a webpage — no screenshot
+            result_id=result_id,
+            cnic_match=result.get("cnic_match", False),
+            breakdown=result.get("breakdown"),
+        )
+        evidence_file = pdf_path.name
+        with db.get_conn() as conn:
+            conn.execute("UPDATE screening_results SET evidence_file = ? WHERE id = ?",
+                         (evidence_file, result_id))
+            conn.commit()
+        results_out.append(ScreeningResultOut(
+            id=result_id, source=source_key, matched_entry=result["matched_entry"],
+            score=result["score"], status=status, detail=result["detail"],
+            evidence_file=evidence_file, checked_at=now,
+            cnic_match=result.get("cnic_match", False), near_miss=result.get("near_miss", False),
+        ))
+    else:
+        rid = db.insert_result(applicant_id, source_key, result["matched_entry"], result["score"],
+                                status, result["detail"], None, now,
+                                cnic_match=result.get("cnic_match", False),
+                                near_miss=result.get("near_miss", False))
+        results_out.append(ScreeningResultOut(
+            id=rid, source=source_key, matched_entry=result["matched_entry"],
+            score=result["score"], status=status, detail=result["detail"],
+            evidence_file=None, checked_at=now,
+            cnic_match=result.get("cnic_match", False), near_miss=result.get("near_miss", False),
+        ))
+
+
 @app.post("/api/screen", response_model=ScreenResponse, dependencies=[Depends(require_api_key)])
 @limiter.limit("10/minute")
 def screen_applicant(request: Request, req: ScreenRequest):
@@ -138,45 +202,24 @@ def screen_applicant(request: Request, req: ScreenRequest):
 
     # --- UNSC ---
     unsc_result = unsc.check(req.full_name, threshold=REVIEW_THRESHOLD)
-    status = _status_for(unsc_result)
-    statuses.append(status)
-    _log_near_miss_if_any(applicant_id, "UNSC", unsc_result, now)
-    if status == "HIT":
-        result_id_placeholder = db.insert_result(
-            applicant_id, "UNSC", unsc_result["matched_entry"], unsc_result["score"],
-            status, unsc_result["detail"], None, now,
-            cnic_match=unsc_result.get("cnic_match", False),
-        )
-        pdf_path = evidence.generate_evidence_pdf(
-            req.full_name, req.cnic, "UNSC Consolidated Sanctions List",
-            unsc_result["matched_entry"], unsc_result["score"], unsc_result["source_url"],
-            image_path=None,  # UNSC is a static data feed, not a webpage — no screenshot
-            result_id=result_id_placeholder,
-            cnic_match=unsc_result.get("cnic_match", False),
-            breakdown=unsc_result.get("breakdown"),
-        )
-        evidence_file = pdf_path.name
-        with db.get_conn() as conn:
-            conn.execute("UPDATE screening_results SET evidence_file = ? WHERE id = ?",
-                         (evidence_file, result_id_placeholder))
-            conn.commit()
-        results_out.append(ScreeningResultOut(
-            id=result_id_placeholder, source="UNSC", matched_entry=unsc_result["matched_entry"],
-            score=unsc_result["score"], status=status, detail=unsc_result["detail"],
-            evidence_file=evidence_file, checked_at=now,
-            cnic_match=unsc_result.get("cnic_match", False), near_miss=unsc_result.get("near_miss", False),
-        ))
-    else:
-        rid = db.insert_result(applicant_id, "UNSC", unsc_result["matched_entry"], unsc_result["score"],
-                                status, unsc_result["detail"], None, now,
-                                cnic_match=unsc_result.get("cnic_match", False),
-                                near_miss=unsc_result.get("near_miss", False))
-        results_out.append(ScreeningResultOut(
-            id=rid, source="UNSC", matched_entry=unsc_result["matched_entry"],
-            score=unsc_result["score"], status=status, detail=unsc_result["detail"],
-            evidence_file=None, checked_at=now,
-            cnic_match=unsc_result.get("cnic_match", False), near_miss=unsc_result.get("near_miss", False),
-        ))
+    _process_structured_source(
+        applicant_id, req, now, "UNSC", "UNSC Consolidated Sanctions List",
+        unsc_result, statuses, results_out,
+    )
+
+    # --- OFAC (SDN + Consolidated Non-SDN) ---
+    ofac_result = ofac.check(req.full_name, threshold=REVIEW_THRESHOLD)
+    _process_structured_source(
+        applicant_id, req, now, "OFAC", "OFAC Sanctions List (SDN / Consolidated Non-SDN)",
+        ofac_result, statuses, results_out,
+    )
+
+    # --- UK Sanctions List (FCDO) ---
+    uksl_result = uksl.check(req.full_name, threshold=REVIEW_THRESHOLD)
+    _process_structured_source(
+        applicant_id, req, now, "UKSL", "UK Sanctions List (FCDO)",
+        uksl_result, statuses, results_out,
+    )
 
     # --- FIA Red Book ---
     fia_result = fia_redbook.check(req.full_name, applicant_cnic=req.cnic, threshold=REVIEW_THRESHOLD)
@@ -335,6 +378,27 @@ def refresh_unsc_cache(request: Request):
     return unsc.refresh_cache()
 
 
+@app.post("/api/admin/refresh-ofac", dependencies=[Depends(require_api_key)])
+@limiter.limit("5/hour")
+def refresh_ofac_cache(request: Request):
+    """Refresh the OFAC SDN + Consolidated Non-SDN caches. Safe to call on a daily schedule."""
+    return ofac.refresh_cache()
+
+
+@app.post("/api/admin/refresh-uksl", dependencies=[Depends(require_api_key)])
+@limiter.limit("5/hour")
+def refresh_uksl_cache(request: Request):
+    """
+    Refresh the UK Sanctions List cache. Safe to call on a daily schedule.
+    Unlike the other refresh endpoints, this one first re-resolves the
+    current CSV download link from the gov.uk publication page (see
+    app/screening/uksl.py) — if FCDO changes that page's layout, this
+    will start raising instead of silently serving a stale list; watch
+    for that failure mode specifically if this endpoint starts erroring.
+    """
+    return uksl.refresh_cache()
+
+
 @app.post("/api/admin/fia-redbook/upload", dependencies=[Depends(require_api_key)])
 @limiter.limit("10/hour")
 async def upload_fia_redbook(request: Request, file: UploadFile = File(...)):
@@ -371,13 +435,30 @@ def fia_redbook_status(request: Request):
 @limiter.limit("5/hour")
 def refresh_caches(request: Request):
     """
-    Legacy combined refresh — attempts the FIA scraper too. Prefer
-    /api/admin/refresh-unsc + /api/admin/fia-redbook/upload if you're
-    managing the Red Book edition manually.
+    Combined refresh of every source with a free, automated feed (UNSC,
+    OFAC, UKSL, and the FIA scraper). Prefer the dedicated per-source
+    endpoints (/api/admin/refresh-unsc, -ofac, -uksl) + the manual FIA
+    Red Book upload if you're managing editions individually.
+
+    Each source is refreshed independently and a failure in one does NOT
+    stop the others from running — unlike the single-list version of
+    this endpoint, a UKSL page-layout change (see app/screening/uksl.py)
+    or a transient OFAC/UN timeout will no longer silently prevent the
+    other three from refreshing. Check each entry's "error" key; a
+    missing key means that source refreshed successfully.
     """
-    unsc_status = unsc.refresh_cache()
-    fia_status = fia_redbook.refresh_cache()
-    return {"unsc": unsc_status, "fia_redbook": fia_status}
+    results = {}
+    for name, refresh_fn in (
+        ("unsc", unsc.refresh_cache),
+        ("ofac", ofac.refresh_cache),
+        ("uksl", uksl.refresh_cache),
+        ("fia_redbook", fia_redbook.refresh_cache),
+    ):
+        try:
+            results[name] = refresh_fn()
+        except Exception as e:
+            results[name] = {"error": str(e)}
+    return results
 
 
 @app.get("/api/health")

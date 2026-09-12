@@ -1,8 +1,10 @@
 # Account Screening — Backend
 
 FastAPI service that screens applicant names against the UNSC sanctions
-list, a manually-uploaded FIA Red Book PDF, and (optionally) an
-adverse-media vendor API. Produces a downloadable evidence PDF for any hit.
+list, the OFAC (US Treasury) SDN + Consolidated Non-SDN lists, the UK
+Sanctions List (FCDO), a manually-uploaded FIA Red Book PDF, and
+(optionally) an adverse-media vendor API. Produces a downloadable evidence
+PDF for any hit.
 
 ## Local development
 
@@ -14,11 +16,40 @@ export $(cat .env | xargs)   # or use python-dotenv / your own process manager
 uvicorn app.main:app --reload --port 8000
 ```
 
-Populate the UNSC cache once (free, no key needed):
+Populate the UNSC, OFAC, and UKSL caches once (all free, no key needed).
+These are stable, official government feeds, but they're still someone
+else's website — refresh once and check the response before trusting it:
 
 ```bash
 curl -X POST http://localhost:8000/api/admin/refresh-unsc -H "X-API-Key: $API_KEY"
+curl -X POST http://localhost:8000/api/admin/refresh-ofac -H "X-API-Key: $API_KEY"
+curl -X POST http://localhost:8000/api/admin/refresh-uksl -H "X-API-Key: $API_KEY"
+# or all three (+ the FIA scraper attempt) in one call, with per-source
+# failures reported instead of aborting the others:
+curl -X POST http://localhost:8000/api/admin/refresh -H "X-API-Key: $API_KEY"
 ```
+
+Then sanity-check the parse actually worked before relying on it — an
+empty or wildly-off count usually means the source changed its page/file
+layout, not that the list is genuinely empty:
+
+```bash
+python3 -c "
+from app.screening import unsc, ofac, uksl
+print('UNSC names:', len(unsc._load_names()))
+print('OFAC SDN names:', len(ofac._load_names(ofac.SDN_CACHE_FILE)))
+print('OFAC Consolidated names:', len(ofac._load_names(ofac.CONSOLIDATED_CACHE_FILE)))
+print('UKSL names:', len(uksl._load_names()))
+"
+```
+
+OFAC's SDN list alone is on the order of tens of thousands of names —
+if you see a handful instead, the field-name assumptions in
+`app/screening/ofac.py`/`uksl.py` (documented in each module's docstring)
+likely need adjusting against the actual current file layout; this repo's
+sandboxed dev environment couldn't reach treasury.gov or gov.uk to verify
+that ahead of time, so this check is genuinely load-bearing, not optional
+boilerplate.
 
 Upload the FIA Red Book PDF manually — download the latest edition from
 fia.gov.pk yourself, glance over it, then upload it:
@@ -195,6 +226,18 @@ open-by-default:
 
 ### Before you consider this production-ready
 
+- **OFAC and UKSL field-name assumptions are unverified against a live
+  download.** `app/screening/ofac.py` and `uksl.py` were written from
+  each source's published format documentation, in a sandboxed
+  environment with no network access to treasury.gov or gov.uk. The
+  parsing logic itself was tested against synthetic fixtures that match
+  the documented schemas exactly, and both modules compile, import, and
+  run correctly end-to-end through the matching engine — but "matches
+  the docs" and "matches what the government actually ships today" are
+  different claims. Run `/api/admin/refresh-ofac` and
+  `/api/admin/refresh-uksl` once after deploying and check the parsed
+  name counts (see the command above) before trusting either source in
+  production.
 - PII sits in a plain SQLite file (or your Postgres, if you migrate) with no
   encryption at rest. If Render's disk-level encryption isn't sufficient for
   your compliance requirements, add application-level encryption for the
@@ -222,6 +265,15 @@ open-by-default:
 ## Do you need an API key?
 
 - **UNSC** — no, free public feed.
+- **OFAC (SDN + Consolidated Non-SDN)** — no, free public feed from the
+  US Treasury, no login.
+- **UK Sanctions List (FCDO)** — no, free public feed from gov.uk, no
+  login. One wrinkle: unlike UNSC/OFAC there's no fixed file URL — FCDO
+  publishes a new download link every time the list updates, so
+  `app/screening/uksl.py` scrapes the current link off the gov.uk
+  publication page before downloading it. If that page's HTML layout
+  ever changes, refreshing will start failing loudly (not silently) —
+  see the module docstring.
 - **FIA Red Book** — no, you're uploading it yourself.
 - **Adverse media** — the check tries three modes, in this order:
   1. **Vendor API** (`ADVERSE_MEDIA_API_KEY` set) — a dedicated AML vendor
