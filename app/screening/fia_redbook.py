@@ -8,17 +8,27 @@ in true real time; the practical approach is:
 
   1. A scheduled job (weekly) checks the FIA publications page for a new
      Red Book PDF link and downloads it if the link has changed.
-  2. The PDF's text/tables are parsed into a name list and cached.
+  2. The PDF's text/tables are parsed into a name list (and CNIC, where the
+     edition's table includes one) and cached.
   3. A compliance analyst spot-checks the parsed list once per new edition
-     (table layouts have changed across editions, so blind trust in the
-     parser is not safe).
+     — table layouts have changed across editions, so blind trust in the
+     parser is not safe, and this code does not claim to solve that; it
+     only makes the extraction more resilient than a single regex pass.
   4. Applicant screening then runs against the cached, analyst-approved
-     name list — same fuzzy-match approach as UNSC.
+     name list, using the shared matching engine in
+     app.screening.matching (normalization + multi-algorithm scoring) plus
+     an exact-CNIC check where both sides have one.
 
 The page-image rendering (render_matched_page) is what produces the
 "proof" artifact for a Red Book hit, since there's no webpage URL to
 screenshot — the evidence is a rendered image of the actual PDF page
 containing the matched entry.
+
+CACHE FILE FORMAT: NAMES_CACHE stores one entry per line as
+"Name|CNIC" — CNIC is empty when the edition's table didn't have one or
+extraction couldn't find it for that row. Older caches with plain
+one-name-per-line (no "|") are still read correctly (CNIC treated as
+absent) for backward compatibility.
 """
 
 import hashlib
@@ -27,10 +37,10 @@ import re
 from pathlib import Path
 from datetime import datetime, timezone
 import requests
-from rapidfuzz import fuzz
 import pdfplumber
 import pymupdf as fitz  # PyMuPDF, for rendering a specific page as an image
 from app.config import CACHE_DIR, FIA_REDBOOK_ARCHIVE_DIR
+from app.screening import matching
 
 FIA_PUBLICATIONS_PAGE = "https://www.fia.gov.pk/press-pub"
 FIA_BASE = "https://www.fia.gov.pk"
@@ -41,6 +51,8 @@ NAMES_CACHE = CACHE_DIR / "fia_redbook_names.txt"
 # so a compliance analyst can check what's active (GET /api/admin/fia-redbook/status)
 # without having to re-upload anything just to find out.
 META_CACHE = CACHE_DIR / "fia_redbook_meta.json"
+
+_NAME_LINE_RE = re.compile(r"^[A-Za-z][A-Za-z .'-]{2,}$")
 
 
 def _archive_current_edition() -> Path | None:
@@ -65,11 +77,13 @@ def _archive_current_edition() -> Path | None:
     return archive_pdf
 
 
-def _write_metadata(source: str, names_found: int, original_filename: str | None = None) -> dict:
+def _write_metadata(source: str, names_found: int, cnics_found: int,
+                     original_filename: str | None = None) -> dict:
     meta = {
         "source": source,  # "upload" or "scrape"
         "original_filename": original_filename,
         "names_found": names_found,
+        "cnics_found": cnics_found,
         "sha256": hashlib.sha256(PDF_CACHE.read_bytes()).hexdigest(),
         "loaded_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -122,39 +136,105 @@ def refresh_cache() -> dict:
     _archive_current_edition()
     PDF_CACHE.write_bytes(resp.content)
 
-    names = _extract_names_from_pdf(PDF_CACHE)
-    NAMES_CACHE.write_text("\n".join(names), encoding="utf-8")
-    meta = _write_metadata("scrape", len(names), original_filename=url)
+    entries = _extract_entries_from_pdf(PDF_CACHE)
+    _save_entries(entries)
+    cnics_found = sum(1 for _, c in entries if c)
+    meta = _write_metadata("scrape", len(entries), cnics_found, original_filename=url)
 
     return {
         "status": "REFRESHED",
         "source_url": url,
-        "names_found": len(names),
+        "names_found": len(entries),
+        "cnics_found": cnics_found,
         "refreshed_at": meta["loaded_at"],
-        "note": "Have a compliance analyst spot-check parsed names before "
-                "trusting this edition in production.",
+        "note": "Have a compliance analyst spot-check parsed names (and CNICs, "
+                "if present in this edition) before trusting this edition in production.",
     }
 
 
-def _extract_names_from_pdf(pdf_path: Path) -> list[str]:
+def _extract_entries_from_pdf(pdf_path: Path) -> list[tuple[str, str | None]]:
     """
-    Placeholder extraction — Red Book tables vary by edition. Prefer
-    page.extract_table() where the PDF has real table structure; fall
-    back to this regex heuristic otherwise. Replace/tune once you have
-    a sample PDF from the current edition to test against.
+    Extracts (name, cnic_or_None) pairs from the Red Book PDF.
+
+    Red Book table layouts vary by edition, so this tries strategies in
+    order of reliability and falls back gracefully:
+
+      1. Real table structure (page.extract_table()) — if a row has a
+         column that looks like a name and (optionally) a column that
+         contains a CNIC pattern, use both. This is the most reliable
+         path when the PDF actually has table structure.
+      2. Plain text fallback — if no table is detected on a page, scan
+         its text line by line: a CNIC pattern found near a name-shaped
+         line is associated with that line; a name-shaped line with no
+         nearby CNIC is still kept (name-only entry).
+
+    This is still fundamentally a best-effort heuristic extraction, not a
+    guaranteed-correct parser — the README and get_status()/refresh_cache()
+    responses deliberately keep saying so. A compliance analyst reviewing
+    a sample of parsed entries against the source PDF after every new
+    edition remains a required step, not an optional nicety.
     """
-    names = []
+    entries: list[tuple[str, str | None]] = []
+    seen_names = set()
+
+    def _maybe_add(name: str, cnic: str | None):
+        name = name.strip()
+        if not name or not _NAME_LINE_RE.match(name):
+            return
+        key = name.lower()
+        if key in seen_names:
+            return
+        seen_names.add(key)
+        entries.append((name, cnic))
+
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
             table = page.extract_table()
             if table:
+                # Guess which column is the name column: the one whose
+                # cells most often match the name-shaped regex.
+                if table:
+                    ncols = max(len(row) for row in table if row)
+                    col_hits = [0] * ncols
+                    for row in table:
+                        for i, cell in enumerate(row or []):
+                            if cell and _NAME_LINE_RE.match(cell.strip()):
+                                col_hits[i] += 1
+                    name_col = col_hits.index(max(col_hits)) if col_hits else 0
+
                 for row in table:
-                    if row and row[0] and re.match(r"^[A-Za-z ]{4,}$", row[0].strip()):
-                        names.append(row[0].strip())
+                    if not row or name_col >= len(row) or not row[name_col]:
+                        continue
+                    name_cell = row[name_col].strip()
+                    cnic = None
+                    for cell in row:
+                        if cell:
+                            found = matching.extract_cnic(cell)
+                            if found:
+                                cnic = found
+                                break
+                    _maybe_add(name_cell, cnic)
             else:
                 text = page.extract_text() or ""
-                names.extend(re.findall(r"\b([A-Z][a-z]+(?:\s[A-Z][a-z]+){1,3})\b", text))
-    return list(dict.fromkeys(names))  # de-dupe, preserve order
+                lines = text.splitlines()
+                for i, line in enumerate(lines):
+                    for candidate in re.findall(
+                        r"\b([A-Z][a-z]+(?:\s[A-Z][a-z]+){1,3})\b", line
+                    ):
+                        # Look at this line and the next for a CNIC that
+                        # likely belongs to the same record.
+                        window = line
+                        if i + 1 < len(lines):
+                            window += " " + lines[i + 1]
+                        cnic = matching.extract_cnic(window)
+                        _maybe_add(candidate, cnic)
+
+    return entries
+
+
+def _save_entries(entries: list[tuple[str, str | None]]) -> None:
+    lines = [f"{name}|{cnic or ''}" for name, cnic in entries]
+    NAMES_CACHE.write_text("\n".join(lines), encoding="utf-8")
 
 
 def ingest_uploaded_pdf(pdf_bytes: bytes, original_filename: str | None = None) -> dict:
@@ -169,27 +249,39 @@ def ingest_uploaded_pdf(pdf_bytes: bytes, original_filename: str | None = None) 
     """
     _archive_current_edition()
     PDF_CACHE.write_bytes(pdf_bytes)
-    names = _extract_names_from_pdf(PDF_CACHE)
-    NAMES_CACHE.write_text("\n".join(names), encoding="utf-8")
-    meta = _write_metadata("upload", len(names), original_filename=original_filename)
+    entries = _extract_entries_from_pdf(PDF_CACHE)
+    _save_entries(entries)
+    cnics_found = sum(1 for _, c in entries if c)
+    meta = _write_metadata("upload", len(entries), cnics_found, original_filename=original_filename)
     return {
         "status": "INGESTED",
-        "names_found": len(names),
+        "names_found": len(entries),
+        "cnics_found": cnics_found,
         "ingested_at": meta["loaded_at"],
-        "note": "Spot-check a sample of these names against the PDF before "
-                "relying on this edition — table layout varies by year.",
+        "note": "Spot-check a sample of these names (and CNICs, if this edition's "
+                "table includes them) against the PDF before relying on this "
+                "edition — table layout varies by year.",
     }
 
 
-def _load_names() -> list[str]:
+def _load_entries() -> list[tuple[str, str | None]]:
     if not NAMES_CACHE.exists():
         return []
-    return [n for n in NAMES_CACHE.read_text(encoding="utf-8").splitlines() if n.strip()]
+    out = []
+    for line in NAMES_CACHE.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        if "|" in line:
+            name, cnic = line.split("|", 1)
+            out.append((name, cnic or None))
+        else:
+            out.append((line, None))  # backward-compat with old cache format
+    return out
 
 
-def check(applicant_name: str, threshold: int = 60) -> dict:
-    names = _load_names()
-    if not names:
+def check(applicant_name: str, applicant_cnic: str | None = None, threshold: float = 60) -> dict:
+    entries = _load_entries()
+    if not entries:
         return {
             "matched_entry": None,
             "score": None,
@@ -197,25 +289,43 @@ def check(applicant_name: str, threshold: int = 60) -> dict:
             "source_url": FIA_PUBLICATIONS_PAGE,
             "page_number": None,
             "available": False,
+            "near_miss": False,
+            "cnic_match": False,
         }
 
-    best_name, best_score = None, 0
-    for entry in names:
-        score = fuzz.token_sort_ratio(applicant_name.lower(), entry.lower())
-        if score > best_score:
-            best_name, best_score = entry, score
+    names = [n for n, _ in entries]
+    best = matching.find_best_match(applicant_name, names, threshold)
+
+    # CNIC is checked independently of the name score — a shared CNIC is
+    # direct identity evidence and should surface even if the name score
+    # (e.g. due to a nickname or transliteration this module doesn't know
+    # about) happens to land below threshold.
+    cnic_hit_name = None
+    if applicant_cnic:
+        for name, cnic in entries:
+            if matching.cnic_exact_match(applicant_cnic, cnic):
+                cnic_hit_name = name
+                break
 
     page_number = None
-    if best_score >= threshold and PDF_CACHE.exists():
-        page_number = _find_page_for_name(best_name)
+    matched_for_page = best.matched_entry or cnic_hit_name
+    if matched_for_page and PDF_CACHE.exists():
+        page_number = _find_page_for_name(matched_for_page)
+
+    detail = f"Checked against {len(entries)} names in cached Red Book edition. {best.detail}"
+    if cnic_hit_name:
+        detail += f" CNIC exact match found against entry '{cnic_hit_name}' — treat as confirmed identity evidence."
 
     return {
-        "matched_entry": best_name if best_score >= threshold else None,
-        "score": best_score,
-        "detail": f"Checked against {len(names)} names in cached Red Book edition.",
+        "matched_entry": best.matched_entry or cnic_hit_name,
+        "score": best.score,
+        "detail": detail,
         "source_url": FIA_PUBLICATIONS_PAGE,
         "page_number": page_number,
         "available": True,
+        "near_miss": best.near_miss,
+        "cnic_match": bool(cnic_hit_name),
+        "breakdown": best.breakdown,
     }
 
 

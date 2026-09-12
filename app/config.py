@@ -1,5 +1,6 @@
 """
-Central place for where data lives on disk.
+Central place for where data lives on disk, plus the screening thresholds
+that decide HIT / REVIEW / CLEAR.
 
 Locally, everything defaults to folders inside backend/ (fine for dev).
 
@@ -30,3 +31,24 @@ FIA_REDBOOK_ARCHIVE_DIR = CACHE_DIR / "fia_redbook_archive"
 
 for d in (CACHE_DIR, EVIDENCE_DIR, SCREENSHOT_DIR, FIA_REDBOOK_ARCHIVE_DIR):
     d.mkdir(parents=True, exist_ok=True)
+
+
+# --- Matching thresholds -----------------------------------------------
+# Score is 0-100 from app/screening/matching.py's combined algorithm.
+# These are configurable via env vars so they can be tuned per deployment
+# without a code change — but changing them should still go through the
+# same review a compliance policy change would, not be done casually.
+# There is no universally "correct" threshold: raising it reduces false
+# positives (fewer innocent applicants flagged) at the cost of missing
+# more true matches, and lowering it does the reverse. Tune against a
+# labeled test set (see tests/test_matching.py for a starting point) and
+# get sign-off from compliance before changing these in production.
+MATCH_THRESHOLD = float(os.environ.get("MATCH_THRESHOLD", "85"))   # score >= this => HIT
+REVIEW_THRESHOLD = float(os.environ.get("REVIEW_THRESHOLD", "60"))  # score >= this => REVIEW
+
+# How many points below REVIEW_THRESHOLD a score can fall and still get
+# logged to the near-miss audit trail (see app/screening/matching.py and
+# database.insert_near_miss). This does NOT change any applicant's status —
+# it only controls what gets written to the audit log for periodic
+# compliance review.
+NEAR_MISS_MARGIN = float(os.environ.get("NEAR_MISS_MARGIN", "10"))

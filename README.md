@@ -31,6 +31,90 @@ curl -X POST http://localhost:8000/api/admin/fia-redbook/upload \
 
 Re-run that upload whenever a new edition is published (roughly annual).
 
+Run the test suite (matching accuracy is the part most worth continuously
+checking as you tune thresholds or extend the transliteration list):
+
+```bash
+pytest tests/ -v
+```
+
+## Matching accuracy
+
+Name screening is fuzzy by nature — this section explains how matching
+works now, what it fixes over a naive single-ratio approach, and what it
+still doesn't guarantee. All of this lives in `app/screening/matching.py`.
+
+**Normalization before comparison.** Both the applicant name and every
+watchlist entry are lowercased, stripped of diacritics/punctuation, and
+had honorifics removed (Syed, Haji, Sheikh, Dr., etc.) before scoring —
+otherwise formatting noise alone can push a real match below threshold.
+A conservative, hand-maintained list also maps common transliteration
+variants to one canonical form (Mohammad/Mohammed/Muhammed → muhammad,
+Yousaf/Yusuf/Yousif → yousuf, and similar) — this is not a general
+transliteration engine, and it's meant to be extended over time as real
+mismatches surface, not treated as complete.
+
+**Multiple algorithms, combined deliberately.** Rather than a single
+`fuzz.token_sort_ratio()` call, each comparison runs `token_sort_ratio`,
+`token_set_ratio`, `WRatio`, and (guarded — see below) `partial_ratio`,
+and takes the maximum. Each algorithm has a different blind spot:
+`token_sort_ratio` misses cases where the applicant supplied fewer name
+parts than the watchlist entry; `token_set_ratio` handles that but can
+over-match on very short tokens in isolation; `partial_ratio` catches
+truncated/abbreviated entries but will treat any short name as "matched"
+if it happens to appear as a substring of a longer unrelated name (e.g.
+"Ali" inside "Alistair") — so it's only trusted once the shorter side of
+the comparison has at least two tokens or is reasonably long on its own.
+This combination is covered by `tests/test_matching.py`, including a
+regression test for that exact substring false-positive.
+
+Taking the **maximum** across algorithms, rather than an average, is a
+deliberate choice: for a compliance screen, a missed true match is the
+worse failure mode, and every result at REVIEW or above still routes to a
+human analyst, so a slightly noisier top score is an acceptable trade for
+not averaging a real match down below threshold.
+
+**CNIC is a separate, stronger signal.** If the applicant supplied a CNIC
+and it exactly matches an entry's CNIC (currently only the FIA Red Book
+source captures CNICs, where the PDF edition includes them), that result
+is escalated to `HIT` *regardless of the name fuzzy score* — a shared
+13-digit national ID number is direct identity evidence, not a fuzzy
+inference, and the API surfaces this distinctly via a `cnic_match` field
+on every result plus a loud banner on the evidence PDF.
+
+**Near misses are logged, not just cleared.** Any score that lands within
+`NEAR_MISS_MARGIN` points (default 10) below `REVIEW_THRESHOLD` without
+crossing it is written to an append-only audit table
+(`GET /api/admin/near-misses`). This doesn't change the applicant's
+status — it exists so a compliance analyst can periodically check where
+real traffic is actually landing relative to the thresholds, instead of
+setting `MATCH_THRESHOLD`/`REVIEW_THRESHOLD` once and never revisiting them.
+
+**What this does NOT solve, and shouldn't be sold as solving:**
+- Fuzzy name matching is inherently probabilistic. This is a meaningfully
+  stronger implementation than a single fuzzy ratio, not a guarantee of
+  zero false negatives or false positives.
+- The transliteration variant list is hand-curated and will miss names it
+  hasn't seen. Treat it as a living document — extend it from real
+  mismatches, don't assume it's exhaustive.
+- FIA Red Book extraction (`app/screening/fia_redbook.py`) is still
+  best-effort PDF parsing — this version tries real table structure first
+  and falls back to a text-scan heuristic, and now also attempts to pull
+  a CNIC column when present, but Red Book table layouts change across
+  editions. A compliance analyst spot-checking a sample of parsed
+  names/CNICs against the source PDF after every new edition is a
+  required step, not an optional nicety — `get_status()` /
+  `ingest_uploaded_pdf()` responses say this explicitly.
+- `MATCH_THRESHOLD` / `REVIEW_THRESHOLD` (env-configurable, defaults
+  85/60) are reasonable starting points, not values validated against
+  your actual applicant population. Tune them against labeled data and
+  the near-miss log, with compliance sign-off, before treating them as
+  final.
+- Every HIT/REVIEW result routes to a human compliance analyst by design
+  (see "No silent false-clears" below). That routing is load-bearing, not
+  a formality — this tool is a screening aid, not an automated
+  adjudicator.
+
 ## Security
 
 This handles applicant PII (names, CNICs) and produces evidence used in
@@ -61,6 +145,10 @@ open-by-default:
   not `CLEAR`, and the applicant is routed to manual review rather than
   auto-cleared. A check that didn't run must never look identical to a
   check that came back clean.
+- **CNIC overrides a weak name score, never the reverse** — an exact CNIC
+  match always escalates to `HIT`, but a *lack* of a CNIC match never
+  downgrades a name-based HIT/REVIEW. CNIC is additive evidence only.
+- **Near-miss audit trail** — see "Matching accuracy" above.
 - **Security headers + no caching of PII** — responses set
   `X-Content-Type-Options`, `X-Frame-Options: DENY`, and `Cache-Control:
   no-store` on all `/api/*` responses.
@@ -88,10 +176,19 @@ open-by-default:
   with a small trusted team; not fine once more than a couple of people use
   this or it needs to survive a regulator asking "who screened this
   applicant."
-- No automated tests are wired into CI here — I ran manual smoke tests
-  (auth enforcement, rate limiting, upload validation, the NOT_CONFIGURED
-  status fix) during development, but there's no regression suite. Worth
-  adding before this becomes load-bearing.
+- Automated tests now cover the matching engine specifically
+  (`tests/test_matching.py` — normalization, multi-algorithm scoring, the
+  short-name/substring false-positive guard, CNIC matching, near-miss
+  flagging), but there's still no CI wiring and no coverage of the API
+  layer, upload validation, or rate limiting beyond the manual smoke
+  testing done during development. Worth adding before this becomes
+  load-bearing, and worth extending `test_matching.py` with real
+  borderline cases pulled from production near-miss logs once you have
+  them.
+- The `MATCH_THRESHOLD` / `REVIEW_THRESHOLD` defaults (85/60) and the
+  transliteration variant list in `app/screening/matching.py` are
+  reasonable starting points, not compliance-validated final values — see
+  "Matching accuracy" above.
 
 ## Do you need an API key?
 
@@ -157,6 +254,9 @@ the container's ephemeral local storage.
      `https://your-app.vercel.app` (update and redeploy once you know it)
    - `ANTHROPIC_API_KEY` or `ADVERSE_MEDIA_API_KEY` if using either for
      adverse media
+   - `MATCH_THRESHOLD` / `REVIEW_THRESHOLD` / `NEAR_MISS_MARGIN` — optional,
+     override the defaults (85/60/10) documented in the "Matching accuracy"
+     section above once you've validated your own values.
 4. Deploy. Note the `.onrender.com` URL — you'll need it for the
    frontend's `VITE_API_BASE_URL`.
 5. Once live, initialize the caches (replace both placeholders):

@@ -4,13 +4,20 @@ UN Security Council Consolidated Sanctions List.
 Free, official, live XML feed — no API key needed. We cache it locally and
 refresh on a schedule (see scheduler.py) rather than hitting the UN server
 on every single screening request.
+
+Matching is delegated to app.screening.matching, which normalizes names
+(honorifics, punctuation, common transliteration variants) and combines
+several fuzzy algorithms rather than relying on a single ratio — see that
+module's docstring for the reasoning. UNSC entries don't carry a Pakistani
+CNIC, so this source never contributes a cnic_match signal; that only
+comes from FIA Red Book / internal applicant data.
 """
 
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 import requests
-from rapidfuzz import fuzz
 from app.config import CACHE_DIR
+from app.screening import matching
 
 UNSC_XML_URL = "https://scsanctions.un.org/resources/xml/en/consolidated.xml"
 CACHE_FILE = CACHE_DIR / "unsc_consolidated.xml"
@@ -58,10 +65,12 @@ def _load_names() -> list[str]:
     return names
 
 
-def check(applicant_name: str, threshold: int = 60) -> dict:
+def check(applicant_name: str, threshold: float = 60) -> dict:
     """
-    Returns the best fuzzy match (if any) above `threshold`, plus the score.
-    Score is 0-100. Caller decides HIT / REVIEW / CLEAR cutoffs.
+    Returns the best match (if any) above `threshold`, plus the combined
+    score, a near_miss flag for audit logging, and a breakdown of the
+    individual algorithm scores behind that number. Caller (app/main.py)
+    decides HIT / REVIEW / CLEAR cutoffs and whether to log the near miss.
     """
     names = _load_names()
     if not names:
@@ -71,18 +80,19 @@ def check(applicant_name: str, threshold: int = 60) -> dict:
             "detail": "UNSC cache not populated — run refresh_cache() first.",
             "source_url": UNSC_XML_URL,
             "available": False,
+            "near_miss": False,
+            "cnic_match": False,
         }
 
-    best_name, best_score = None, 0
-    for entry in names:
-        score = fuzz.token_sort_ratio(applicant_name.lower(), entry.lower())
-        if score > best_score:
-            best_name, best_score = entry, score
+    best = matching.find_best_match(applicant_name, names, threshold)
 
     return {
-        "matched_entry": best_name if best_score >= threshold else None,
-        "score": best_score,
-        "detail": f"Checked against {len(names)} UNSC names/aliases.",
+        "matched_entry": best.matched_entry,
+        "score": best.score,
+        "detail": f"Checked against {len(names)} UNSC names/aliases. {best.detail}",
         "source_url": UNSC_XML_URL,
         "available": True,
+        "near_miss": best.near_miss,
+        "cnic_match": False,  # UNSC has no Pakistani-CNIC field to compare against
+        "breakdown": best.breakdown,
     }

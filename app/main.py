@@ -12,6 +12,7 @@ Endpoints:
     GET  /api/applicants            -> list past screenings
     GET  /api/applicants/{id}       -> full result detail for one applicant
     GET  /api/evidence/{result_id}  -> download the evidence PDF for a hit
+    GET  /api/admin/near-misses     -> audit log of scores that came close to a threshold without crossing it
     POST /api/admin/refresh-unsc    -> refresh the UNSC cache
     POST /api/admin/fia-redbook/upload -> upload a Red Book PDF manually (replaces the current edition; old one is archived, not lost)
     GET  /api/admin/fia-redbook/status -> what edition is currently loaded, and when
@@ -31,8 +32,8 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 from app import database as db
-from app.config import SCREENSHOT_DIR
-from app.schemas import ScreenRequest, ScreenResponse, ScreeningResultOut, ApplicantSummary
+from app.config import SCREENSHOT_DIR, MATCH_THRESHOLD, REVIEW_THRESHOLD
+from app.schemas import ScreenRequest, ScreenResponse, ScreeningResultOut, ApplicantSummary, NearMissEntry
 from app.screening import unsc, fia_redbook, adverse_media
 from app import evidence
 from app.auth import require_api_key
@@ -75,9 +76,6 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     print(f"Unhandled error on {request.url.path}: {exc!r}")
     return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
-MATCH_THRESHOLD = 85   # score >= this => HIT
-REVIEW_THRESHOLD = 60  # score >= this => REVIEW (below => CLEAR)
-
 
 @app.on_event("startup")
 def startup():
@@ -92,12 +90,20 @@ def startup():
 def _status_for(result: dict) -> str:
     """
     Turns a source-check result dict into HIT / REVIEW / CLEAR / NOT_CONFIGURED.
-    Important: a source that couldn't actually run (cache empty, no API key)
-    must NOT be reported as CLEAR — that would silently hide the fact that
-    the check never happened.
+
+    Two rules that override a bare score comparison:
+      - A source that couldn't actually run (cache empty, no API key) must
+        NOT be reported as CLEAR — that would silently hide the fact that
+        the check never happened.
+      - An exact CNIC match is direct identity evidence, not a fuzzy
+        inference, so it always resolves to HIT regardless of the name
+        score — a shared 13-digit national ID number should never be
+        outvoted by a mediocre fuzzy name score.
     """
     if result.get("available") is False:
         return "NOT_CONFIGURED"
+    if result.get("cnic_match"):
+        return "HIT"
     score = result.get("score")
     if score is None:
         return "CLEAR"
@@ -106,6 +112,19 @@ def _status_for(result: dict) -> str:
     if score >= REVIEW_THRESHOLD:
         return "REVIEW"
     return "CLEAR"
+
+
+def _log_near_miss_if_any(applicant_id: int, source: str, result: dict, now: str):
+    if result.get("near_miss"):
+        db.insert_near_miss(
+            applicant_id=applicant_id,
+            source=source,
+            matched_entry=result.get("matched_entry") or (result.get("breakdown") or {}).get("matched_entry_raw"),
+            score=result.get("score"),
+            threshold=REVIEW_THRESHOLD,
+            detail=result.get("detail"),
+            logged_at=now,
+        )
 
 
 @app.post("/api/screen", response_model=ScreenResponse, dependencies=[Depends(require_api_key)])
@@ -121,17 +140,20 @@ def screen_applicant(request: Request, req: ScreenRequest):
     unsc_result = unsc.check(req.full_name, threshold=REVIEW_THRESHOLD)
     status = _status_for(unsc_result)
     statuses.append(status)
-    evidence_file = None
+    _log_near_miss_if_any(applicant_id, "UNSC", unsc_result, now)
     if status == "HIT":
         result_id_placeholder = db.insert_result(
             applicant_id, "UNSC", unsc_result["matched_entry"], unsc_result["score"],
             status, unsc_result["detail"], None, now,
+            cnic_match=unsc_result.get("cnic_match", False),
         )
         pdf_path = evidence.generate_evidence_pdf(
             req.full_name, req.cnic, "UNSC Consolidated Sanctions List",
             unsc_result["matched_entry"], unsc_result["score"], unsc_result["source_url"],
             image_path=None,  # UNSC is a static data feed, not a webpage — no screenshot
             result_id=result_id_placeholder,
+            cnic_match=unsc_result.get("cnic_match", False),
+            breakdown=unsc_result.get("breakdown"),
         )
         evidence_file = pdf_path.name
         with db.get_conn() as conn:
@@ -142,24 +164,30 @@ def screen_applicant(request: Request, req: ScreenRequest):
             id=result_id_placeholder, source="UNSC", matched_entry=unsc_result["matched_entry"],
             score=unsc_result["score"], status=status, detail=unsc_result["detail"],
             evidence_file=evidence_file, checked_at=now,
+            cnic_match=unsc_result.get("cnic_match", False), near_miss=unsc_result.get("near_miss", False),
         ))
     else:
         rid = db.insert_result(applicant_id, "UNSC", unsc_result["matched_entry"], unsc_result["score"],
-                                status, unsc_result["detail"], None, now)
+                                status, unsc_result["detail"], None, now,
+                                cnic_match=unsc_result.get("cnic_match", False),
+                                near_miss=unsc_result.get("near_miss", False))
         results_out.append(ScreeningResultOut(
             id=rid, source="UNSC", matched_entry=unsc_result["matched_entry"],
             score=unsc_result["score"], status=status, detail=unsc_result["detail"],
             evidence_file=None, checked_at=now,
+            cnic_match=unsc_result.get("cnic_match", False), near_miss=unsc_result.get("near_miss", False),
         ))
 
     # --- FIA Red Book ---
-    fia_result = fia_redbook.check(req.full_name, threshold=REVIEW_THRESHOLD)
+    fia_result = fia_redbook.check(req.full_name, applicant_cnic=req.cnic, threshold=REVIEW_THRESHOLD)
     status = _status_for(fia_result)
     statuses.append(status)
+    _log_near_miss_if_any(applicant_id, "FIA_REDBOOK", fia_result, now)
     if status == "HIT":
         result_id_placeholder = db.insert_result(
             applicant_id, "FIA_REDBOOK", fia_result["matched_entry"], fia_result["score"],
             status, fia_result["detail"], None, now,
+            cnic_match=fia_result.get("cnic_match", False),
         )
         image_path = None
         if fia_result.get("page_number") is not None:
@@ -169,6 +197,8 @@ def screen_applicant(request: Request, req: ScreenRequest):
             req.full_name, req.cnic, "FIA Red Book",
             fia_result["matched_entry"], fia_result["score"], fia_result["source_url"],
             image_path=image_path, result_id=result_id_placeholder,
+            cnic_match=fia_result.get("cnic_match", False),
+            breakdown=fia_result.get("breakdown"),
         )
         evidence_file = pdf_path.name
         with db.get_conn() as conn:
@@ -179,14 +209,18 @@ def screen_applicant(request: Request, req: ScreenRequest):
             id=result_id_placeholder, source="FIA_REDBOOK", matched_entry=fia_result["matched_entry"],
             score=fia_result["score"], status=status, detail=fia_result["detail"],
             evidence_file=evidence_file, checked_at=now,
+            cnic_match=fia_result.get("cnic_match", False), near_miss=fia_result.get("near_miss", False),
         ))
     else:
         rid = db.insert_result(applicant_id, "FIA_REDBOOK", fia_result["matched_entry"], fia_result["score"],
-                                status, fia_result["detail"], None, now)
+                                status, fia_result["detail"], None, now,
+                                cnic_match=fia_result.get("cnic_match", False),
+                                near_miss=fia_result.get("near_miss", False))
         results_out.append(ScreeningResultOut(
             id=rid, source="FIA_REDBOOK", matched_entry=fia_result["matched_entry"],
             score=fia_result["score"], status=status, detail=fia_result["detail"],
             evidence_file=None, checked_at=now,
+            cnic_match=fia_result.get("cnic_match", False), near_miss=fia_result.get("near_miss", False),
         ))
 
     # --- Adverse Media ---
@@ -196,7 +230,6 @@ def screen_applicant(request: Request, req: ScreenRequest):
         {"score": media_result.get("score"), "available": media_result.get("available", True)}
     )
     statuses.append(media_status)
-    evidence_file = None
     if media_status in ("HIT", "REVIEW") and media_result.get("screenshot_path"):
         result_id_placeholder = db.insert_result(
             applicant_id, "ADVERSE_MEDIA", media_result.get("matched_entry"), media_result.get("score"),
@@ -276,6 +309,20 @@ def download_evidence(request: Request, result_id: int):
     if not path.exists():
         raise HTTPException(404, "Evidence file missing on disk")
     return FileResponse(path, media_type="application/pdf", filename=result["evidence_file"])
+
+
+@app.get("/api/admin/near-misses", response_model=list[NearMissEntry], dependencies=[Depends(require_api_key)])
+@limiter.limit("30/minute")
+def near_misses(request: Request, limit: int = 200):
+    """
+    Audit trail of scores that came within NEAR_MISS_MARGIN points of
+    REVIEW_THRESHOLD without crossing it — i.e. scored CLEAR, but close
+    enough to be worth a compliance analyst's periodic attention. Useful
+    for sanity-checking whether the thresholds in app/config.py are set
+    where the business actually wants them, using real applicant traffic
+    rather than guesswork.
+    """
+    return db.list_near_misses(limit=limit)
 
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20MB — Red Book PDFs are small; this is a generous ceiling

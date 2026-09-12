@@ -33,6 +33,13 @@ class ScreeningResultOut(BaseModel):
     detail: Optional[str]
     evidence_file: Optional[str]
     checked_at: str
+    # Additive fields — an exact CNIC match is a distinct, stronger signal
+    # than the fuzzy name score (see app/screening/matching.py), and
+    # near_miss flags a score that came close to a threshold without
+    # crossing it, for audit purposes. Both default False so this stays
+    # backward compatible with any client built against the earlier schema.
+    cnic_match: bool = False
+    near_miss: bool = False
 
 
 class ScreenResponse(BaseModel):
@@ -48,3 +55,14 @@ class ApplicantSummary(BaseModel):
     cnic: Optional[str]
     submitted_at: str
     overall_status: str
+
+
+class NearMissEntry(BaseModel):
+    id: int
+    applicant_id: int
+    source: str
+    matched_entry: Optional[str]
+    score: Optional[float]
+    threshold: Optional[float]
+    detail: Optional[str]
+    logged_at: str
