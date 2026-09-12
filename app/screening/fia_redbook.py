@@ -301,11 +301,21 @@ def check(applicant_name: str, applicant_cnic: str | None = None, threshold: flo
     # (e.g. due to a nickname or transliteration this module doesn't know
     # about) happens to land below threshold.
     cnic_hit_name = None
+    cnic_near_hit_name = None
     if applicant_cnic:
         for name, cnic in entries:
             if matching.cnic_exact_match(applicant_cnic, cnic):
                 cnic_hit_name = name
                 break
+        if not cnic_hit_name:
+            # Only look for a near-match (single-digit typo/OCR slip) once
+            # there's no exact hit — this is a weaker, audit-only signal,
+            # never an escalation path of its own. See
+            # matching.cnic_near_match for why it's deliberately not a HIT.
+            for name, cnic in entries:
+                if matching.cnic_near_match(applicant_cnic, cnic):
+                    cnic_near_hit_name = name
+                    break
 
     page_number = None
     matched_for_page = best.matched_entry or cnic_hit_name
@@ -315,6 +325,11 @@ def check(applicant_name: str, applicant_cnic: str | None = None, threshold: flo
     detail = f"Checked against {len(entries)} names in cached Red Book edition. {best.detail}"
     if cnic_hit_name:
         detail += f" CNIC exact match found against entry '{cnic_hit_name}' — treat as confirmed identity evidence."
+    elif cnic_near_hit_name:
+        detail += (
+            f" CNIC differs by a single digit from entry '{cnic_near_hit_name}' — not treated as a match, "
+            "but flagged for the near-miss audit log in case it's a transcription error worth a human look."
+        )
 
     return {
         "matched_entry": best.matched_entry or cnic_hit_name,
@@ -323,7 +338,7 @@ def check(applicant_name: str, applicant_cnic: str | None = None, threshold: flo
         "source_url": FIA_PUBLICATIONS_PAGE,
         "page_number": page_number,
         "available": True,
-        "near_miss": best.near_miss,
+        "near_miss": best.near_miss or bool(cnic_near_hit_name),
         "cnic_match": bool(cnic_hit_name),
         "breakdown": best.breakdown,
     }

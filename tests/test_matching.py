@@ -12,6 +12,10 @@ generic fuzzy-matching trivia:
   - Partial name submissions (2 of 4 watchlist tokens)
   - Genuinely different names that must NOT match
   - CNIC as an independent, stronger signal than any name score
+  - Phonetic (Metaphone) matches for transliteration pairs not present
+    in the hand-curated variant table
+  - Single-digit CNIC "near matches" (likely OCR/typo slips) flagged for
+    audit without ever being auto-escalated to a HIT
 
 Run with:  pytest tests/test_matching.py -v
 
@@ -124,6 +128,38 @@ def test_normalize_name_is_idempotent_and_order_preserving_per_token():
     once = matching.normalize_name("Dr. Syed Mohammad  Ali-Khan")
     twice = matching.normalize_name(once)
     assert once == twice
+
+
+def test_phonetic_layer_catches_variant_not_in_table():
+    # "Zulfiqar" vs "Zulfikar" is a real transliteration pair that is
+    # NOT in VARIANT_MAP — this should only pass because of the added
+    # Metaphone phonetic layer, not the hand-curated variant table.
+    r = matching.score_against("Zulfiqar Ali", "Zulfikar Ali")
+    assert r.combined >= MATCH_THRESHOLD, f"phonetic layer should catch this variant, got {r.combined}"
+    assert r.phonetic >= MATCH_THRESHOLD, "expected the phonetic score itself to be high for this pair"
+
+
+def test_phonetic_layer_respects_short_token_guard():
+    # Same guard rationale as partial_ratio: a short single token
+    # shouldn't be trusted to phonetically "match" purely by coincidence
+    # against an unrelated multi-token entry.
+    r = matching.score_against("Ali", "Chandrasekhar Alistair Montgomery")
+    assert r.phonetic == 0, "phonetic score should be excluded by the short-token guard, not just low"
+    assert r.combined < MATCH_THRESHOLD
+
+
+def test_cnic_near_match_flags_single_digit_typo_but_not_exact():
+    assert matching.cnic_near_match("12345-1234567-1", "12345-1234567-2")
+    assert not matching.cnic_near_match("12345-1234567-1", "12345-1234567-1")  # exact, not "near"
+
+
+def test_cnic_near_match_false_for_multi_digit_difference():
+    assert not matching.cnic_near_match("12345-1234567-1", "12345-1234568-2")
+
+
+def test_cnic_near_match_false_when_either_side_missing():
+    assert not matching.cnic_near_match(None, "12345-1234567-1")
+    assert not matching.cnic_near_match("12345-1234567-1", None)
 
 
 def test_empty_or_none_inputs_do_not_crash():

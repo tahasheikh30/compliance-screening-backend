@@ -56,17 +56,34 @@ mismatches surface, not treated as complete.
 
 **Multiple algorithms, combined deliberately.** Rather than a single
 `fuzz.token_sort_ratio()` call, each comparison runs `token_sort_ratio`,
-`token_set_ratio`, `WRatio`, and (guarded — see below) `partial_ratio`,
-and takes the maximum. Each algorithm has a different blind spot:
-`token_sort_ratio` misses cases where the applicant supplied fewer name
-parts than the watchlist entry; `token_set_ratio` handles that but can
-over-match on very short tokens in isolation; `partial_ratio` catches
-truncated/abbreviated entries but will treat any short name as "matched"
-if it happens to appear as a substring of a longer unrelated name (e.g.
-"Ali" inside "Alistair") — so it's only trusted once the shorter side of
-the comparison has at least two tokens or is reasonably long on its own.
-This combination is covered by `tests/test_matching.py`, including a
-regression test for that exact substring false-positive.
+`token_set_ratio`, `WRatio`, and (guarded — see below) `partial_ratio` and
+a phonetic score, and takes the maximum. Each algorithm has a different
+blind spot: `token_sort_ratio` misses cases where the applicant supplied
+fewer name parts than the watchlist entry; `token_set_ratio` handles that
+but can over-match on very short tokens in isolation; `partial_ratio`
+catches truncated/abbreviated entries but will treat any short name as
+"matched" if it happens to appear as a substring of a longer unrelated
+name (e.g. "Ali" inside "Alistair") — so it's only trusted once the
+shorter side of the comparison has at least two tokens or is reasonably
+long on its own. This combination is covered by `tests/test_matching.py`,
+including a regression test for that exact substring false-positive.
+
+**Phonetic matching, as a supplement to the variant table, not a
+replacement for it.** The hand-curated `VARIANT_MAP` only catches spelling
+pairs someone has already written down — real applicant traffic will
+surface transliteration pairs nobody thought to add. Each comparison now
+also computes a Metaphone-coded token-overlap score (`jellyfish.metaphone`
+per token), which catches phonetically-identical names that are literally
+quite different strings (e.g. "Zulfiqar" vs "Zulfikar" — not in the
+variant table, but phonetically the same name). It uses exact phonetic-
+code equality per token, not substring containment, and the same
+short-token guard as `partial_ratio`, for the same reason: a phonetic
+match is a stronger claim than "one string contains another," but a very
+short token can still coincidentally share a phonetic code with an
+unrelated name. This is a coarser, noisier signal than the variant table
+by nature — treat a HIT/REVIEW that only cleared threshold via the
+phonetic score with the same "route to a human, don't auto-decide"
+posture as everything else here, not extra confidence.
 
 Taking the **maximum** across algorithms, rather than an average, is a
 deliberate choice: for a compliance screen, a missed true match is the
@@ -89,14 +106,26 @@ crossing it is written to an append-only audit table
 status — it exists so a compliance analyst can periodically check where
 real traffic is actually landing relative to the thresholds, instead of
 setting `MATCH_THRESHOLD`/`REVIEW_THRESHOLD` once and never revisiting them.
+A CNIC that differs from a Red Book entry by exactly one digit (a
+plausible OCR/typo slip) is logged to the same table for the same reason —
+it is never auto-escalated to a HIT (see `matching.cnic_near_match`), only
+flagged for a human to glance at.
 
 **What this does NOT solve, and shouldn't be sold as solving:**
-- Fuzzy name matching is inherently probabilistic. This is a meaningfully
-  stronger implementation than a single fuzzy ratio, not a guarantee of
-  zero false negatives or false positives.
+- Fuzzy name matching is inherently probabilistic — on this codebase or
+  any other vendor's. This is a meaningfully stronger implementation than
+  a single fuzzy ratio, not a guarantee of zero false negatives or false
+  positives, and not a benchmarked claim of being more accurate than any
+  specific commercial product (no such benchmark has been run).
 - The transliteration variant list is hand-curated and will miss names it
   hasn't seen. Treat it as a living document — extend it from real
-  mismatches, don't assume it's exhaustive.
+  mismatches, don't assume it's exhaustive. The added phonetic (Metaphone)
+  layer covers some of that gap automatically, but Metaphone was designed
+  for English phonetics and is an approximation for Arabic/Urdu-derived
+  names, not a purpose-built solution for them — it catches some real
+  variants the variant table misses, and will also miss some, and very
+  occasionally over-match short names that happen to share a phonetic
+  code. It's a net improvement in coverage, not a solved problem.
 - FIA Red Book extraction (`app/screening/fia_redbook.py`) is still
   best-effort PDF parsing — this version tries real table structure first
   and falls back to a text-scan heuristic, and now also attempts to pull
