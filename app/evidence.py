@@ -25,8 +25,23 @@ from datetime import datetime, timezone
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas
-from reportlab.lib.utils import ImageReader
+from reportlab.lib.utils import ImageReader, simpleSplit
+from reportlab.pdfbase.pdfmetrics import stringWidth
 from app.config import EVIDENCE_DIR
+
+
+def _wrap_lines(text: str, font: str, size: float, max_width: float) -> list[str]:
+    """Word-wrap, and hard-break any single token (e.g. a long URL) wider than the page."""
+    out: list[str] = []
+    for line in simpleSplit(text, font, size, max_width) or [""]:
+        while stringWidth(line, font, size) > max_width and len(line) > 1:
+            cut = len(line)
+            while cut > 1 and stringWidth(line[:cut], font, size) > max_width:
+                cut -= 1
+            out.append(line[:cut])
+            line = line[cut:]
+        out.append(line)
+    return out
 
 
 def generate_evidence_pdf(
@@ -40,12 +55,26 @@ def generate_evidence_pdf(
     result_id: int,
     cnic_match: bool = False,
     breakdown: dict | None = None,
+    list_version: str | None = None,
 ) -> Path:
     out_path = EVIDENCE_DIR / f"evidence_{result_id}.pdf"
     c = canvas.Canvas(str(out_path), pagesize=A4)
     width, height = A4
     margin = 20 * mm
     y = height - margin
+    text_w = width - 2 * margin
+
+    def wrapped(text, font="Helvetica", size=10, leading=5 * mm, color=None):
+        """Draw text wrapped to the page width (long names/URLs used to run off the edge)."""
+        nonlocal y
+        c.setFont(font, size)
+        if color:
+            c.setFillColorRGB(*color)
+        for line in _wrap_lines(str(text), font, size, text_w):
+            c.drawString(margin, y, line)
+            y -= leading
+        if color:
+            c.setFillColorRGB(0, 0, 0)
 
     # Header
     c.setFont("Helvetica-Bold", 16)
@@ -63,11 +92,11 @@ def generate_evidence_pdf(
     # CNIC exact match banner — most decisive evidence, shown first and
     # loudly, before the applicant/match detail blocks.
     if cnic_match:
-        c.setFillColorRGB(0.7, 0, 0)
-        c.setFont("Helvetica-Bold", 12)
-        c.drawString(margin, y, "⚠ EXACT CNIC MATCH — direct identity evidence, not a fuzzy inference")
-        c.setFillColorRGB(0, 0, 0)
-        y -= 10 * mm
+        # Plain-text marker: "⚠" is not encodable in the built-in Helvetica
+        # font and rendered as a stray "I" in the previous version.
+        wrapped("ALERT - EXACT CNIC MATCH: direct identity evidence, not a fuzzy inference",
+                font="Helvetica-Bold", size=12, leading=6 * mm, color=(0.7, 0, 0))
+        y -= 4 * mm
 
     # Applicant block
     c.setFont("Helvetica-Bold", 11)
@@ -86,8 +115,9 @@ def generate_evidence_pdf(
     c.setFont("Helvetica", 10)
     c.drawString(margin, y, f"Source: {source}")
     y -= 6 * mm
-    c.drawString(margin, y, f"Matched entry: {matched_entry}")
-    y -= 6 * mm
+    wrapped(f"Matched entry: {matched_entry}", leading=5 * mm)
+    y -= 1 * mm
+    c.setFont("Helvetica", 10)
     c.drawString(margin, y, f"Combined fuzzy-match confidence: {score}/100")
     y -= 6 * mm
     if breakdown:
@@ -103,20 +133,20 @@ def generate_evidence_pdf(
             c.setFillColorRGB(0, 0, 0)
             c.setFont("Helvetica", 10)
             y -= 6 * mm
+    if list_version:
+        wrapped(f"List version checked: {list_version}", size=9, leading=4.5 * mm)
+        y -= 1.5 * mm
     if source_url:
-        c.drawString(margin, y, f"Source reference: {source_url}")
-        y -= 6 * mm
-    y -= 6 * mm
+        wrapped(f"Source reference: {source_url}", size=9, leading=4.5 * mm)
+        y -= 1.5 * mm
+    y -= 4 * mm
 
-    c.setFont("Helvetica-Oblique", 8)
-    c.setFillColorRGB(0.5, 0.5, 0.5)
-    c.drawString(
-        margin, y,
+    wrapped(
         "This is an automated name/identity match, not a final adjudication. "
-        "A compliance analyst must verify before any adverse action."
+        "A compliance analyst must verify before any adverse action.",
+        font="Helvetica-Oblique", size=8, leading=4 * mm, color=(0.5, 0.5, 0.5),
     )
-    c.setFillColorRGB(0, 0, 0)
-    y -= 12 * mm
+    y -= 8 * mm
 
     # Embedded proof image
     if image_path and Path(image_path).exists():
@@ -127,7 +157,7 @@ def generate_evidence_pdf(
             img = ImageReader(str(image_path))
             iw, ih = img.getSize()
             max_w = width - 2 * margin
-            max_h = y - margin
+            max_h = max(y - margin, 20 * mm)
             scale = min(max_w / iw, max_h / ih)
             c.drawImage(img, margin, margin, width=iw * scale, height=ih * scale, preserveAspectRatio=True)
         except Exception as e:

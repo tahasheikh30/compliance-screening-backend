@@ -7,6 +7,9 @@ Tables:
     (UNSC / FIA_REDBOOK / ADVERSE_MEDIA), with an optional evidence_file
     path when the result was a HIT, plus cnic_match / near_miss flags
     (see app/screening/matching.py for what those mean).
+  - admin_audit_log: append-only record of administrative actions (Red Book
+    upload/activate/discard, list refreshes) with timestamp, client address
+    and request ID — so "who changed the watchlist, and when" is answerable.
   - near_miss_log: append-only audit trail of scores that came close to a
     threshold but didn't cross it. A result that never runs must never
     look identical to one that ran and cleared cleanly — this table is
@@ -66,11 +69,26 @@ def init_db():
                 FOREIGN KEY (applicant_id) REFERENCES applicants(id)
             )
         """)
-        # Additive migration for DBs created before cnic_match/near_miss
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS admin_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action TEXT NOT NULL,
+                target TEXT,
+                detail TEXT,
+                client_ip TEXT,
+                request_id TEXT,
+                logged_at TEXT NOT NULL
+            )
+        """)
+        # Additive migration for DBs created before these columns
         # existed — safe to run every startup, only ALTERs if missing.
+        # list_version records WHICH version of a watchlist a result was
+        # checked against (FIA edition id, or the feed's last-refresh time),
+        # so a questioned result can be traced to the exact list in force.
         for column, ddl in (
             ("cnic_match", "ALTER TABLE screening_results ADD COLUMN cnic_match INTEGER DEFAULT 0"),
             ("near_miss", "ALTER TABLE screening_results ADD COLUMN near_miss INTEGER DEFAULT 0"),
+            ("list_version", "ALTER TABLE screening_results ADD COLUMN list_version TEXT"),
         ):
             if not _column_exists(conn, "screening_results", column):
                 conn.execute(ddl)
@@ -108,18 +126,54 @@ def update_applicant_status(applicant_id, overall_status):
 
 
 def insert_result(applicant_id, source, matched_entry, score, status, detail,
-                   evidence_file, checked_at, cnic_match=False, near_miss=False):
+                   evidence_file, checked_at, cnic_match=False, near_miss=False,
+                   list_version=None):
     with get_conn() as conn:
         cur = conn.execute(
             "INSERT INTO screening_results "
             "(applicant_id, source, matched_entry, score, status, detail, evidence_file, "
-            "checked_at, cnic_match, near_miss) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "checked_at, cnic_match, near_miss, list_version) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (applicant_id, source, matched_entry, score, status, detail, evidence_file,
-             checked_at, int(bool(cnic_match)), int(bool(near_miss))),
+             checked_at, int(bool(cnic_match)), int(bool(near_miss)), list_version),
         )
         conn.commit()
         return cur.lastrowid
+
+
+def set_evidence_file(result_id, evidence_file):
+    with get_conn() as conn:
+        conn.execute("UPDATE screening_results SET evidence_file = ? WHERE id = ?",
+                     (evidence_file, result_id))
+        conn.commit()
+
+
+def append_result_detail(result_id, extra: str):
+    """Append a note to a stored result's detail (e.g. 'evidence PDF failed')."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE screening_results SET detail = COALESCE(detail, '') || ? WHERE id = ?",
+            (extra, result_id),
+        )
+        conn.commit()
+
+
+def log_admin_action(action, target, detail, client_ip, request_id, logged_at):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO admin_audit_log (action, target, detail, client_ip, request_id, logged_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (action, target, detail, client_ip, request_id, logged_at),
+        )
+        conn.commit()
+
+
+def list_admin_actions(limit=100):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM admin_audit_log ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def insert_near_miss(applicant_id, source, matched_entry, score, threshold, detail, logged_at):

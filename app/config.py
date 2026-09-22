@@ -29,7 +29,15 @@ SCREENSHOT_DIR = EVIDENCE_DIR / "screenshots"
 # which edition was active when it ran. See app/screening/fia_redbook.py.
 FIA_REDBOOK_ARCHIVE_DIR = CACHE_DIR / "fia_redbook_archive"
 
-for d in (CACHE_DIR, EVIDENCE_DIR, SCREENSHOT_DIR, FIA_REDBOOK_ARCHIVE_DIR):
+# Edition registry: every uploaded/scraped Red Book lives in its own
+# subfolder here (PDF + parsed entries + metadata) for as long as it has ever
+# been live. The "live" files in CACHE_DIR (fia_redbook_latest.pdf etc.) are a
+# copy of whichever edition is currently activated. The older
+# FIA_REDBOOK_ARCHIVE_DIR above is only read once, to migrate pre-registry
+# archives into this structure.
+FIA_REDBOOK_EDITIONS_DIR = CACHE_DIR / "fia_redbook_editions"
+
+for d in (CACHE_DIR, EVIDENCE_DIR, SCREENSHOT_DIR, FIA_REDBOOK_ARCHIVE_DIR, FIA_REDBOOK_EDITIONS_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 
@@ -52,3 +60,14 @@ REVIEW_THRESHOLD = float(os.environ.get("REVIEW_THRESHOLD", "60"))  # score >= t
 # it only controls what gets written to the audit log for periodic
 # compliance review.
 NEAR_MISS_MARGIN = float(os.environ.get("NEAR_MISS_MARGIN", "10"))
+
+
+# --- Data freshness ------------------------------------------------------
+# Only used to *warn* in the Lists & audit tab; never changes screening
+# results. Sanctions feeds change often; the FIA Red Book is roughly annual.
+FEED_STALE_HOURS = float(os.environ.get("FEED_STALE_HOURS", "72"))
+FIA_STALE_DAYS = float(os.environ.get("FIA_STALE_DAYS", "400"))
+
+# If a scraped Red Book parses to fewer than this fraction of the live
+# edition's names, it is staged for human review instead of auto-activated.
+FIA_AUTO_ACTIVATE_MIN_RATIO = float(os.environ.get("FIA_AUTO_ACTIVATE_MIN_RATIO", "0.6"))

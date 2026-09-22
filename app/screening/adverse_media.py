@@ -15,11 +15,12 @@ Three modes, tried in this order:
      search-results page directly. Noisiest option; always routes to
      manual review. Used only if neither of the above is configured.
 """
-
 import os
 from pathlib import Path
 from datetime import datetime, timezone
 import requests
+
+from app.errors import describe_exception, logger
 
 VENDOR_API_KEY = os.environ.get("ADVERSE_MEDIA_API_KEY")
 VENDOR_ENDPOINT = os.environ.get("ADVERSE_MEDIA_ENDPOINT", "https://api.vendor.example.com/v1/adverse-media")
@@ -144,6 +145,7 @@ def _capture_screenshot(url: str, out_path: Path) -> Path | None:
             browser.close()
         return out_path
     except Exception:
+        logger.warning("Adverse media: could not screenshot cited source %s", url, exc_info=True)
         return None
 
 
@@ -179,7 +181,12 @@ def check_via_search_and_screenshot(applicant_name: str, screenshot_out_path: Pa
         result["screenshot_path"] = str(screenshot_out_path)
         result["status"] = "REVIEW"  # always route to human review in fallback mode
     except Exception as e:
-        result["detail"] += f" (screenshot capture failed: {e})"
+        # Playwright's "browser not installed" error in particular dumps a
+        # multi-line boxed ASCII message (`playwright install` instructions) —
+        # never put that raw text in front of an applicant-facing result.
+        code, message, hint = describe_exception(e)
+        logger.exception("Adverse media screenshot fallback failed")
+        result["detail"] += f" Screenshot capture also failed: {message} ({code}). {hint}"
         result["status"] = "ERROR"
 
     return result

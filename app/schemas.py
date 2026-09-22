@@ -40,6 +40,10 @@ class ScreeningResultOut(BaseModel):
     # backward compatible with any client built against the earlier schema.
     cnic_match: bool = False
     near_miss: bool = False
+    # Which version of the watchlist this result was checked against: the FIA
+    # edition id, or the UTC time the feed cache was last refreshed. None for
+    # results stored before this field existed, and for adverse media.
+    list_version: Optional[str] = None
 
 
 class ScreenResponse(BaseModel):
@@ -66,3 +70,22 @@ class NearMissEntry(BaseModel):
     threshold: Optional[float]
     detail: Optional[str]
     logged_at: str
+
+
+class AdminAuditEntry(BaseModel):
+    id: int
+    action: str
+    target: Optional[str]
+    detail: Optional[str]
+    client_ip: Optional[str]
+    request_id: Optional[str]
+    logged_at: str
+
+
+class ActivateEditionRequest(BaseModel):
+    # Required (True) the first time an edition goes live, so activation is a
+    # deliberate act by someone who has spot-checked the parsed entries —
+    # the fia_redbook module docstring calls that review a required step.
+    # Not required when rolling back to an edition that has been live before.
+    confirm_reviewed: bool = False
+    note: Optional[str] = Field(default=None, max_length=500)
