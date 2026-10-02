@@ -133,15 +133,9 @@ def describe_exception(exc: BaseException) -> tuple[str, str, str]:
                     "Try again later; if it persists, the endpoint or credentials may have changed.")
         return ("UPSTREAM_UNREACHABLE", "Could not reach the external service.",
                 "The server may have no outbound network access, or the provider is down.")
-    if module.startswith("anthropic"):
-        return ("UPSTREAM_API_ERROR", f"The Anthropic API call failed ({name}).",
-                "Check ANTHROPIC_API_KEY, account credit, and rate limits.")
     if module.startswith("sqlite3"):
         return ("DATABASE_ERROR", "A database operation failed.",
                 "Check the persistent disk has free space and the database file is writable.")
-    if module.startswith("playwright"):
-        return ("BROWSER_CAPTURE_FAILED", "Capturing the screenshot failed.",
-                "Run `playwright install chromium` on the server.")
     if isinstance(exc, MemoryError):
         return ("OUT_OF_MEMORY", "The server ran out of memory processing this list.",
                 "Consider a larger Render plan.")
@@ -199,7 +193,7 @@ def install(app: FastAPI) -> None:
         return error_response(
             429, "RATE_LIMITED",
             f"Too many requests ({limit})." if limit else "Too many requests.",
-            "Wait a minute and try again. Limits exist to protect the sanctions/vendor APIs and applicant data.",
+            "Wait a minute and try again. Limits exist to protect the public list publishers and applicant data.",
             headers={"Retry-After": "60"},
         )
 
