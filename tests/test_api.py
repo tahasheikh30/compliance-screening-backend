@@ -98,6 +98,7 @@ def test_hit_escalates_and_evidence_is_downloadable_by_both_routes(client):
     un = _by_source(r)["UNSC"]
     assert un["status"] == "HIT" and un["score"] >= 95 and un["matched_entry"] == "MOHAMMAD ALI KHAN"
     assert un["matches"][0]["id"] == "QDi.001" and un["matches"][0]["dob_year_match"] == "Yes"
+    assert un["match_count"] == 1
     assert un["evidence_file"] and un["evidence_file"].endswith(".pdf")
     assert _by_source(r)["UKSL"]["evidence_file"] is None            # clear rows carry no PDF
 
@@ -138,7 +139,7 @@ def test_failed_list_never_resolves_to_auto_clear(client, fake_sources):
     r = _screen(client)
     assert r.status_code == 200
     rows = _by_source(r)
-    assert rows["UNSC"]["status"] == "ERROR" and "NOT screened" in rows["UNSC"]["detail"]
+    assert rows["UNSC"]["status"] == "ERROR" and rows["UNSC"]["detail"].startswith("Not screened.")
     assert rows["OFAC"]["status"] == "CLEAR"                          # other sources unaffected
     assert r.json()["overall_status"] == "MANUAL_REVIEW"
 

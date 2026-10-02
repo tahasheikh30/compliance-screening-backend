@@ -104,10 +104,11 @@ def screen(name: str, dob: str = "", nationality: str = "", threshold=None) -> d
     for key in loader.SOURCE_KEYS:
         g = groups[key]
         lists_meta.extend(g.meta)
-        matches = [] if not g.available else match_records(scorer, g.records, thr, dob_year)
-        matches.sort(key=lambda x: -x["score"])
+        found = [] if not g.available else match_records(scorer, g.records, thr, dob_year)
+        found.sort(key=lambda x: -x["score"])
+        matches = found[:MAX_MATCHES]  # a low threshold on a common name must not produce a huge response
         total_records += len(g.records)
-        all_matches.extend(matches)
+        all_matches.extend(found)
         published = "; ".join(sorted({str(x.get("published")) for x in g.meta if x.get("published") and x.get("records")}))
         sources[key] = {
             "key": key,
@@ -117,6 +118,7 @@ def screen(name: str, dob: str = "", nationality: str = "", threshold=None) -> d
             "records": len(g.records),
             "list_version": published or None,
             "matches": matches,
+            "match_count": len(found),  # true total; "matches" holds at most MAX_MATCHES of them
             "articles": [],
         }
 
@@ -126,8 +128,8 @@ def screen(name: str, dob: str = "", nationality: str = "", threshold=None) -> d
 
     media_sources = {
         "key": "ADVERSE_MEDIA", "label": SOURCE_LABELS["ADVERSE_MEDIA"], "available": news["status"] == "OK",
-        "error": None if news["status"] == "OK" else news["status"], "records": news["articles_reviewed"],
-        "list_version": None, "matches": [], "articles": news["hits"],
+        "error": None if news["status"] == "OK" else news["status"].removeprefix("Not available: "), "records": news["articles_reviewed"],
+        "list_version": None, "matches": [], "match_count": 0, "articles": news["hits"],
     }
     sources["ADVERSE_MEDIA"] = media_sources
 
@@ -205,16 +207,17 @@ def overall_status(statuses: dict, fia_required: bool = True) -> str:
 def describe_source(src: dict, status: str, threshold: float) -> str:
     """One readable sentence for a source's result row."""
     if status in ("ERROR", "NOT_CONFIGURED"):
-        return f"{src['label']} was NOT screened. {src['error'] or 'Unavailable.'} Treat this applicant as not yet cleared by this source."
+        reason = (src["error"] or "The source was unavailable").strip().rstrip(".")
+        return f"Not screened. {reason}. Treat this applicant as not yet cleared by this source."
     if src["key"] == "ADVERSE_MEDIA":
         n = len(src["articles"])
         if not n:
             return f"No adverse news found ({src['records']} articles reviewed)."
         return (f"{n} news article(s) mention the applicant alongside an adverse keyword "
                 f"({src['records']} articles reviewed). Unverified leads: the person may be someone else with the same name.")
-    n = len(src["matches"])
+    n = src.get("match_count", len(src["matches"]))
     if not n:
-        return f"No match at {threshold:g}% across {src['records']:,} records."
+        return f"No match at {threshold:g}% across {src['records']:,} {'record' if src['records'] == 1 else 'records'}."
     top = src["matches"][0]
     more = f" and {n - 1} more" if n > 1 else ""
     return (f"{n} potential match(es) at or above {threshold:g}%. Top: {top['primary_name']} "

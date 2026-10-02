@@ -68,7 +68,8 @@ def test_parse_redbook_blocks_aliases_cnic_dob_zone_fir():
     assert "Father/Husband: ABDUL SATTAR" in a.remarks and "CNIC: 35202-1111111-1" in a.remarks
     assert "CIRCLE: LAHORE CIRCLE" in a.remarks and "FIR: 12/2019" in a.remarks
     assert b.names == ["SAJID IQBAL"]                            # "(MWS/T)" marker removed
-    assert a.list == "FIA Red Book 2026" and a.type == "Individual"
+    assert a.list == "FIA Red Book 2026" and a.type == "Individual"          # no doubled prefix
+    assert p.fia_label("Red Book 2026") == "FIA Red Book 2026" and p.fia_label("") == "FIA Red Book"
 
 
 def test_parse_redbook_without_blocks_is_empty_not_an_error():

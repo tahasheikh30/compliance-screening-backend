@@ -75,7 +75,8 @@ class ScreeningResultOut(BaseModel):
     list_version: Optional[str] = None
     # new: how many records were screened, and the full match / article detail
     records_screened: Optional[int] = None
-    matches: List[MatchOut] = []
+    matches: List[MatchOut] = []      # best matches first, at most MAX_MATCHES per source
+    match_count: Optional[int] = None  # true number of matches found, may exceed len(matches)
     articles: List[ArticleOut] = []
 
 

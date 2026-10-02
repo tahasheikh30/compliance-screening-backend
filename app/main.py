@@ -118,7 +118,7 @@ def screen_applicant(request: Request, req: ScreenRequest):
             best["score"] if best else None,
             status, detail, None, result["screened_at"],
             list_version=src["list_version"], records_screened=src["records"],
-            payload={"matches": src["matches"], "articles": src["articles"]},
+            payload={"matches": src["matches"], "articles": src["articles"], "match_count": src["match_count"]},
         )
         rows.append((row_id, key, src, status, detail, best))
 

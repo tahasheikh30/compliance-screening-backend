@@ -139,7 +139,7 @@ def _load_fia_edition(ed: dict) -> tuple:
     if not url:
         return [], {"list": "FIA Red Book", "source": parsers.FIA_PAGES[0], "published": "n/a", "records": 0,
                     "optional": True, "status": "Not available: " + (ed.get("note") or "no Red Book link found on the FIA website")}
-    label = "FIA " + (ed.get("title") or "Red Book")
+    label = parsers.fia_label(ed.get("title"))
     try:
         data = _get(url, READ_TIMEOUT).content
         text = parsers.pdf_to_text(data)
@@ -163,7 +163,7 @@ def _load_fia() -> GroupData:
     records = [r for recs, _ in loaded for r in recs]
     meta = [m for _, m in loaded]
     if not records:
-        reasons = "; ".join(str(m.get("status", "")) for m in meta)[:300]
+        reasons = "; ".join(str(m.get("status", "")).removeprefix("Not available: ") for m in meta)[:300]
         # not an exception: the FIA site is optional in the workflow, the list is simply reported as not screened
         return GroupData("FIA_REDBOOK", [], meta, error="The FIA Red Book could not be loaded. " + reasons)
     return GroupData("FIA_REDBOOK", parsers.prepare(records), meta)

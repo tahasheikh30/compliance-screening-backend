@@ -127,7 +127,7 @@ def test_news_failure_is_error_not_clear(fake_sources):
     fake_sources["news_fail"] = True
     r = engine.screen("Completely Unrelated Person")
     media = r["sources"]["ADVERSE_MEDIA"]
-    assert engine.source_status(media) == "ERROR" and "Not available" in media["error"]
+    assert engine.source_status(media) == "ERROR" and "ConnectionError" in media["error"]
     assert r["adverse_media"]["status"].startswith("Not available")
 
 
@@ -149,7 +149,8 @@ def test_describe_source_wording(fake_sources):
     assert "No match at" in engine.describe_source(r["sources"]["UKSL"], "CLEAR", 85)
     fake_sources["fail"].add(loader.UN_URL)
     bad = engine.screen("x y")["sources"]["UNSC"]
-    assert "NOT screened" in engine.describe_source(bad, "ERROR", 85)
+    text = engine.describe_source(bad, "ERROR", 85)
+    assert text.startswith("Not screened. ") and "not yet cleared" in text and ". ." not in text
 
 
 # ---- cache -------------------------------------------------------------------
@@ -172,3 +173,14 @@ def test_cache_reuses_lists_and_never_caches_failures(fake_sources, monkeypatch)
     assert loader.load_group("UKSL").error and not loader.cache_status()["UKSL"]["cached"]
     fake_sources["fail"].clear()
     assert loader.load_group("UKSL").available            # retried, not stuck on the failure
+
+
+def test_per_source_matches_are_capped_but_the_true_count_is_kept(fake_sources, monkeypatch):
+    monkeypatch.setattr(engine, "MAX_MATCHES", 1)
+    extra = ("<INDIVIDUAL><DATAID>9</DATAID><REFERENCE_NUMBER>QDi.009</REFERENCE_NUMBER>"
+             "<FIRST_NAME>MUHAMMED</FIRST_NAME><SECOND_NAME>ALI</SECOND_NAME><THIRD_NAME>KHANN</THIRD_NAME>"
+             "<UN_LIST_TYPE>Taliban</UN_LIST_TYPE></INDIVIDUAL></INDIVIDUALS>")
+    fake_sources["texts"][loader.UN_URL] = fx.UN_XML.replace("</INDIVIDUALS>", extra)
+    un = engine.screen("Muhammad Ali Khan", threshold=80)["sources"]["UNSC"]
+    assert len(un["matches"]) == 1 and un["match_count"] == 2
+    assert "2 potential match(es)" in engine.describe_source(un, "HIT", 80)

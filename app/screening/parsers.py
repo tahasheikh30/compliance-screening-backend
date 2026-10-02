@@ -297,9 +297,15 @@ def _pick(src: str, rx) -> str:
     return _SPACES.sub(" ", m.group(1)).strip() if m else ""
 
 
+def fia_label(title: str) -> str:
+    """'FIA Red Book 2026' stays as is; 'Red Book 2026' becomes 'FIA Red Book 2026'."""
+    t = (title or "Red Book").strip()
+    return t if t.upper().startswith("FIA") else "FIA " + t
+
+
 def parse_redbook(text: str, title: str) -> list:
     """Records for every 'Name of Accused' block in one Red Book edition's text."""
-    label = "FIA " + (title or "Red Book")
+    label = fia_label(title)
     starts = [(m.start(), len(m.group(0))) for m in _ACCUSED.finditer(text)]
     records = []
     count = 0
