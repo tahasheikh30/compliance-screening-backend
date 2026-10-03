@@ -104,3 +104,13 @@ def make_redbook_pdf(people=None) -> bytes:
         y -= 14
     c.save()
     return buf.getvalue()
+
+
+# NACTA Fourth Schedule export, in the column layout used on the NACTA portal and its mirrors
+NACTA_CSV = (
+    "S.No,Primary Title / Name,Father Name,CNIC / ID Number,District,Province\n"
+    "1,Muhammad Shakir,Qabil Khan,3740565359881,HANGU,PUNJAB\n"
+    "2,Aamir Bilal alias Babu Jhangvee,Muhammad Bilal,3640177467701,PAKPATTAN,Punjab\n"
+    "3,Naseebullah,nill,5420396187581,KILLA ABDULLAH,BALOCHISTAN\n"
+    "4,Akhtar Muhammad Khalil,Gul Roz,1111111111166,BANNU,KP\n"
+)

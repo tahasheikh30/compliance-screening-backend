@@ -85,7 +85,7 @@ def test_clear_applicant_is_auto_clear_with_one_row_per_source(client):
     body = r.json()
     assert body["overall_status"] == "AUTO_CLEAR" and body["case_ref"].startswith("CS-")
     rows = _by_source(r)
-    assert set(rows) == {"UNSC", "OFAC", "UKSL", "FIA_REDBOOK", "ADVERSE_MEDIA"}
+    assert set(rows) == {"UNSC", "OFAC", "UKSL", "FIA_REDBOOK", "NACTA", "ADVERSE_MEDIA"}
     assert all(x["status"] == "CLEAR" and x["evidence_file"] is None for x in rows.values())
     assert body["threshold"] == 85 and body["records_screened"] > 0
     assert rows["UNSC"]["list_version"] == "2026-09-30T08:00:00.000Z"
@@ -116,10 +116,10 @@ def test_adverse_media_only_is_manual_review_with_evidence(client, fake_sources)
     assert media["status"] == "REVIEW" and media["articles"][0]["keyword"] == "arrested" and media["evidence_file"]
 
 
-def test_cnic_and_father_name_are_stored_but_do_not_change_matching(client):
-    r = _screen(client, cnic="35202-1111111-1", father_name="Abdul Sattar")
+def test_unrelated_cnic_and_father_name_are_stored_and_do_not_create_matches(client):
+    r = _screen(client, cnic="42101-9999999-9", father_name="Nobody Known")
     assert r.json()["overall_status"] == "AUTO_CLEAR"
-    assert client.get("/api/applicants", headers=API_HEADERS).json()[0]["cnic"] == "35202-1111111-1"
+    assert client.get("/api/applicants", headers=API_HEADERS).json()[0]["cnic"] == "42101-9999999-9"
 
 
 def test_history_endpoints_round_trip(client):
@@ -207,3 +207,144 @@ def test_old_database_is_migrated_in_place(tmp_path, monkeypatch):
     assert database.get_applicant(1)["full_name"] == "Old Row"
     row = database.get_results_for_applicant(1)[0]
     assert row["matches"] == [] and row["status"] == "CLEAR"
+
+
+def test_partial_fia_book_is_reported_through_the_api(client, fake_sources):
+    from tests.test_engine import _second_redbook
+    _second_redbook(fake_sources, readable=False)
+    r = _screen(client)
+    fia = _by_source(r)["FIA_REDBOOK"]
+    assert fia["status"] == "PARTIAL" and r.json()["overall_status"] == "MANUAL_REVIEW"
+    assert fia["detail"].startswith("Incomplete screening.")
+    assert {li["status"] == "OK" for li in fia["lists"]} == {True, False}
+    # and it is stored, so reopening the screening from history shows the same thing
+    again = client.get(f"/api/applicants/{r.json()['applicant_id']}", headers=API_HEADERS).json()
+    assert next(x for x in again["results"] if x["source"] == "FIA_REDBOOK")["lists"] == fia["lists"]
+
+
+# ---- NACTA -----------------------------------------------------------------
+
+def _upload(client, body, filename="nacta.csv", content_type="text/csv"):
+    return client.post(f"/api/admin/nacta?filename={filename}", content=body,
+                       headers={**API_HEADERS, "Content-Type": content_type})
+
+
+def test_matching_cnic_is_reported_even_when_the_name_is_completely_different(client):
+    r = _screen(client, full_name="Totally Different Name", cnic="3740565359881")
+    nacta = _by_source(r)["NACTA"]
+    assert nacta["status"] == "HIT" and r.json()["overall_status"] == "ESCALATE_TO_COMPLIANCE"
+    m = nacta["matches"][0]
+    assert m["primary_name"] == "Muhammad Shakir" and m["cnic_match"] is True and m["cnic"] == "3740565359881"
+    assert m["father_name"] == "Qabil Khan" and m["list"] == "NACTA Proscribed Persons (Fourth Schedule)"
+    assert nacta["cnic_match"] is True and nacta["evidence_file"]
+
+
+def test_name_match_on_nacta_with_a_different_cnic_is_flagged_as_differing(client):
+    r = _screen(client, full_name="Muhammad Shakir", cnic="35202-1234567-1", father_name="Qabil Khan")
+    m = _by_source(r)["NACTA"]["matches"][0]
+    assert m["cnic_match"] is False and m["father_match"] is True and m["score"] == 100.0
+
+
+def test_no_cnic_given_means_cnic_match_is_unknown_not_false(client):
+    m = _by_source(_screen(client, full_name="Muhammad Shakir"))["NACTA"]["matches"][0]
+    assert m["cnic_match"] is None and m["father_match"] is None
+
+
+def test_alias_in_a_nacta_name_is_matched(client):
+    m = _by_source(_screen(client, full_name="Babu Jhangvee"))["NACTA"]["matches"][0]
+    assert m["primary_name"] == "Aamir Bilal" and m["matched_name"] == "Babu Jhangvee"
+
+
+def test_placeholder_cnic_in_the_list_can_never_match(client):
+    # the list holds 1111111111166 for one person: that is not an identifier
+    r = _screen(client, full_name="Totally Different Name", cnic="1111111111166")
+    assert _by_source(r)["NACTA"]["status"] == "CLEAR"
+
+
+def test_invalid_cnic_from_the_applicant_is_ignored(client):
+    assert _by_source(_screen(client, full_name="Totally Different Name", cnic="12345"))["NACTA"]["status"] == "CLEAR"
+
+
+def test_missing_nacta_list_is_not_screened_and_blocks_auto_clear(client, fake_sources, monkeypatch):
+    fake_sources["nacta"] = None
+    r = _screen(client)
+    nacta = _by_source(r)["NACTA"]
+    assert nacta["status"] == "NOT_CONFIGURED" and nacta["detail"].startswith("Not screened.")
+    assert r.json()["overall_status"] == "MANUAL_REVIEW"
+    from app import main
+    monkeypatch.setattr(main, "NACTA_REQUIRED", False)
+    assert _screen(client).json()["overall_status"] == "AUTO_CLEAR"
+
+
+def test_out_of_date_nacta_list_is_incomplete_not_clear(client, fake_sources):
+    fake_sources["nacta_age_days"] = 45
+    r = _screen(client)
+    nacta = _by_source(r)["NACTA"]
+    assert nacta["status"] == "PARTIAL" and "Out of date" in nacta["lists"][0]["status"]
+    assert r.json()["overall_status"] == "MANUAL_REVIEW"
+
+
+def test_upload_requires_the_api_key(client):
+    assert client.post("/api/admin/nacta", content=b"x").status_code == 401
+
+
+def test_upload_endpoint_validates_and_stores(client, fake_sources):
+    fake_sources["nacta"] = "real"
+    assert _upload(client, b"").json()["error"]["code"] == "NACTA_FILE_EMPTY"
+    bad = _upload(client, b"just some words\nwith no headers\n")
+    assert bad.status_code == 422 and bad.json()["error"]["code"] == "NACTA_FILE_UNREADABLE"
+    assert _upload(client, b'{"data": 5}', content_type="application/json").status_code == 422
+    assert client.get("/api/admin/nacta", headers=API_HEADERS).json()["loaded"] is False
+
+    good = "Name,Father Name,CNIC\nZara Test Person,Some Father,4210112345671\nAli Test,Other Father,N/A\n"
+    r = _upload(client, good.encode())
+    body = r.json()
+    assert r.status_code == 200 and body["records"] == 2 and body["with_cnic"] == 1 and body["loaded"] is True
+    assert any("Only 2 people" in w for w in body["warnings"])        # far fewer than the real list
+    st = client.get("/api/admin/nacta", headers=API_HEADERS).json()
+    assert st["source"] == "upload" and st["records"] == 2 and st["filename"] == "nacta.csv" and st["stale"] is False
+
+
+def test_nothing_uploaded_yet_means_nacta_is_not_screened(client, fake_sources):
+    fake_sources["nacta"] = "real"
+    r = _screen(client)
+    assert _by_source(r)["NACTA"]["status"] == "NOT_CONFIGURED"
+    assert "Lists page" in _by_source(r)["NACTA"]["detail"] or "upload" in _by_source(r)["NACTA"]["detail"].lower()
+
+
+def test_an_uploaded_list_is_used_by_the_next_screening(client, fake_sources):
+    fake_sources["nacta"] = "real"
+    csv = "Name,Father Name,CNIC\nZara Test Person,Some Father,4210112345671\n"
+    assert _upload(client, csv.encode()).status_code == 200
+    r = _screen(client, full_name="Zara Test Person", cnic="4210112345671")
+    m = _by_source(r)["NACTA"]["matches"][0]
+    assert m["primary_name"] == "Zara Test Person" and m["cnic_match"] is True
+    # replacing the file replaces the list
+    assert _upload(client, b"Name,CNIC\nSomeone Else,4210100000001\n").status_code == 200
+    assert _by_source(_screen(client, full_name="Zara Test Person"))["NACTA"]["status"] == "CLEAR"
+
+
+def test_a_rejected_upload_does_not_replace_the_current_list(client, fake_sources):
+    fake_sources["nacta"] = "real"
+    assert _upload(client, b"Name,CNIC\nZara Test Person,4210112345671\n").status_code == 200
+    assert _upload(client, b"garbage with no headers").status_code == 422
+    assert client.get("/api/admin/nacta", headers=API_HEADERS).json()["records"] == 1
+    assert _by_source(_screen(client, full_name="Zara Test Person"))["NACTA"]["status"] == "HIT"
+
+
+def test_json_upload_is_accepted(client, fake_sources):
+    fake_sources["nacta"] = "real"
+    import json
+    body = json.dumps({"data": [{"Name": "Json Person", "Father Name": "F", "CNIC": "4210112345671"}]})
+    r = _upload(client, body.encode(), "nacta.json", "application/json")
+    assert r.status_code == 200 and r.json()["records"] == 1
+
+
+def test_stale_uploaded_file_is_reported_by_the_status_endpoint(client, fake_sources, monkeypatch):
+    fake_sources["nacta"] = "real"
+    assert _upload(client, b"Name,CNIC\nZara Test Person,4210112345671\n").status_code == 200
+    from app import config
+    monkeypatch.setattr(config, "NACTA_MAX_AGE_DAYS", -1)           # any file is now "too old"
+    assert client.get("/api/admin/nacta", headers=API_HEADERS).json()["stale"] is True
+    r = _screen(client)
+    assert _by_source(r)["NACTA"]["status"] == "PARTIAL" and r.json()["overall_status"] == "MANUAL_REVIEW"

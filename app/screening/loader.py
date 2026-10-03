@@ -21,9 +21,10 @@ from dataclasses import dataclass, field
 
 import requests
 
+from app import config
 from app.config import HTTP_USER_AGENT, LIST_CACHE_TTL_SECONDS
 from app.errors import logger
-from app.screening import parsers
+from app.screening import nacta_store, parsers
 
 # Same endpoints as the workflow's "List Sources" node.
 UN_URL = "https://unsolprodfiles.blob.core.windows.net/publiclegacyxmlfiles/EN/consolidatedLegacyByNAME.xml"
@@ -42,7 +43,7 @@ CONNECT_TIMEOUT = 15
 READ_TIMEOUT = 180  # the workflow allowed 180 s per list download
 PAGE_READ_TIMEOUT = 60
 
-SOURCE_KEYS = ("UNSC", "OFAC", "UKSL", "FIA_REDBOOK")
+SOURCE_KEYS = ("UNSC", "OFAC", "UKSL", "FIA_REDBOOK", "NACTA")
 
 
 class SourceUnavailable(Exception):
@@ -169,7 +170,45 @@ def _load_fia() -> GroupData:
     return GroupData("FIA_REDBOOK", parsers.prepare(records), meta)
 
 
-_LOADERS = {"UNSC": _load_unsc, "OFAC": _load_ofac, "UKSL": _load_uksl, "FIA_REDBOOK": _load_fia}
+def decode_bytes(raw: bytes) -> str:
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1")
+
+
+def _read_nacta() -> tuple:
+    """(text, metadata) of the NACTA list: downloaded from NACTA_PERSONS_URL if set, else the uploaded file."""
+    url = config.NACTA_PERSONS_URL
+    if url:
+        return fetch_text(url), {"filename": url, "uploaded_at": None, "live": True}
+    stored = nacta_store.load()
+    if not stored:
+        raise SourceUnavailable(
+            "No NACTA list has been loaded yet. Export the Fourth Schedule list from nfs.nacta.gov.pk as CSV and "
+            "upload it on the Lists page.")
+    raw, meta = stored
+    return decode_bytes(raw), meta
+
+
+def _load_nacta() -> GroupData:
+    text, meta = _read_nacta()
+    try:
+        records, _info = parsers.parse_nacta_persons(text)
+    except ValueError as exc:
+        raise SourceUnavailable(f"The NACTA file could not be read: {exc}") from None
+    if not records:
+        raise SourceUnavailable("The NACTA file contains no usable records (no names found).")
+    entry = {"list": parsers.NACTA_LABEL, "source": meta.get("filename") or "uploaded file",
+             "published": "Retrieved live" if meta.get("live") else (meta.get("uploaded_at") or "n/a")[:10],
+             "records": len(records)}
+    age = nacta_store.age_days(meta)
+    if age is not None and age > config.NACTA_MAX_AGE_DAYS:
+        entry["status"] = f"Out of date: this copy was loaded {int(age)} days ago (limit {config.NACTA_MAX_AGE_DAYS:g}). Upload a fresh export"
+    return GroupData("NACTA", parsers.prepare(records), [entry])
+
+
+_LOADERS = {"UNSC": _load_unsc, "OFAC": _load_ofac, "UKSL": _load_uksl, "FIA_REDBOOK": _load_fia, "NACTA": _load_nacta}
 
 
 # --------------------------------------------------------------------------
@@ -216,8 +255,11 @@ def load_groups() -> dict:
         return {k: f.result() for k, f in futs.items()}
 
 
-def clear_cache() -> None:
-    _cache.clear()
+def clear_cache(key: str | None = None) -> None:
+    if key is None:
+        _cache.clear()
+    else:
+        _cache.pop(key, None)
 
 
 def cache_status() -> dict:

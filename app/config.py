@@ -21,8 +21,9 @@ STORAGE_DIR = Path(os.environ.get("STORAGE_DIR", str(_backend_root)))
 
 DB_PATH = STORAGE_DIR / "screening.db"
 EVIDENCE_DIR = STORAGE_DIR / "evidence"
+LISTS_DIR = STORAGE_DIR / "lists"   # the NACTA list file uploaded through the API
 
-for d in (STORAGE_DIR, EVIDENCE_DIR):
+for d in (STORAGE_DIR, EVIDENCE_DIR, LISTS_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 
@@ -61,3 +62,18 @@ HTTP_USER_AGENT = os.environ.get(
 # check that did not run can never look like a clean result. Set FIA_REQUIRED=false
 # to get the workflow's behaviour instead.
 FIA_REQUIRED = os.environ.get("FIA_REQUIRED", "true").strip().lower() not in ("0", "false", "no")
+
+# --- NACTA Proscribed Persons (Fourth Schedule) ---------------------------
+# NACTA publishes this list only through a web app (nfs.nacta.gov.pk), with no
+# stable file download, so it is loaded from a CSV or JSON file uploaded through
+# POST /api/admin/nacta. If you find a stable URL that returns the list as CSV or
+# JSON, set NACTA_PERSONS_URL and it is downloaded live instead.
+NACTA_PERSONS_URL = os.environ.get("NACTA_PERSONS_URL", "").strip()
+
+# The list changes every few weeks. A copy older than this is reported as
+# out of date, which routes the applicant to manual review instead of looking clear.
+NACTA_MAX_AGE_DAYS = _float_env("NACTA_MAX_AGE_DAYS", 30)
+
+# Like the FIA Red Book: when true (the default), a NACTA list that is missing or out
+# of date sends an otherwise clear applicant to manual review.
+NACTA_REQUIRED = os.environ.get("NACTA_REQUIRED", "true").strip().lower() not in ("0", "false", "no")

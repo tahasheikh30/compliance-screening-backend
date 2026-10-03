@@ -294,6 +294,10 @@ def generate_evidence_pdf(r: dict, case_ref: str, out_path: Path | None = None) 
     d.kv("Name screened", app["name"])
     d.kv("Date of birth", app["dob"])
     d.kv("Nationality", app["nationality"])
+    if app.get("cnic"):
+        d.kv("CNIC", app["cnic"])
+    if app.get("father_name"):
+        d.kv("Father / husband name", app["father_name"])
 
     d.section("Screening details")
     d.kv("Screened at", fmt_date(r["screened_at"]))
@@ -318,7 +322,8 @@ def generate_evidence_pdf(r: dict, case_ref: str, out_path: Path | None = None) 
         d.labeled("Source", src, indent=10, link=bool(re.match(r"^https?://", clean(src), re.I)))
         d.labeled("List date", fmt_date(lst.get("published") or "n/a"), indent=10)
         if not loaded:
-            d.labeled("Status", "Not found. This list could not be retrieved, so it was not screened.",
+            why = re.sub(r"^not available: ", "", str(status or ""), flags=re.I)
+            d.labeled("Status", "Not screened. " + (why or "This list could not be retrieved."),
                       indent=10, bold=True, color=COL["red"])
         else:
             if status and status != "OK" and not re.match(r"^not available", str(status), re.I):
@@ -364,6 +369,14 @@ def generate_evidence_pdf(r: dict, case_ref: str, out_path: Path | None = None) 
             ("DOB year matches applicant", m["dob_year_match"]), ("Nationality", m["nationality"]),
             ("Listed on", m["listed_on"]),
         ]
+        if m.get("cnic"):
+            rows.append(("CNIC", m["cnic"]))
+        if m.get("cnic_match") is not None:
+            rows.append(("CNIC matches applicant", "Yes" if m["cnic_match"] else "No"))
+        if m.get("father_name"):
+            rows.append(("Father / husband", m["father_name"]))
+        if m.get("father_match") is not None:
+            rows.append(("Father's name matches applicant", "Yes" if m["father_match"] else "No"))
         if m.get("aliases"):
             rows.append(("Other names", "; ".join(m["aliases"])))
         if m.get("remarks"):

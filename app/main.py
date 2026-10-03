@@ -20,6 +20,8 @@ Endpoints:
     GET  /api/evidence/{result_id}        same PDF, addressed by a result row id
     GET  /api/admin/lists                 which lists are cached in memory right now
     POST /api/admin/refresh               drop the in-memory list cache and reload every list
+    GET  /api/admin/nacta                 which NACTA file is loaded and how old it is
+    POST /api/admin/nacta                 upload the NACTA Proscribed Persons CSV or JSON export
     GET  /api/health                      unauthenticated liveness check
 """
 
@@ -32,11 +34,12 @@ from fastapi.responses import FileResponse
 
 from app import database as db
 from app import evidence
+from app import config as app_config
 from app.auth import require_api_key
-from app.config import EVIDENCE_DIR, FIA_REQUIRED
+from app.config import EVIDENCE_DIR, FIA_REQUIRED, NACTA_REQUIRED
 from app.errors import AppError, configure_logging, install as install_error_handlers, request_context, logger
 from app.schemas import ApplicantSummary, ScreenRequest, ScreenResponse, ScreeningResultOut
-from app.screening import engine, loader
+from app.screening import engine, loader, nacta_store, parsers
 
 configure_logging()
 
@@ -102,7 +105,8 @@ def screen_applicant(request: Request, req: ScreenRequest):
                                        dob=req.dob, nationality=req.nationality, threshold=threshold)
     case_ref = _case_ref(applicant_id, now)
 
-    result = engine.screen(req.full_name, req.dob or "", req.nationality or "", threshold)
+    result = engine.screen(req.full_name, req.dob or "", req.nationality or "", threshold,
+                           cnic=req.cnic or "", father_name=req.father_name or "")
 
     statuses: dict = {}
     rows: list = []
@@ -118,7 +122,7 @@ def screen_applicant(request: Request, req: ScreenRequest):
             best["score"] if best else None,
             status, detail, None, result["screened_at"],
             list_version=src["list_version"], records_screened=src["records"],
-            payload={"matches": src["matches"], "articles": src["articles"], "match_count": src["match_count"]},
+            payload={"matches": src["matches"], "articles": src["articles"], "match_count": src["match_count"], "lists": src["lists"]},
         )
         rows.append((row_id, key, src, status, detail, best))
 
@@ -136,7 +140,7 @@ def screen_applicant(request: Request, req: ScreenRequest):
                 if status in ("HIT", "REVIEW"):
                     db.append_result_detail(row_id, note)
 
-    overall = engine.overall_status(statuses, FIA_REQUIRED)
+    overall = engine.overall_status(statuses, FIA_REQUIRED, NACTA_REQUIRED)
     db.update_applicant_status(applicant_id, overall, records_screened=result["total_records"])
 
     results_out = [
@@ -223,9 +227,73 @@ def refresh_lists(request: Request):
     out = {}
     for key, g in loader.load_groups().items():
         out[key] = ({"error": g.error} if g.error else
-                    {"records": len(g.records), "lists": [{"list": m["list"], "records": m["records"],
-                                                           "published": m.get("published")} for m in g.meta]})
+                    {"records": len(g.records), "lists": [engine._list_info(m) for m in g.meta]})
     return out
+
+
+MAX_NACTA_UPLOAD_BYTES = 25 * 1024 * 1024
+NACTA_MIN_EXPECTED = 500   # the Fourth Schedule has several thousand people; far fewer suggests a partial export
+
+
+def _nacta_status() -> dict:
+    meta = nacta_store.meta()
+    live = bool(app_config.NACTA_PERSONS_URL)
+    age = nacta_store.age_days(meta)
+    return {
+        "loaded": bool(meta) or live,
+        "source": "url" if live else ("upload" if meta else None),
+        "url": app_config.NACTA_PERSONS_URL or None,
+        "filename": (meta or {}).get("filename"),
+        "uploaded_at": (meta or {}).get("uploaded_at"),
+        "records": (meta or {}).get("records"),
+        "age_days": round(age, 1) if age is not None else None,
+        "max_age_days": app_config.NACTA_MAX_AGE_DAYS,
+        "stale": bool(age is not None and not live and age > app_config.NACTA_MAX_AGE_DAYS),
+    }
+
+
+@app.get("/api/admin/nacta", dependencies=[Depends(require_api_key)])
+@limiter.limit("30/minute")
+def nacta_status(request: Request):
+    """Which NACTA list the screening is using, and how old it is."""
+    return _nacta_status()
+
+
+@app.post("/api/admin/nacta", dependencies=[Depends(require_api_key)])
+@limiter.limit("10/hour")
+async def upload_nacta(request: Request, filename: str = "nacta.csv"):
+    """
+    Load the NACTA Proscribed Persons (Fourth Schedule) list. Send the CSV or JSON export as the
+    request body (not a multipart form), with the file name in ?filename=. The file replaces the
+    previous one only if it can be read.
+    """
+    data = await request.body()
+    if not data:
+        raise AppError(400, "NACTA_FILE_EMPTY", "The upload was empty.", "Choose the exported CSV or JSON file and try again.")
+    if len(data) > MAX_NACTA_UPLOAD_BYTES:
+        raise AppError(413, "NACTA_FILE_TOO_LARGE", "That file is too large for the NACTA list.",
+                       "The Fourth Schedule export is a few megabytes at most. Check you chose the right file.")
+    try:
+        records, info = parsers.parse_nacta_persons(loader.decode_bytes(data))
+    except ValueError as exc:
+        raise AppError(422, "NACTA_FILE_UNREADABLE", f"The file could not be read: {exc}",
+                       "Upload the list as CSV or JSON, with a header row that includes the name column.") from None
+    if not records:
+        raise AppError(422, "NACTA_FILE_NO_RECORDS", "The file has no usable records (no names found).",
+                       "Check that the first row holds the column headers.")
+    meta = nacta_store.save(data, filename, len(records))
+    loader.clear_cache("NACTA")
+    warnings = []
+    if len(records) < NACTA_MIN_EXPECTED:
+        warnings.append(f"Only {len(records)} people were found. The Fourth Schedule normally has several thousand, "
+                        "so this may be a partial export.")
+    if not info["with_cnic"]:
+        warnings.append("No usable CNIC numbers were found, so matching will rely on names alone.")
+    if not info["has_father"]:
+        warnings.append("No father's name column was found.")
+    logger.info("NACTA list uploaded: %s records from %s", len(records), meta["filename"])
+    return {**_nacta_status(), "records": len(records), "rows_read": info["rows"], "rows_skipped": info["skipped"],
+            "with_cnic": info["with_cnic"], "warnings": warnings}
 
 
 @app.get("/api/health")

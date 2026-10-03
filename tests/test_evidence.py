@@ -27,7 +27,7 @@ def test_evidence_lists_unavailable_sources_as_not_screened(fake_sources, storag
     fake_sources["fail"].add("https://www.fia.gov.pk/press-pub")
     r = engine.screen("Muhammad Ali Khan")
     _, text = _text(evidence.generate_evidence_pdf(r, "CS-1"))
-    assert "could not be retrieved, so it was not screened" in text
+    assert "Not screened." in text and "FIA website could not be reached" in text
 
 
 def test_many_matches_paginate_with_page_numbers(fake_sources, storage):

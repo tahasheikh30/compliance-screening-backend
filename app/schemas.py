@@ -5,10 +5,11 @@ from pydantic import BaseModel, Field, field_validator
 
 class ScreenRequest(BaseModel):
     """
-    Inputs of the n8n "Applicant Sanctions Screening" form: name (required),
-    date of birth, nationality and match threshold. `cnic` and `father_name`
-    are kept so existing clients keep working; they are stored with the
-    applicant but do not influence matching.
+    Inputs of the screening form: name (required), date of birth, nationality and
+    match threshold, plus `cnic` and `father_name`. The FIA Red Book and NACTA lists
+    publish CNIC and father's name, so a CNIC that equals a listed CNIC is reported
+    as a match whatever the name looks like, and a matching father's name is shown as
+    supporting evidence. A CNIC that is not 13 digits is ignored.
     """
     full_name: str = Field(..., min_length=2, max_length=200)
     dob: Optional[str] = Field(default=None, max_length=30)
@@ -49,6 +50,10 @@ class MatchOut(BaseModel):
     listed_on: str = ""
     remarks: str = ""
     aliases: List[str] = []
+    cnic: str = ""
+    father_name: str = ""
+    cnic_match: Optional[bool] = None    # None: the applicant gave no CNIC, or the list has none for this person
+    father_match: Optional[bool] = None
 
 
 class ArticleOut(BaseModel):
@@ -57,6 +62,13 @@ class ArticleOut(BaseModel):
     published: str = ""
     source: str = ""
     keyword: str = ""
+
+
+class ListInfoOut(BaseModel):
+    list: str
+    records: int = 0
+    published: Optional[str] = None
+    status: str = "OK"  # "OK", or why this list could not be read
 
 
 class ScreeningResultOut(BaseModel):
@@ -78,6 +90,7 @@ class ScreeningResultOut(BaseModel):
     matches: List[MatchOut] = []      # best matches first, at most MAX_MATCHES per source
     match_count: Optional[int] = None  # true number of matches found, may exceed len(matches)
     articles: List[ArticleOut] = []
+    lists: List[ListInfoOut] = []      # every list behind this source and whether it could be read
 
 
 class ScreenResponse(BaseModel):

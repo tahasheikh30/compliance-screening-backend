@@ -8,7 +8,8 @@ def test_clear_applicant_has_no_hits_and_every_source_clear(fake_sources):
     r = engine.screen("Completely Unrelated Person")
     assert r["hit"] is False and r["hit_count"] == 0
     assert {k: engine.source_status(v) for k, v in r["sources"].items()} == {
-        "UNSC": "CLEAR", "OFAC": "CLEAR", "UKSL": "CLEAR", "FIA_REDBOOK": "CLEAR", "ADVERSE_MEDIA": "CLEAR"}
+        "UNSC": "CLEAR", "OFAC": "CLEAR", "UKSL": "CLEAR", "FIA_REDBOOK": "CLEAR", "NACTA": "CLEAR",
+        "ADVERSE_MEDIA": "CLEAR"}
     assert engine.overall_status({k: "CLEAR" for k in r["sources"]}) == "AUTO_CLEAR"
     assert r["total_records"] == 3 + 4 + 1 + 2 or r["total_records"] > 0
     assert r["lists"][0]["records"] == 3
@@ -184,3 +185,100 @@ def test_per_source_matches_are_capped_but_the_true_count_is_kept(fake_sources, 
     un = engine.screen("Muhammad Ali Khan", threshold=80)["sources"]["UNSC"]
     assert len(un["matches"]) == 1 and un["match_count"] == 2
     assert "2 potential match(es)" in engine.describe_source(un, "HIT", 80)
+
+
+# ---- a source with several books where only some can be read ------------------
+
+def _second_redbook(fake_sources, readable):
+    """Add a second FIA book. `readable` False makes it a PDF whose layout the parser cannot read."""
+    import io
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    fake_sources["texts"]["https://www.fia.gov.pk/press-pub"] = (
+        fx.FIA_PAGE_HTML + '<a href="/files/terror.pdf">FIA Red Book Most Wanted Terrorists</a>')
+    if readable:
+        fake_sources["bytes"]["https://www.fia.gov.pk/files/terror.pdf"] = fx.make_redbook_pdf(
+            [("SADDAR HAYAT", "ZIA ULLAH", "17301-3333333-3", "01-01-1985", "PESHAWAR", "FIR No(s) 5/2018 Section 302")])
+    else:
+        buf = io.BytesIO()
+        c = canvas.Canvas(buf, pagesize=A4)
+        c.drawString(30, 800, "S.No  Name  Father Name  Head Money  Wanted By")
+        c.drawString(30, 780, "1  SADDAR HAYAT  ZIA ULLAH  8,000,000  KP POLICE")
+        c.save()
+        fake_sources["bytes"]["https://www.fia.gov.pk/files/terror.pdf"] = buf.getvalue()
+
+
+def test_both_red_books_are_screened_when_both_can_be_read(fake_sources):
+    _second_redbook(fake_sources, readable=True)
+    r = engine.screen("Saddar Hayat")
+    fia = r["sources"]["FIA_REDBOOK"]
+    assert [li["status"] for li in fia["lists"]] == ["OK", "OK"] and not fia["partial"]
+    assert {li["list"] for li in fia["lists"]} == {"FIA Red Book 2026", "FIA Red Book Most Wanted Terrorists"}
+    assert engine.source_status(fia) == "HIT" and fia["matches"][0]["list"] == "FIA Red Book Most Wanted Terrorists"
+
+
+def test_unreadable_second_book_is_flagged_never_silently_clear(fake_sources):
+    _second_redbook(fake_sources, readable=False)
+    r = engine.screen("Completely Unrelated Person")
+    fia = r["sources"]["FIA_REDBOOK"]
+    assert fia["available"] and fia["partial"]                     # one book was read, one was not
+    unread = [li for li in fia["lists"] if li["status"] != "OK"]
+    assert len(unread) == 1 and "no records could be read" in unread[0]["status"] and unread[0]["records"] == 0
+    assert engine.source_status(fia) == "PARTIAL"
+    text = engine.describe_source(fia, "PARTIAL", 85)
+    assert text.startswith("Incomplete screening.") and "Most Wanted Terrorists" in text and "not yet cleared" in text
+    statuses = {k: engine.source_status(v) for k, v in r["sources"].items()}
+    assert engine.overall_status(statuses, fia_required=True) == "MANUAL_REVIEW"
+    assert engine.overall_status(statuses, fia_required=False) == "AUTO_CLEAR"   # the workflow's optional-FIA behaviour
+
+
+def test_a_hit_in_the_readable_book_still_mentions_the_unreadable_one(fake_sources):
+    _second_redbook(fake_sources, readable=False)
+    fia = engine.screen("Tariq Bhatti")["sources"]["FIA_REDBOOK"]
+    assert engine.source_status(fia) == "HIT"
+    assert "some lists of this source were not fully screened" in engine.describe_source(fia, "HIT", 85)
+
+
+def test_every_source_reports_its_lists(fake_sources):
+    r = engine.screen("Anyone Here")
+    assert [li["list"] for li in r["sources"]["OFAC"]["lists"]] == [
+        "OFAC Specially Designated Nationals (SDN) List", "OFAC Consolidated (Non-SDN) List"]
+    assert all(li["status"] == "OK" for s in r["sources"].values() for li in s["lists"])
+    assert r["sources"]["ADVERSE_MEDIA"]["lists"] == []
+
+
+# ---- CNIC and father's name ---------------------------------------------------------
+
+def test_cnic_match_on_the_fia_red_book_is_reported_whatever_the_name(fake_sources):
+    r = engine.screen("Totally Different Name", cnic="35202-1111111-1")
+    fia = r["sources"]["FIA_REDBOOK"]
+    assert engine.source_status(fia) == "HIT"
+    m = fia["matches"][0]
+    assert m["cnic_match"] is True and m["primary_name"] == "TARIQ MEHMOOD SATTAR" and m["score"] < 85
+
+
+def test_cnic_matches_rank_above_better_name_scores(fake_sources):
+    # "Tariq Bhatti" matches a Red Book name exactly; the CNIC belongs to a different NACTA person
+    r = engine.screen("Tariq Bhatti", cnic="3740565359881")
+    assert r["matches"][0]["cnic_match"] is True and r["matches"][0]["source"] == "nacta"
+    assert any(m["source"] == "fia" and not m["cnic_match"] for m in r["matches"])
+
+
+def test_father_name_is_supporting_evidence_only(fake_sources):
+    same = engine.screen("Muhammad Shakir", father_name="Qabil Khan")["sources"]["NACTA"]["matches"][0]
+    other = engine.screen("Muhammad Shakir", father_name="Somebody Else")["sources"]["NACTA"]["matches"][0]
+    assert same["father_match"] is True and other["father_match"] is False
+    assert other["score"] == 100.0                      # a different father never removes the match
+
+
+def test_applicant_cnic_is_normalised_in_the_result(fake_sources):
+    assert engine.screen("Anyone Here", cnic="37405-6535988-1")["applicant"]["cnic"] == "3740565359881"
+    assert engine.screen("Anyone Here", cnic="not a cnic")["applicant"]["cnic"] == ""
+
+
+def test_nacta_overall_status_rules():
+    assert engine.overall_status({"NACTA": "NOT_CONFIGURED", "UNSC": "CLEAR"}) == "MANUAL_REVIEW"
+    assert engine.overall_status({"NACTA": "NOT_CONFIGURED", "UNSC": "CLEAR"}, nacta_required=False) == "AUTO_CLEAR"
+    assert engine.overall_status({"NACTA": "PARTIAL"}, nacta_required=False) == "AUTO_CLEAR"
+    # not required never hides a real problem elsewhere
+    assert engine.overall_status({"NACTA": "NOT_CONFIGURED", "UNSC": "ERROR"}, nacta_required=False) == "MANUAL_REVIEW"

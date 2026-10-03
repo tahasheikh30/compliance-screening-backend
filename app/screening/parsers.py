@@ -37,6 +37,8 @@ class Record:
     names: list
     source_key: str = ""
     toks: list = field(default_factory=list)  # tokenised names, filled by prepare()
+    cnic: str = ""    # 13 digit national ID, digits only, when the list publishes one
+    father: str = ""  # father's or husband's name, when the list publishes one
 
 
 def prepare(records: list) -> list:
@@ -352,6 +354,8 @@ def parse_redbook(text: str, title: str) -> list:
             remarks=remarks,
             names=names,
             source_key="fia",
+            cnic=normalize_cnic(cnic),
+            father=father,
         ))
     return records
 
@@ -411,3 +415,148 @@ def parse_news_hits(xml: str, applicant_name: str, limit: int = 20) -> tuple:
         if len(hits) >= limit:
             break
     return len(items), hits
+
+
+# --------------------------------------------------------------------------
+# NACTA Proscribed Persons (Fourth Schedule of the Anti-Terrorism Act, 1997)
+# --------------------------------------------------------------------------
+# Published by NACTA through a web app, so this parser reads an exported CSV or
+# JSON file rather than a fixed feed. Column names differ between exports and
+# mirrors ("Primary Title / Name", "Father Name", "CNIC / ID Number", ...), so
+# columns are recognised by name, ignoring case and punctuation.
+
+import json  # noqa: E402
+
+NACTA_LABEL = "NACTA Proscribed Persons (Fourth Schedule)"
+NACTA_PROGRAMME = "Anti-Terrorism Act 1997, Fourth Schedule"
+
+
+def normalize_cnic(v) -> str:
+    """13 digit CNIC with everything else removed, or '' when it is missing or not usable."""
+    digits = re.sub(r"\D", "", str(v or ""))
+    # placeholders such as 1111111111166 or 0000000000000 are not real identifiers
+    if len(digits) != 13 or len(set(digits)) <= 2:
+        return ""
+    return digits
+
+
+def _hkey(h) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(h or "").lower())
+
+
+_NAME_KEYS = {"name", "primarytitlename", "primaryname", "fullname", "personname", "nameofperson",
+              "nameofproscribedperson", "title", "accusedname", "nameofaccused"}
+_FATHER_KEYS = {"fathername", "fatherhusbandname", "fatherorhusbandname", "fathersname", "father",
+                "husbandname", "guardianname", "sonof", "swdowo", "so", "sdwo"}
+_CNIC_KEYS = {"cnic", "cnicidnumber", "cnicno", "cnicnumber", "idnumber", "nic", "nicnumber",
+              "nationalid", "identitynumber", "idno"}
+_DISTRICT_KEYS = {"district", "city"}
+_PROVINCE_KEYS = {"province", "state", "region"}
+_SERIAL_KEYS = {"sno", "serialno", "serial", "srno", "sr", "id", "no"}
+_ALIAS_KEYS = {"alias", "aliases", "alsoknownas", "aka", "othernames", "alternatename"}
+
+_NACTA_PLACEHOLDERS = {"", "nill", "nil", "n/a", "na", "none", "null", "-", "--", "unknown"}
+
+
+def _clean_cell(v) -> str:
+    s = re.sub(r"\s+", " ", "" if v is None else str(v)).strip()
+    return "" if s.lower() in _NACTA_PLACEHOLDERS else s
+
+
+def _row_fields(row: dict) -> dict:
+    by = {_hkey(k): v for k, v in row.items()}
+
+    def first(keys):
+        for k in keys:
+            if k in by and _clean_cell(by[k]):
+                return _clean_cell(by[k])
+        return ""
+
+    name = first(_NAME_KEYS)
+    if not name:  # any other column that mentions "name" but is not a relative's name
+        for k, v in by.items():
+            if "name" in k and not re.search(r"father|husband|mother|guardian|wife", k) and _clean_cell(v):
+                name = _clean_cell(v)
+                break
+    return {
+        "name": name, "father": first(_FATHER_KEYS), "cnic_raw": first(_CNIC_KEYS),
+        "district": first(_DISTRICT_KEYS), "province": first(_PROVINCE_KEYS),
+        "serial": first(_SERIAL_KEYS), "alias": first(_ALIAS_KEYS),
+    }
+
+
+def _nacta_rows(text: str) -> list:
+    """Rows as dicts, from a JSON array (or an object holding one) or from CSV."""
+    t = text.lstrip("\ufeff").strip()
+    if not t:
+        raise ValueError("The file is empty.")
+    if t[0] in "[{":
+        try:
+            data = json.loads(t)
+        except ValueError as exc:
+            raise ValueError(f"The file looks like JSON but could not be parsed ({exc}).") from None
+        if isinstance(data, dict):
+            lists = [v for v in data.values() if isinstance(v, list) and v and isinstance(v[0], dict)]
+            if not lists:
+                raise ValueError("The JSON has no list of records. Expected an array of objects.")
+            data = max(lists, key=len)
+        rows = [r for r in data if isinstance(r, dict)]
+        if not rows:
+            raise ValueError("The JSON contains no records.")
+        return rows
+    first_line = t.splitlines()[0]
+    delim = max((",", ";", "\t", "|"), key=first_line.count)
+    grid = [r for r in csv.reader(io.StringIO(t, newline=""), delimiter=delim) if any(c.strip() for c in r)]
+    # the header is the first row that has a recognisable name column
+    for i, row in enumerate(grid[:15]):
+        keys = {_hkey(c) for c in row}
+        if keys & _NAME_KEYS or any("name" in k and "father" not in k for k in keys):
+            header = row
+            return [dict(zip(header, r)) for r in grid[i + 1:]]
+    raise ValueError("Could not find a Name column. The first row should have headers such as Name, Father Name, CNIC.")
+
+
+def parse_nacta_persons(text: str) -> tuple:
+    """
+    Returns (records, info). `info` has rows read, rows skipped (no name) and whether the
+    file has CNIC and father's name columns, so the upload response can say what was found.
+    """
+    rows = _nacta_rows(text)
+    records = []
+    skipped = 0
+    with_cnic = 0
+    for idx, row in enumerate(rows, start=1):
+        f = _row_fields(row)
+        if not f["name"]:
+            skipped += 1
+            continue
+        parts = [x.strip() for x in _ALIAS_SPLIT.split(f["name"]) if x and x.strip()]
+        names = parts or [f["name"]]
+        if f["alias"]:
+            names += [x.strip() for x in re.split(r"[;,/]", f["alias"]) if x.strip()]
+        cnic = normalize_cnic(f["cnic_raw"])
+        with_cnic += 1 if cnic else 0
+        remarks = "; ".join(x for x in [
+            ("Father/Husband: " + f["father"]) if f["father"] else "",
+            ("CNIC: " + (cnic or f["cnic_raw"])) if (cnic or f["cnic_raw"]) else "",
+            ("District: " + f["district"]) if f["district"] else "",
+            ("Province: " + f["province"]) if f["province"] else "",
+        ] if x)
+        records.append(Record(
+            list=NACTA_LABEL,
+            id="NACTA-" + (f["serial"] or str(idx)),
+            primary=names[0],
+            type="Individual",
+            programs=NACTA_PROGRAMME,
+            dob="",
+            nationality="",
+            listed_on="",
+            remarks=remarks,
+            names=names,
+            source_key="nacta",
+            cnic=cnic,
+            father=f["father"],
+        ))
+    info = {"rows": len(rows), "skipped": skipped, "with_cnic": with_cnic,
+            "has_father": any(r.father for r in records)}
+    return records, info

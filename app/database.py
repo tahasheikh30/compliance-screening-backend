@@ -140,6 +140,8 @@ def _result_row(row) -> dict:
     d["matches"] = p.get("matches", [])
     d["articles"] = p.get("articles", [])
     d["match_count"] = p.get("match_count", len(d["matches"]))
+    d["lists"] = p.get("lists", [])
+    d["cnic_match"] = any(m.get("cnic_match") for m in d["matches"])
     return d
 
 

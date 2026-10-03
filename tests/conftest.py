@@ -35,6 +35,9 @@ def storage(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "EVIDENCE_DIR", ev)
     monkeypatch.setattr(evidence, "EVIDENCE_DIR", ev)
     monkeypatch.setattr(main, "EVIDENCE_DIR", ev)
+    lists = tmp_path / "lists"
+    lists.mkdir()
+    monkeypatch.setattr(config, "LISTS_DIR", lists)
     return tmp_path
 
 
@@ -59,6 +62,8 @@ def fake_sources(monkeypatch):
         "fail": set(),          # URLs that raise
         "news": fx.NEWS_RSS_CLEAR,
         "news_fail": False,
+        "nacta": fx.NACTA_CSV,          # None = nothing uploaded
+        "nacta_age_days": 1.0,
     }
 
     def fake_fetch_text(url, read_timeout=0):
@@ -84,6 +89,18 @@ def fake_sources(monkeypatch):
             raise ConnectionError("simulated news outage")
         return state["news"]
 
+    real_read_nacta = loader._read_nacta
+
+    def fake_read_nacta():
+        from datetime import datetime, timedelta, timezone
+        if state["nacta"] == "real":          # exercise the real file store (needs the `storage` fixture)
+            return real_read_nacta()
+        if state["nacta"] is None:
+            raise loader.SourceUnavailable("No NACTA list has been loaded yet. Upload one.")
+        when = datetime.now(timezone.utc) - timedelta(days=state["nacta_age_days"])
+        return state["nacta"], {"filename": "nacta.csv", "uploaded_at": when.isoformat(), "live": False}
+
+    monkeypatch.setattr(loader, "_read_nacta", fake_read_nacta)
     monkeypatch.setattr(loader, "fetch_text", fake_fetch_text)
     monkeypatch.setattr(loader, "_get", fake_get)
     monkeypatch.setattr(loader, "fetch_news", fake_news)

@@ -94,3 +94,78 @@ def test_news_hit_needs_surname_plus_another_part_and_a_keyword():
 def test_news_single_word_name_needs_the_whole_name():
     xml = fx.NEWS_RSS_HIT.replace("Bilal Ahmed Qureshi arrested", "Qureshi arrested")
     assert len(p.parse_news_hits(xml, "Qureshi")[1]) == 1
+
+
+# ---- NACTA Proscribed Persons (Fourth Schedule) ----------------------------------
+
+import json  # noqa: E402
+
+import pytest  # noqa: E402
+
+
+def test_normalize_cnic_accepts_real_numbers_and_rejects_junk():
+    assert p.normalize_cnic("35202-1234567-1") == "3520212345671"
+    assert p.normalize_cnic(" 3520212345671 ") == "3520212345671"
+    assert p.normalize_cnic("1111111111166") == ""      # placeholder seen in published data
+    assert p.normalize_cnic("0000000000000") == ""
+    assert p.normalize_cnic("12345") == "" and p.normalize_cnic("N/A") == "" and p.normalize_cnic(None) == ""
+    assert p.normalize_cnic("352021234567") == ""       # 12 digits
+
+
+def test_nacta_csv_in_the_portal_layout():
+    recs, info = p.parse_nacta_persons(fx.NACTA_CSV)
+    assert info == {"rows": 4, "skipped": 0, "with_cnic": 3, "has_father": True}
+    a, b, c, d = recs
+    assert a.primary == "Muhammad Shakir" and a.father == "Qabil Khan" and a.cnic == "3740565359881"
+    assert a.id == "NACTA-1" and a.list == p.NACTA_LABEL and a.source_key == "nacta" and a.type == "Individual"
+    assert "District: HANGU" in a.remarks and "Province: PUNJAB" in a.remarks
+    assert b.names == ["Aamir Bilal", "Babu Jhangvee"]          # "alias" split into separate names
+    assert c.father == "" and "Father" not in c.remarks          # "nill" is not a father's name
+    assert d.cnic == "" and "CNIC: 1111111111166" in d.remarks   # shown, but never used for matching
+
+
+def test_nacta_csv_in_the_other_column_order_and_with_other_delimiters():
+    other = "ID,Name,Father Name,CNIC,Province,District\n7,Zain Haider,Ahmad Nawaz,3810481580749,Punjab,BHAKKAR\n"
+    for text in (other, other.replace(",", ";"), other.replace(",", "\t")):
+        recs, _ = p.parse_nacta_persons(text)
+        assert recs[0].primary == "Zain Haider" and recs[0].cnic == "3810481580749" and recs[0].id == "NACTA-7"
+
+
+def test_nacta_csv_with_a_title_row_above_the_headers_and_a_bom():
+    text = "\ufeffProscribed Persons List\nTotal Record : 2\nID,Name,Father Name,CNIC\n1,A B,C D,3810481580749\n"
+    recs, info = p.parse_nacta_persons(text)
+    assert [r.primary for r in recs] == ["A B"] and info["rows"] == 1
+
+
+def test_nacta_json_shapes():
+    rows = [{"Name": "A One", "Father Name": "F", "CNIC": "3810481580749", "District": "X", "Province": "Y"}]
+    assert p.parse_nacta_persons(json.dumps(rows))[0][0].cnic == "3810481580749"
+    assert p.parse_nacta_persons(json.dumps({"total": 1, "data": rows}))[0][0].primary == "A One"
+    snake = [{"full_name": "B Two", "fatherName": "G", "cnic_no": "3810481580749"}]
+    r = p.parse_nacta_persons(json.dumps(snake))[0][0]
+    assert r.primary == "B Two" and r.father == "G" and r.cnic == "3810481580749"
+
+
+def test_nacta_rows_without_a_name_are_skipped_and_counted():
+    recs, info = p.parse_nacta_persons("Name,CNIC\nAli Raza,3810481580749\n,3810481580750\n  ,3810481580751\n")
+    assert len(recs) == 1 and info["skipped"] == 2
+
+
+@pytest.mark.parametrize("text,fragment", [
+    ("", "empty"),
+    ("   \n  ", "empty"),
+    ("just words\nno headers here\n", "Name column"),
+    ("{broken json", "JSON"),
+    ('{"data": 5}', "no list of records"),
+    ("[]", "no records"),
+])
+def test_nacta_unreadable_files_raise_a_clear_message(text, fragment):
+    with pytest.raises(ValueError) as e:
+        p.parse_nacta_persons(text)
+    assert fragment.lower() in str(e.value).lower()
+
+
+def test_fia_red_book_records_carry_cnic_and_father_for_matching():
+    recs = p.parse_redbook(p.pdf_to_text(fx.make_redbook_pdf()), "Red Book 2026")
+    assert recs[0].cnic == "3520211111111" and recs[0].father == "ABDUL SATTAR"
+    assert recs[1].cnic == "4210122222223" and recs[1].father == "MUHAMMAD IQBAL"
