@@ -1,0 +1,4 @@
+# Only needed to run scripts/fetch_nacta.py. Not part of the web service, so the
+# backend does not install a browser.
+playwright==1.48.0
+rapidfuzz==3.9.7

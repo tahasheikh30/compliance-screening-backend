@@ -282,3 +282,119 @@ def test_nacta_overall_status_rules():
     assert engine.overall_status({"NACTA": "PARTIAL"}, nacta_required=False) == "AUTO_CLEAR"
     # not required never hides a real problem elsewhere
     assert engine.overall_status({"NACTA": "NOT_CONFIGURED", "UNSC": "ERROR"}, nacta_required=False) == "MANUAL_REVIEW"
+
+
+# ---- per-list status for the Lists page ------------------------------------------------
+
+def test_cache_status_reports_each_red_book_separately(fake_sources):
+    _second_redbook(fake_sources, readable=False)
+    loader.load_group("FIA_REDBOOK")
+    fia = loader.cache_status()["FIA_REDBOOK"]
+    assert fia["cached"] and fia["error"] is None
+    good, bad = fia["lists"]
+    assert good["list"] == "FIA Red Book 2026" and good["records"] == 2 and good["status"] == "OK"
+    assert good["source"] == "https://www.fia.gov.pk/files/redbook-2026.pdf" and "sample" not in good
+    assert bad["list"] == "FIA Red Book Most Wanted Terrorists" and bad["records"] == 0
+    assert "no records could be read" in bad["status"]
+    assert bad["source"] == "https://www.fia.gov.pk/files/terror.pdf"
+    assert "Head Money" in bad["sample"]            # the text that was read, so the layout can be diagnosed
+
+
+def test_the_sample_is_admin_only_and_never_reaches_screening_results(fake_sources):
+    _second_redbook(fake_sources, readable=False)
+    fia = engine.screen("Anyone Here")["sources"]["FIA_REDBOOK"]
+    assert all("sample" not in li and "source" not in li for li in fia["lists"])
+
+
+def test_cache_status_keeps_the_reason_a_source_failed(fake_sources):
+    fake_sources["fail"].add(loader.UK_URL)
+    loader.load_group("UKSL")
+    uk = loader.cache_status()["UKSL"]
+    assert uk["cached"] is False and "could not be downloaded" in uk["error"]
+    assert uk["lists"][0]["status"].startswith("The list could not be downloaded")
+    assert loader.cache_status()["UNSC"] == {"cached": False, "records": 0, "age_seconds": None, "error": None, "lists": []}
+
+
+def test_a_pdf_without_text_is_reported_as_such(fake_sources):
+    import io
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    c.rect(50, 50, 100, 100)          # a page with a drawing but no text, like a scanned image
+    c.save()
+    fake_sources["bytes"]["https://www.fia.gov.pk/files/redbook-2026.pdf"] = buf.getvalue()
+    loader.load_group("FIA_REDBOOK")
+    fia = loader.cache_status()["FIA_REDBOOK"]
+    assert fia["error"] and "no extractable text" in fia["lists"][0]["status"]
+
+
+# ---- NACTA live download ------------------------------------------------------------------
+
+NACTA_URL = "https://nfs.example.pk/export.json"
+NACTA_JSON = (b'[{"id": 1, "name": "Live Person", "father_name": "Live Father", "cnic": "3740565359881", '
+              b'"province": "Punjab", "district": "HANGU"}]')
+
+
+def _live(fake_sources, monkeypatch, tmp_path, body=NACTA_JSON):
+    from app import config
+    monkeypatch.setattr(config, "NACTA_PERSONS_URL", NACTA_URL)
+    monkeypatch.setattr(config, "LISTS_DIR", tmp_path / "lists")
+    fake_sources["nacta"] = "real"
+    fake_sources["bytes"][NACTA_URL] = body
+    loader.clear_cache()
+
+
+def test_nacta_is_downloaded_live_and_saved_as_the_last_good_copy(fake_sources, monkeypatch, tmp_path):
+    _live(fake_sources, monkeypatch, tmp_path)
+    nacta = engine.screen("Live Person", cnic="3740565359881")["sources"]["NACTA"]
+    assert engine.source_status(nacta) == "HIT" and nacta["matches"][0]["father_name"] == "Live Father"
+    assert nacta["lists"][0]["published"] == "Retrieved live" and nacta["lists"][0]["status"] == "OK"
+    from app.screening import nacta_store
+    meta = nacta_store.meta()
+    assert meta["live"] is True and meta["records"] == 1 and meta["filename"] == "live: " + NACTA_URL
+
+
+def test_a_failed_live_download_falls_back_to_the_last_good_copy_and_says_so(fake_sources, monkeypatch, tmp_path):
+    _live(fake_sources, monkeypatch, tmp_path)
+    engine.screen("Anyone Here")                       # first screening downloads and saves the copy
+    loader.clear_cache("NACTA")
+    fake_sources["fail"].add(NACTA_URL)                # NACTA goes down
+    nacta = engine.screen("Live Person")["sources"]["NACTA"]
+    assert engine.source_status(nacta) == "HIT"        # still screened against the saved copy
+    li = nacta["lists"][0]
+    assert li["status"] == "OK" and "live download from NACTA failed" in li["note"] and "last good copy" in li["note"]
+    assert not nacta["partial"]                        # recent enough, so it does not block a clear result
+
+
+def test_a_failed_live_download_with_no_copy_is_not_screened(fake_sources, monkeypatch, tmp_path):
+    _live(fake_sources, monkeypatch, tmp_path)
+    fake_sources["fail"].add(NACTA_URL)
+    nacta = engine.screen("Anyone Here")["sources"]["NACTA"]
+    assert engine.source_status(nacta) == "NOT_CONFIGURED"
+    assert "could not be downloaded or read from the configured address" in nacta["error"]
+    assert "simulated outage" in nacta["error"]
+
+
+def test_a_stale_saved_copy_is_not_used_to_hide_a_failed_download(fake_sources, monkeypatch, tmp_path):
+    _live(fake_sources, monkeypatch, tmp_path)
+    engine.screen("Anyone Here")
+    loader.clear_cache("NACTA")
+    from app import config
+    monkeypatch.setattr(config, "NACTA_MAX_AGE_DAYS", -1)     # every copy is now too old
+    fake_sources["fail"].add(NACTA_URL)
+    nacta = engine.screen("Anyone Here")["sources"]["NACTA"]
+    assert engine.source_status(nacta) == "NOT_CONFIGURED"
+
+
+def test_a_live_response_that_is_not_a_list_is_rejected_with_the_reason(fake_sources, monkeypatch, tmp_path):
+    _live(fake_sources, monkeypatch, tmp_path, body=b"<html><body>Please complete the captcha</body></html>")
+    nacta = engine.screen("Anyone Here")["sources"]["NACTA"]
+    assert engine.source_status(nacta) == "NOT_CONFIGURED" and "no records" in nacta["error"].lower()
+
+
+def test_live_xml_download_works(fake_sources, monkeypatch, tmp_path):
+    xml = (b'<list><p><Name>Xml Person</Name><CNIC>3740565359881</CNIC></p>'
+           b'<p><Name>Other</Name><CNIC>3740565359882</CNIC></p></list>')
+    _live(fake_sources, monkeypatch, tmp_path, body=xml)
+    assert engine.source_status(engine.screen("Xml Person")["sources"]["NACTA"]) == "HIT"

@@ -19,30 +19,61 @@ Lists are downloaded in parallel on a screening and kept in memory for `LIST_CAC
 
 ## NACTA Proscribed Persons
 
-NACTA publishes the Fourth Schedule list (about 5,000 people) only through a web app at
-`nfs.nacta.gov.pk`, with no stable file download, so it cannot be fetched like the other lists.
-Instead, export it and upload it:
+NACTA publishes the Fourth Schedule list (about 5,300 people) at `nfs.nacta.gov.pk`, which has Excel,
+JSON and XML export buttons. The site is a **Blazor Server** app: the page talks to the server over a
+private SignalR connection and the export buttons build the file inside that session, so **there is no
+web address that returns the list**. The list therefore reaches the screening as a file. Three ways:
+
+1. **By hand.** Click **JSON** on the NACTA site, then upload the file on the Lists page.
+2. **Scheduled, with a browser (recommended).** `scripts/fetch_nacta.py` opens the site in a headless
+   browser, clicks the JSON button, checks the file (at least 1,000 people, within 10 percent of the count
+   the page shows, readable by the same parser the backend uses), and uploads it. A refused or partial
+   download never replaces a good list. `.github/workflows/refresh-nacta.yml` runs it twice a week on GitHub
+   Actions with two repository secrets, `SCREENING_API_URL` and `SCREENING_API_KEY`. If NACTA does not answer
+   GitHub's servers (government sites sometimes only answer inside Pakistan), run the same script on a
+   computer in Pakistan on a schedule instead.
+
+   ```bash
+   pip install -r scripts/requirements-nacta.txt
+   python -m playwright install chromium
+   python scripts/fetch_nacta.py --show              # watch it work, saves the file
+   python scripts/fetch_nacta.py --upload            # also uploads (needs SCREENING_API_URL and SCREENING_API_KEY)
+   ```
+   The browser is not part of the web service, so the backend stays small.
+3. **A plain address.** If the list is ever served as a file at some address (your own copy, a proxy),
+   set `NACTA_PERSONS_URL` and it is downloaded whenever the lists load, saved as the **last good copy**,
+   and that copy is used (with a note on the Lists page) if the address later fails, as long as it is no older
+   than `NACTA_MAX_AGE_DAYS`. NACTA's own site cannot be used this way.
+
+To upload yourself:
 
 ```bash
-curl -X POST "https://your-backend/api/admin/nacta?filename=nacta.csv" \
-  -H "X-API-Key: $API_KEY" -H "Content-Type: text/csv" --data-binary @nacta.csv
+curl -X POST "https://your-backend/api/admin/nacta?filename=nacta.json" \
+  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" --data-binary @nacta.json
 ```
 
 The Lists page in the frontend does the same with a file picker. The body is the raw file, not a
-multipart form. CSV (comma, semicolon or tab separated) and JSON (an array of objects, or an object
-holding one) are accepted. Columns are recognised by name, so `Primary Title / Name`, `Father Name`,
+multipart form. CSV (comma, semicolon or tab separated), JSON (an array of objects, or an object
+holding one) and XML are accepted. XML files with entity declarations are refused. Columns are recognised by name, so `Primary Title / Name`, `Father Name`,
 `CNIC / ID Number`, `District` and `Province` all work. A file that cannot be read is rejected and
 the previous list stays in use.
 
 - **Freshness.** The list changes every few weeks. A copy older than `NACTA_MAX_AGE_DAYS` (30) is
   reported as out of date and sends the applicant to manual review, so a stale list never looks clean.
 - **No upload yet** is reported as not screened. Set `NACTA_REQUIRED=false` to let that through.
-- **Live download.** If you find a stable URL that returns the list as CSV or JSON, set
-  `NACTA_PERSONS_URL` and it is downloaded live instead.
 - **Not included:** NACTA's list of Proscribed Organizations. It is a PDF whose address changes with
   each update, so it is not read.
 
 NACTA records have name, father's name, CNIC, district and province, and **no date of birth**.
+
+## Seeing which list has a problem
+
+`GET /api/admin/lists` (shown on the Lists page) reports every list behind each source on its own: its
+record count, whether it could be read and why not, and the address it came from. The FIA Red Books are
+listed one by one, so it is clear which book failed. For a PDF that downloaded but gave no people (a
+layout the reader does not understand), it also returns a sample of the text read from the PDF, so the
+layout can be diagnosed from the screen without server access. The server log carries the same detail,
+one line per Red Book.
 
 ## CNIC and father's name
 

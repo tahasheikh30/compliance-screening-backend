@@ -27,14 +27,16 @@ def _atomic_write(path, data: bytes) -> None:
     os.replace(tmp, path)  # never leaves a half written list behind
 
 
-def save(data: bytes, filename: str, records: int) -> dict:
+def save(data: bytes, filename: str, records: int, live: bool = False) -> dict:
     blob, meta_path = _paths()
     meta = {
-        "filename": os.path.basename(filename or "nacta.csv")[:200],
+        # an uploaded file keeps only its file name (never a client side path); a live copy keeps its address
+        "filename": (filename if live else os.path.basename(filename or "nacta.csv"))[:200],
         "uploaded_at": datetime.now(timezone.utc).isoformat(),
         "records": int(records),
         "size": len(data),
         "sha256": hashlib.sha256(data).hexdigest(),
+        "live": bool(live),   # True when this copy was downloaded from NACTA_PERSONS_URL rather than uploaded
     }
     _atomic_write(blob, data)
     _atomic_write(meta_path, json.dumps(meta).encode())

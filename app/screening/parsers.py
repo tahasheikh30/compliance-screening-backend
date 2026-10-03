@@ -485,6 +485,49 @@ def _row_fields(row: dict) -> dict:
     }
 
 
+def _nacta_xml_rows(text: str) -> list:
+    """
+    Records from an XML export: the repeated element that holds one person, with its child
+    elements and attributes as fields. Works whatever the element names are.
+    """
+    import xml.etree.ElementTree as ET
+
+    # entity declarations are the way XML files are made to expand into gigabytes
+    if re.search(r"<!\s*(ENTITY|DOCTYPE[^>]*\[)", text, re.I):
+        raise ValueError("XML files with entity declarations are not accepted.")
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as exc:
+        raise ValueError(f"The file looks like XML but could not be parsed ({exc}).") from None
+    node = root
+    while True:  # descend to the level that holds the repeated person elements
+        kids = list(node)
+        if not kids:
+            raise ValueError("The XML contains no records.")
+        tags = [k.tag for k in kids]
+        if len(kids) > 1 and len(set(tags)) < len(tags):
+            records = [k for k in kids if tags.count(k.tag) > 1 and k.tag == max(set(tags), key=tags.count)]
+            break
+        if len(kids) == 1:
+            node = kids[0]
+            continue
+        # several different child tags and none repeated: the records are probably this node's children's children
+        node = max(kids, key=lambda k: len(list(k)))
+    rows = []
+    for rec in records:
+        row = dict(rec.attrib)
+        for child in rec:
+            tag = child.tag.split("}")[-1]
+            if not list(child):
+                row[tag] = (child.text or "").strip()
+        if not row and (rec.text or "").strip():
+            continue
+        rows.append(row)
+    if not rows:
+        raise ValueError("The XML contains no records.")
+    return rows
+
+
 def _nacta_rows(text: str) -> list:
     """Rows as dicts, from a JSON array (or an object holding one) or from CSV."""
     t = text.lstrip("\ufeff").strip()
@@ -504,6 +547,8 @@ def _nacta_rows(text: str) -> list:
         if not rows:
             raise ValueError("The JSON contains no records.")
         return rows
+    if t[0] == "<":
+        return _nacta_xml_rows(t)
     first_line = t.splitlines()[0]
     delim = max((",", ";", "\t", "|"), key=first_line.count)
     grid = [r for r in csv.reader(io.StringIO(t, newline=""), delimiter=delim) if any(c.strip() for c in r)]

@@ -141,7 +141,7 @@ def screen(name: str, dob: str = "", nationality: str = "", threshold=None,
         total_records += len(g.records)
         all_matches.extend(found)
         published = "; ".join(sorted({str(x.get("published")) for x in g.meta if x.get("published") and x.get("records")}))
-        lists = [_list_info(x) for x in g.meta]
+        lists = [loader.list_info(x) for x in g.meta]
         sources[key] = {
             "key": key,
             "label": SOURCE_LABELS[key],
@@ -186,15 +186,6 @@ def screen(name: str, dob: str = "", nationality: str = "", threshold=None,
         "truncated": truncated,
         "sources": sources,
     }
-
-
-def _list_info(meta: dict) -> dict:
-    """What the API reports about one list: name, size, date and whether it could be read."""
-    status = str(meta.get("status") or "OK")
-    if status.startswith("Not available: "):
-        status = status[len("Not available: "):]
-    return {"list": meta.get("list", ""), "records": int(meta.get("records") or 0),
-            "published": meta.get("published"), "status": status}
 
 
 def _news(name: str) -> dict:

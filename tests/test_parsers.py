@@ -169,3 +169,30 @@ def test_fia_red_book_records_carry_cnic_and_father_for_matching():
     recs = p.parse_redbook(p.pdf_to_text(fx.make_redbook_pdf()), "Red Book 2026")
     assert recs[0].cnic == "3520211111111" and recs[0].father == "ABDUL SATTAR"
     assert recs[1].cnic == "4210122222223" and recs[1].father == "MUHAMMAD IQBAL"
+
+
+def test_nacta_xml_export():
+    xml = ('<?xml version="1.0"?><ProscribedPersons><Total>2</Total>'
+           '<Person><ID>1</ID><Name>Zain Haider</Name><FatherName>Ahmad Nawaz</FatherName><CNIC>3810481580749</CNIC>'
+           '<Province>Punjab</Province><District>BHAKKAR</District></Person>'
+           '<Person><ID>2</ID><Name>Aamir Bilal alias Babu Jhangvee</Name><FatherName>nill</FatherName>'
+           '<CNIC>3640177467701</CNIC></Person></ProscribedPersons>')
+    recs, info = p.parse_nacta_persons(xml)
+    assert info["rows"] == 2 and recs[0].primary == "Zain Haider" and recs[0].cnic == "3810481580749"
+    assert recs[1].names == ["Aamir Bilal", "Babu Jhangvee"] and recs[1].father == ""
+
+
+def test_nacta_xml_with_attributes_and_wrapper_elements():
+    xml = '<root><data><items><row name="A B" cnic="3810481580749"/><row name="C D" cnic="3810481580750"/></items></data></root>'
+    assert [r.primary for r in p.parse_nacta_persons(xml)[0]] == ["A B", "C D"]
+
+
+@pytest.mark.parametrize("xml,fragment", [
+    ('<!DOCTYPE x [<!ENTITY a "b">]><x><y/></x>', "entity"),
+    ("<broken><x>", "could not be parsed"),
+    ("<root/>", "no records"),
+])
+def test_nacta_bad_xml_is_refused_with_a_message(xml, fragment):
+    with pytest.raises(ValueError) as e:
+        p.parse_nacta_persons(xml)
+    assert fragment in str(e.value).lower()

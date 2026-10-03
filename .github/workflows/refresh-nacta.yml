@@ -1,0 +1,42 @@
+name: Refresh NACTA list
+
+# Downloads the NACTA Proscribed Persons list with a real browser and uploads it to the screening
+# backend. NACTA has no downloadable web address (see scripts/fetch_nacta.py), so this is how the list
+# is kept fresh without anyone doing it by hand.
+#
+# Needs two repository secrets (Settings, Secrets and variables, Actions):
+#   SCREENING_API_URL  the backend address, e.g. https://your-service.onrender.com   (no trailing slash, no /api)
+#   SCREENING_API_KEY  the backend's API_KEY
+#
+# If NACTA blocks GitHub's servers (government sites sometimes only answer inside Pakistan), the run
+# fails with a clear message. Then run scripts/fetch_nacta.py --upload from a computer in Pakistan instead,
+# on a schedule, or upload the file by hand on the Lists page.
+
+on:
+  schedule:
+    - cron: "0 3 * * 1,4"   # Monday and Thursday, 03:00 UTC
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r scripts/requirements-nacta.txt
+      - run: python -m playwright install --with-deps chromium
+      - name: Download and upload the NACTA list
+        run: python scripts/fetch_nacta.py --upload --out nacta_download
+        env:
+          SCREENING_API_URL: ${{ secrets.SCREENING_API_URL }}
+          SCREENING_API_KEY: ${{ secrets.SCREENING_API_KEY }}
+      - name: Keep the debug screenshot if it failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nacta-debug
+          path: nacta_download/nacta_debug.png
+          if-no-files-found: ignore

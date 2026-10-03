@@ -14,6 +14,7 @@ The n8n workflow downloaded every list on every run. This module does the same
 Nothing is written to disk and no API key is needed.
 """
 
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -68,7 +69,8 @@ class GroupData:
 # --------------------------------------------------------------------------
 
 def _get(url: str, read_timeout: float = READ_TIMEOUT, **kwargs) -> requests.Response:
-    resp = requests.get(url, headers={"User-Agent": HTTP_USER_AGENT}, timeout=(CONNECT_TIMEOUT, read_timeout), **kwargs)
+    headers = {"User-Agent": HTTP_USER_AGENT, **kwargs.pop("headers", {})}
+    resp = requests.get(url, headers=headers, timeout=(CONNECT_TIMEOUT, read_timeout), **kwargs)
     resp.raise_for_status()
     return resp
 
@@ -87,6 +89,27 @@ def fetch_text(url: str, read_timeout: float = READ_TIMEOUT) -> str:
 
 def _short(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {str(exc)[:160]}"
+
+
+def list_info(meta: dict, debug: bool = False) -> dict:
+    """
+    What the API reports about one list: name, size, date and whether it could be read.
+    `debug` adds the address it came from and, for a PDF that was downloaded but gave no
+    records, a sample of the text that was read from it. That is only for the admin Lists
+    page, so a layout the parser does not understand can be diagnosed from the screen.
+    """
+    status = str(meta.get("status") or "OK")
+    if status.startswith("Not available: "):
+        status = status[len("Not available: "):]
+    out = {"list": meta.get("list", ""), "records": int(meta.get("records") or 0),
+           "published": meta.get("published"), "status": status}
+    if meta.get("note"):
+        out["note"] = meta["note"]
+    if debug:
+        out["source"] = meta.get("source") or None
+        if meta.get("sample"):
+            out["sample"] = meta["sample"]
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -145,14 +168,22 @@ def _load_fia_edition(ed: dict) -> tuple:
         data = _get(url, READ_TIMEOUT).content
         text = parsers.pdf_to_text(data)
         if not text.strip():
-            raise ValueError("the PDF contains no extractable text")
+            raise ValueError("the PDF contains no extractable text (it may be a scanned image)")
     except Exception as exc:
+        logger.warning("FIA edition %r (%s) could not be read: %s", label, url, _short(exc))
         return [], {"list": label, "source": url, "published": ed.get("updated") or "n/a", "records": 0,
                     "optional": True, "status": "Not available: " + _short(exc)[:200]}
     records = parsers.parse_redbook(text, ed.get("title") or "Red Book")
-    status = "OK" if records else "Downloaded, but no records could be read (layout may have changed)"
-    return records, {"list": label, "source": url, "published": ed.get("updated") or "n/a", "records": len(records),
-                     "optional": True, "status": status}
+    meta = {"list": label, "source": url, "published": ed.get("updated") or "n/a", "records": len(records),
+            "optional": True, "status": "OK"}
+    if not records:
+        meta["status"] = "Downloaded, but no records could be read (the layout is not one the reader understands)"
+        meta["sample"] = re.sub(r"[ \t]+", " ", re.sub(r"\n\s*\n+", "\n", text)).strip()[:1200]
+        logger.warning("FIA edition %r (%s): downloaded %d characters of text but no records could be read",
+                       label, url, len(text))
+    else:
+        logger.info("FIA edition %r (%s): %d records", label, url, len(records))
+    return records, meta
 
 
 def _load_fia() -> GroupData:
@@ -178,15 +209,38 @@ def decode_bytes(raw: bytes) -> str:
 
 
 def _read_nacta() -> tuple:
-    """(text, metadata) of the NACTA list: downloaded from NACTA_PERSONS_URL if set, else the uploaded file."""
+    """
+    (text, metadata) of the NACTA list.
+
+    With NACTA_PERSONS_URL set it is downloaded from NACTA and, once it has been read successfully,
+    saved as the last good copy. If that download fails, the last good copy is used as long as it is
+    no older than NACTA_MAX_AGE_DAYS, with a note saying so. Without a URL, the uploaded file is used.
+    """
     url = config.NACTA_PERSONS_URL
-    if url:
-        return fetch_text(url), {"filename": url, "uploaded_at": None, "live": True}
     stored = nacta_store.load()
+    if url:
+        try:
+            raw = _get(url, READ_TIMEOUT, headers={"Accept": "application/json, text/csv, application/xml, */*"}).content
+            text = decode_bytes(raw)
+            records, _info = parsers.parse_nacta_persons(text)
+            if not records:
+                raise ValueError("the response contained no usable records")
+        except Exception as exc:
+            reason = _short(exc)
+            logger.warning("NACTA download from %s failed: %s", url, reason)
+            if stored:
+                raw_s, meta_s = stored
+                age = nacta_store.age_days(meta_s)
+                if age is not None and age <= config.NACTA_MAX_AGE_DAYS:
+                    note = f"The live download from NACTA failed ({reason}). Using the last good copy, {int(age)} days old."
+                    return decode_bytes(raw_s), {**meta_s, "note": note}
+            raise SourceUnavailable(f"The NACTA list could not be downloaded or read from the configured address ({reason}).") from None
+        meta = nacta_store.save(raw, "live: " + url, len(records), live=True)
+        return text, {**meta, "live": True}
     if not stored:
         raise SourceUnavailable(
-            "No NACTA list has been loaded yet. Export the Fourth Schedule list from nfs.nacta.gov.pk as CSV and "
-            "upload it on the Lists page.")
+            "No NACTA list has been loaded yet. Export the Fourth Schedule list as JSON or CSV from nfs.nacta.gov.pk "
+            "and upload it on the Lists page, or set NACTA_PERSONS_URL to download it automatically.")
     raw, meta = stored
     return decode_bytes(raw), meta
 
@@ -199,9 +253,11 @@ def _load_nacta() -> GroupData:
         raise SourceUnavailable(f"The NACTA file could not be read: {exc}") from None
     if not records:
         raise SourceUnavailable("The NACTA file contains no usable records (no names found).")
-    entry = {"list": parsers.NACTA_LABEL, "source": meta.get("filename") or "uploaded file",
+    entry = {"list": parsers.NACTA_LABEL, "source": config.NACTA_PERSONS_URL or meta.get("filename") or "uploaded file",
              "published": "Retrieved live" if meta.get("live") else (meta.get("uploaded_at") or "n/a")[:10],
              "records": len(records)}
+    if meta.get("note"):
+        entry["note"] = meta["note"]
     age = nacta_store.age_days(meta)
     if age is not None and age > config.NACTA_MAX_AGE_DAYS:
         entry["status"] = f"Out of date: this copy was loaded {int(age)} days ago (limit {config.NACTA_MAX_AGE_DAYS:g}). Upload a fresh export"
@@ -216,6 +272,7 @@ _LOADERS = {"UNSC": _load_unsc, "OFAC": _load_ofac, "UKSL": _load_uksl, "FIA_RED
 # --------------------------------------------------------------------------
 
 _cache: dict = {}
+_last_attempt: dict = {}   # the most recent load of each source, including failures, for the Lists page
 _locks = {k: threading.Lock() for k in SOURCE_KEYS}
 
 
@@ -236,13 +293,14 @@ def load_group(key: str) -> GroupData:
             data = _LOADERS[key]()
         except SourceUnavailable as exc:
             logger.warning("%s unavailable: %s", key, exc)
-            return GroupData(key, error=str(exc), meta=[{"list": key, "source": "", "published": "n/a", "records": 0,
+            data = GroupData(key, error=str(exc), meta=[{"list": key, "source": "", "published": "n/a", "records": 0,
                                                        "status": "Not available: " + str(exc)}])
         except Exception as exc:
             logger.exception("%s could not be loaded", key)
             msg = f"The list could not be downloaded or read ({_short(exc)})."
-            return GroupData(key, error=msg, meta=[{"list": key, "source": "", "published": "n/a", "records": 0,
+            data = GroupData(key, error=msg, meta=[{"list": key, "source": "", "published": "n/a", "records": 0,
                                                    "status": "Not available: " + msg}])
+        _last_attempt[key] = data
         if data.available:
             _cache[key] = data
         return data
@@ -258,16 +316,27 @@ def load_groups() -> dict:
 def clear_cache(key: str | None = None) -> None:
     if key is None:
         _cache.clear()
+        _last_attempt.clear()
     else:
         _cache.pop(key, None)
+        _last_attempt.pop(key, None)
 
 
 def cache_status() -> dict:
+    """
+    For the Lists page: per source, whether it is held in memory, and every list behind it with its
+    own record count and status, taken from the most recent load (successful or not). A source that
+    has not been loaded since the server started has no lists yet.
+    """
     out = {}
     for k in SOURCE_KEYS:
-        e = _cache.get(k)
-        out[k] = ({"cached": True, "age_seconds": round(time.time() - e.loaded_at),
-                   "records": len(e.records)} if e else {"cached": False})
+        cached = _cache.get(k)
+        last = _last_attempt.get(k)
+        entry = {"cached": bool(cached), "records": len(cached.records) if cached else 0,
+                 "age_seconds": round(time.time() - cached.loaded_at) if cached else None,
+                 "error": last.error if last else None,
+                 "lists": [list_info(m, debug=True) for m in last.meta] if last else []}
+        out[k] = entry
     return out
 
 

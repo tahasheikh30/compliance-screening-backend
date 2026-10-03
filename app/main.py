@@ -227,7 +227,7 @@ def refresh_lists(request: Request):
     out = {}
     for key, g in loader.load_groups().items():
         out[key] = ({"error": g.error} if g.error else
-                    {"records": len(g.records), "lists": [engine._list_info(m) for m in g.meta]})
+                    {"records": len(g.records), "lists": [loader.list_info(m, debug=True) for m in g.meta]})
     return out
 
 
@@ -242,6 +242,7 @@ def _nacta_status() -> dict:
     return {
         "loaded": bool(meta) or live,
         "source": "url" if live else ("upload" if meta else None),
+        "live_copy": bool(meta and meta.get("live")),   # the saved copy came from a live download, not an upload
         "url": app_config.NACTA_PERSONS_URL or None,
         "filename": (meta or {}).get("filename"),
         "uploaded_at": (meta or {}).get("uploaded_at"),
