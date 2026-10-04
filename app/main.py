@@ -31,12 +31,13 @@ from datetime import datetime, timezone
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from starlette.concurrency import run_in_threadpool
 
 from app import database as db
 from app import evidence
 from app import config as app_config
 from app.auth import require_api_key
-from app.config import EVIDENCE_DIR, FIA_REQUIRED, NACTA_REQUIRED
+from app.config import EVIDENCE_DIR, FIA_REQUIRED, NACTA_REQUIRED, PRELOAD_LISTS
 from app.errors import AppError, configure_logging, install as install_error_handlers, request_context, logger
 from app.schemas import ApplicantSummary, ScreenRequest, ScreenResponse, ScreeningResultOut
 from app.screening import engine, loader, nacta_store, parsers
@@ -90,6 +91,13 @@ def startup():
     if not os.environ.get("API_KEY"):
         logger.warning("API_KEY is not set. Every protected endpoint will return 503 until it is configured. "
                        "Do not deploy like this.")
+    if PRELOAD_LISTS and loader.start_background_refresh():
+        logger.info("Loading the screening lists in the background and keeping them fresh")
+
+
+@app.on_event("shutdown")
+def shutdown():
+    loader.stop_background_refresh()
 
 
 def _case_ref(applicant_id: int, when: datetime) -> str:
@@ -115,33 +123,35 @@ def screen_applicant(request: Request, req: ScreenRequest):
         status = engine.source_status(src, FIA_REQUIRED)
         statuses[key] = status
         best = src["matches"][0] if src["matches"] else None
-        detail = engine.describe_source(src, status, threshold)
-        row_id = db.insert_result(
-            applicant_id, key,
-            best["primary_name"] if best else (src["articles"][0]["title"] if src["articles"] else None),
-            best["score"] if best else None,
-            status, detail, None, result["screened_at"],
-            list_version=src["list_version"], records_screened=src["records"],
-            payload={"matches": src["matches"], "articles": src["articles"], "match_count": src["match_count"], "lists": src["lists"]},
-        )
-        rows.append((row_id, key, src, status, detail, best))
+        rows.append({
+            "source": key,
+            "matched_entry": best["primary_name"] if best else (src["articles"][0]["title"] if src["articles"] else None),
+            "score": best["score"] if best else None,
+            "status": status,
+            "detail": engine.describe_source(src, status, threshold),
+            "checked_at": result["screened_at"],
+            "list_version": src["list_version"],
+            "records_screened": src["records"],
+            "payload": {"matches": src["matches"], "articles": src["articles"], "match_count": src["match_count"],
+                        "lists": src["lists"]},
+        })
+
+    # One transaction for all result rows and the final status. The PENDING row inserted above stays
+    # as the record of the attempt if the screening itself fails.
+    overall = engine.overall_status(statuses, FIA_REQUIRED, NACTA_REQUIRED)
+    row_ids = db.save_screening(applicant_id, overall, result["total_records"], rows)
 
     # One evidence PDF per screening. If it cannot be written the finding is still saved.
-    evidence_file = None
     if result["hit"]:
         try:
             pdf_path = evidence.generate_evidence_pdf(result, case_ref)
-            evidence_file = pdf_path.name
-            db.set_evidence_file_for_applicant(applicant_id, evidence_file)
+            db.set_evidence_file_for_applicant(applicant_id, pdf_path.name)
         except Exception:
             logger.exception("Evidence PDF generation failed for applicant %s", applicant_id)
             note = " [Evidence PDF could not be generated. See the server log for this request ID.]"
-            for row_id, _key, _src, status, _detail, _best in rows:
-                if status in ("HIT", "REVIEW"):
+            for row_id, row in zip(row_ids, rows):
+                if row["status"] in ("HIT", "REVIEW"):
                     db.append_result_detail(row_id, note)
-
-    overall = engine.overall_status(statuses, FIA_REQUIRED, NACTA_REQUIRED)
-    db.update_applicant_status(applicant_id, overall, records_screened=result["total_records"])
 
     results_out = [
         ScreeningResultOut(**r) for r in db.get_results_for_applicant(applicant_id)
@@ -260,20 +270,8 @@ def nacta_status(request: Request):
     return _nacta_status()
 
 
-@app.post("/api/admin/nacta", dependencies=[Depends(require_api_key)])
-@limiter.limit("10/hour")
-async def upload_nacta(request: Request, filename: str = "nacta.csv"):
-    """
-    Load the NACTA Proscribed Persons (Fourth Schedule) list. Send the CSV or JSON export as the
-    request body (not a multipart form), with the file name in ?filename=. The file replaces the
-    previous one only if it can be read.
-    """
-    data = await request.body()
-    if not data:
-        raise AppError(400, "NACTA_FILE_EMPTY", "The upload was empty.", "Choose the exported CSV or JSON file and try again.")
-    if len(data) > MAX_NACTA_UPLOAD_BYTES:
-        raise AppError(413, "NACTA_FILE_TOO_LARGE", "That file is too large for the NACTA list.",
-                       "The Fourth Schedule export is a few megabytes at most. Check you chose the right file.")
+def _ingest_nacta(data: bytes, filename: str) -> dict:
+    """Parse, validate and store an uploaded NACTA file. Blocking work, so it runs in a worker thread."""
     try:
         records, info = parsers.parse_nacta_persons(loader.decode_bytes(data))
     except ValueError as exc:
@@ -295,6 +293,24 @@ async def upload_nacta(request: Request, filename: str = "nacta.csv"):
     logger.info("NACTA list uploaded: %s records from %s", len(records), meta["filename"])
     return {**_nacta_status(), "records": len(records), "rows_read": info["rows"], "rows_skipped": info["skipped"],
             "with_cnic": info["with_cnic"], "warnings": warnings}
+
+
+@app.post("/api/admin/nacta", dependencies=[Depends(require_api_key)])
+@limiter.limit("10/hour")
+async def upload_nacta(request: Request, filename: str = "nacta.csv"):
+    """
+    Load the NACTA Proscribed Persons (Fourth Schedule) list. Send the CSV or JSON export as the
+    request body (not a multipart form), with the file name in ?filename=. The file replaces the
+    previous one only if it can be read.
+    """
+    data = await request.body()
+    if not data:
+        raise AppError(400, "NACTA_FILE_EMPTY", "The upload was empty.", "Choose the exported CSV or JSON file and try again.")
+    if len(data) > MAX_NACTA_UPLOAD_BYTES:
+        raise AppError(413, "NACTA_FILE_TOO_LARGE", "That file is too large for the NACTA list.",
+                       "The Fourth Schedule export is a few megabytes at most. Check you chose the right file.")
+    # parsing a few thousand rows is CPU work: keep it off the event loop so other requests are not stalled
+    return await run_in_threadpool(_ingest_nacta, data, filename)
 
 
 @app.get("/api/health")

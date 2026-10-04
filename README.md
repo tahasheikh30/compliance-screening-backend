@@ -15,7 +15,7 @@ The screening logic is a Python port of the n8n **Applicant Screening Engine** a
 | `NACTA` | NACTA Proscribed Persons, Fourth Schedule (Pakistan) | A CSV or JSON export you upload (see below) |
 | `ADVERSE_MEDIA` | Open news search | Google News RSS |
 
-Lists are downloaded in parallel on a screening and kept in memory for `LIST_CACHE_TTL_SECONDS` (default 1 hour; `0` downloads fresh every time, like the workflow). Nothing about the lists is stored on disk.
+Lists are downloaded in parallel and kept in memory for `LIST_CACHE_TTL_SECONDS` (default 1 hour; `0` downloads fresh every time, like the workflow). They are loaded when the server starts and reloaded in the background once they are three quarters of the way to expiring, so a screening normally never waits for a download (`PRELOAD_LISTS=false` turns this off). If a background reload fails the previous copy is kept until it expires; after that the source is reported as unavailable, never as clear. Nothing about the lists is stored on disk.
 
 ## NACTA Proscribed Persons
 
@@ -148,12 +148,12 @@ One PDF per screening, generated when there is any hit (watch list or news). It 
 
 ## Configuration
 
-See `.env.example`. Required: `API_KEY`. Common: `ALLOWED_ORIGINS`, `STORAGE_DIR` (persistent disk), `MATCH_THRESHOLD`, `LIST_CACHE_TTL_SECONDS`, `FIA_REQUIRED`, `NACTA_REQUIRED`, `NACTA_MAX_AGE_DAYS`, `NACTA_PERSONS_URL`. The uploaded NACTA file lives under `STORAGE_DIR/lists`, so it needs the persistent disk.
+See `.env.example`. Required: `API_KEY`. Common: `ALLOWED_ORIGINS`, `STORAGE_DIR` (persistent disk), `MATCH_THRESHOLD`, `LIST_CACHE_TTL_SECONDS`, `PRELOAD_LISTS`, `FIA_REQUIRED`, `NACTA_REQUIRED`, `NACTA_MAX_AGE_DAYS`, `NACTA_PERSONS_URL`. The uploaded NACTA file lives under `STORAGE_DIR/lists`, so it needs the persistent disk.
 
 ## Run and test
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # requirements.txt alone is what production installs
 API_KEY=dev uvicorn app.main:app --reload --port 8000
 python -m pytest
 ```
@@ -164,7 +164,7 @@ Tests use synthetic copies of every feed and never touch the network.
 
 - **Unavailable sources.** The workflow shows the FIA Red Book and news as "unavailable" but still gives a clearance. Here an unavailable source routes to `MANUAL_REVIEW`. Set `FIA_REQUIRED=false` to let an unreachable FIA Red Book through, as the workflow does (news and the sanctions lists always block).
 - **Evidence in the API.** The workflow returned the PDF through its form. Here it is a download endpoint, and each screening is saved in SQLite.
-- **Speed.** Sources download in parallel and can be cached in memory; matching 60,000+ names takes under a second.
+- **Speed.** Sources download in parallel, are cached in memory and refreshed in the background; matching 60,000+ names takes under a second. Result rows are saved in one transaction (SQLite in WAL mode, with an index on the applicant).
 - **Jaro-Winkler.** The workflow's exact algorithm is used (rapidfuzz only pre-filters pairs that cannot reach the cutoff).
 - **News wording.** The workflow's PDF said articles must contain every part of the name; the code actually requires the surname plus one more part. The report now describes what the code does.
 

@@ -84,13 +84,19 @@ def _rank(m: dict):
 
 
 def match_records(scorer: NameScorer, records: list, threshold: float, dob_year: str,
-                  cnic: str = "", father_scorer=None) -> list:
+                  cnic: str = "", father_scorer=None, limit: int | None = None) -> tuple:
     """
+    Returns (matches, total): the best `limit` potential matches (all of them when limit is None),
+    ranked CNIC matches first and then by score, and how many records matched in all.
+
     A record is a potential match when its best name scores at or above the threshold, or
     when the applicant's CNIC equals the record's CNIC (an identity number match is reported
     even if the name was written very differently).
+
+    The result dicts (aliases, remarks, father's name scoring) are only built for the records that
+    are kept, so a low threshold on a common name that matches thousands of records stays cheap.
     """
-    out = []
+    cands = []   # (rank, record, best score, index of the best name); in record order, so ties keep it
     for r in records:
         best, best_i = 0.0, 0
         for i, tk in enumerate(r.toks):
@@ -99,8 +105,10 @@ def match_records(scorer: NameScorer, records: list, threshold: float, dob_year:
                 best, best_i = s, i
         by_cnic = bool(cnic and r.cnic and r.cnic == cnic)
         if best >= threshold or by_cnic:
-            out.append(_match_dict(r, best, r.names[best_i], dob_year, cnic, father_scorer))
-    return out
+            cands.append(((0 if by_cnic else 1, -best), r, best, best_i))
+    cands.sort(key=lambda c: c[0])   # stable: equal ranks stay in list order
+    kept = cands if limit is None else cands[:limit]
+    return [_match_dict(r, best, r.names[i], dob_year, cnic, father_scorer) for _, r, best, i in kept], len(cands)
 
 
 def screen(name: str, dob: str = "", nationality: str = "", threshold=None,
@@ -131,15 +139,17 @@ def screen(name: str, dob: str = "", nationality: str = "", threshold=None,
     sources: dict = {}
     lists_meta: list = []
     total_records = 0
+    sanctions_hits = 0
 
     for key in loader.SOURCE_KEYS:
         g = groups[key]
         lists_meta.extend(g.meta)
-        found = [] if not g.available else match_records(scorer, g.records, thr, dob_year, cnic, father_scorer)
-        found.sort(key=_rank)
-        matches = found[:MAX_MATCHES]  # a low threshold on a common name must not produce a huge response
+        # a low threshold on a common name must not produce a huge response: keep the best MAX_MATCHES
+        matches, found_count = (match_records(scorer, g.records, thr, dob_year, cnic, father_scorer, limit=MAX_MATCHES)
+                                if g.available else ([], 0))
         total_records += len(g.records)
-        all_matches.extend(found)
+        sanctions_hits += found_count
+        all_matches.extend(matches)
         published = "; ".join(sorted({str(x.get("published")) for x in g.meta if x.get("published") and x.get("records")}))
         lists = [loader.list_info(x) for x in g.meta]
         sources[key] = {
@@ -154,12 +164,13 @@ def screen(name: str, dob: str = "", nationality: str = "", threshold=None,
             # some lists of an otherwise available source could not be read (FIA publishes several books)
             "partial": g.available and any(li["status"] != "OK" for li in lists),
             "matches": matches,
-            "match_count": len(found),  # true total; "matches" holds at most MAX_MATCHES of them
+            "match_count": found_count,  # true total; "matches" holds at most MAX_MATCHES of them
             "articles": [],
         }
 
+    # The overall best MAX_MATCHES are always among each source's own best MAX_MATCHES.
     all_matches.sort(key=_rank)
-    truncated = len(all_matches) > MAX_MATCHES
+    truncated = sanctions_hits > MAX_MATCHES
     kept = all_matches[:MAX_MATCHES]
 
     media_sources = {
@@ -169,7 +180,6 @@ def screen(name: str, dob: str = "", nationality: str = "", threshold=None,
     }
     sources["ADVERSE_MEDIA"] = media_sources
 
-    sanctions_hits = len(all_matches)
     media_hits = len(news["hits"])
     return {
         "applicant": {"name": name, "dob": dob, "nationality": nationality, "cnic": cnic, "father_name": father_name},

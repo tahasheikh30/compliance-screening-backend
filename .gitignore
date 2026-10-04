@@ -6,3 +6,5 @@ evidence/*.pdf
 .env
 .env.*
 !.env.example
+screening.db-wal
+screening.db-shm

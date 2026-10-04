@@ -27,6 +27,9 @@ def _column_exists(conn, table: str, column: str) -> bool:
 
 def init_db():
     with get_conn() as conn:
+        # WAL lets reads proceed while a screening is being written, and survives restarts
+        # (the mode is stored in the database file). Set once here, not on every connection.
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS applicants (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,14 +68,17 @@ def init_db():
         ):
             if not _column_exists(conn, table, column):
                 conn.execute(ddl)
+        # every per-applicant lookup filters on this column; without an index each one scans the whole table
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_results_applicant ON screening_results (applicant_id)")
         conn.commit()
 
 
 @contextmanager
 def get_conn():
     # read DB_PATH at call time so tests can point it at a temporary folder
-    conn = sqlite3.connect(config.DB_PATH)
+    conn = sqlite3.connect(config.DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA synchronous=NORMAL")   # safe with WAL, and avoids an fsync on every commit
     try:
         yield conn
     finally:
@@ -91,25 +97,29 @@ def insert_applicant(full_name, cnic, father_name, submitted_at, overall_status,
         return cur.lastrowid
 
 
-def update_applicant_status(applicant_id, overall_status, records_screened=None):
+def save_screening(applicant_id, overall_status, records_screened, rows) -> list:
+    """
+    Store every source's result row and the applicant's final status in ONE transaction
+    (one connection, one commit). `rows` is a list of dicts with the keys source, matched_entry,
+    score, status, detail, checked_at, list_version, records_screened and payload. Returns the new
+    result row ids in the same order. Either everything is saved or nothing is.
+    """
+    ids = []
     with get_conn() as conn:
+        for r in rows:
+            cur = conn.execute(
+                "INSERT INTO screening_results (applicant_id, source, matched_entry, score, status, detail, "
+                "evidence_file, checked_at, list_version, records_screened, payload) "
+                "VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+                (applicant_id, r["source"], r["matched_entry"], r["score"], r["status"], r["detail"],
+                 r["checked_at"], r["list_version"], r["records_screened"],
+                 json.dumps(r["payload"]) if r["payload"] is not None else None),
+            )
+            ids.append(cur.lastrowid)
         conn.execute("UPDATE applicants SET overall_status = ?, records_screened = ? WHERE id = ?",
                      (overall_status, records_screened, applicant_id))
         conn.commit()
-
-
-def insert_result(applicant_id, source, matched_entry, score, status, detail, evidence_file, checked_at,
-                  list_version=None, records_screened=None, payload=None):
-    with get_conn() as conn:
-        cur = conn.execute(
-            "INSERT INTO screening_results (applicant_id, source, matched_entry, score, status, detail, "
-            "evidence_file, checked_at, list_version, records_screened, payload) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (applicant_id, source, matched_entry, score, status, detail, evidence_file, checked_at,
-             list_version, records_screened, json.dumps(payload) if payload is not None else None),
-        )
-        conn.commit()
-        return cur.lastrowid
+    return ids
 
 
 def set_evidence_file_for_applicant(applicant_id, evidence_file, statuses=("HIT", "REVIEW")):

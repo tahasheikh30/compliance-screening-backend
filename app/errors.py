@@ -33,7 +33,6 @@ import logging
 import re
 import time
 import uuid
-import xml.etree.ElementTree as ET
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -102,45 +101,6 @@ def error_response(status: int, code: str, message: str, hint: str | None = None
     h = dict(headers or {})
     h["X-Request-ID"] = request_id_var.get()
     return JSONResponse(status_code=status, content=error_body(code, message, hint, fields), headers=h)
-
-
-# --------------------------------------------------------------------------
-# Turning arbitrary exceptions from a screening source into something a
-# compliance analyst can act on, WITHOUT leaking file paths or stack frames.
-# The full traceback always goes to the server log under the request ID.
-# --------------------------------------------------------------------------
-
-def describe_exception(exc: BaseException) -> tuple[str, str, str]:
-    """Returns (code, human message, hint) for an exception raised inside a source check."""
-    name = type(exc).__name__
-    module = type(exc).__module__ or ""
-
-    if isinstance(exc, ET.ParseError):
-        return ("SOURCE_DATA_CORRUPT",
-                "The cached list file could not be parsed (it may be truncated or corrupt).",
-                "Re-run the refresh for this list from the Lists & audit tab.")
-    if isinstance(exc, FileNotFoundError):
-        return ("SOURCE_FILE_MISSING",
-                "A file this check needs is missing on the server.",
-                "Refresh the list, or re-upload it. If this keeps happening, check the persistent disk is mounted.")
-    if module.startswith("requests") or module.startswith("urllib3"):
-        if "Timeout" in name:
-            return ("UPSTREAM_TIMEOUT", "The external service took too long to respond.",
-                    "Try again in a minute. If it persists the provider may be down.")
-        if "HTTPError" in name:
-            status = getattr(getattr(exc, "response", None), "status_code", "?")
-            return (f"UPSTREAM_HTTP_{status}", f"The external service answered with HTTP {status}.",
-                    "Try again later; if it persists, the endpoint or credentials may have changed.")
-        return ("UPSTREAM_UNREACHABLE", "Could not reach the external service.",
-                "The server may have no outbound network access, or the provider is down.")
-    if module.startswith("sqlite3"):
-        return ("DATABASE_ERROR", "A database operation failed.",
-                "Check the persistent disk has free space and the database file is writable.")
-    if isinstance(exc, MemoryError):
-        return ("OUT_OF_MEMORY", "The server ran out of memory processing this list.",
-                "Consider a larger Render plan.")
-    return (f"UNEXPECTED_{name.upper()}", f"Unexpected {name} while running this check.",
-            "Send the reference ID to whoever maintains this tool; the full traceback is in the server log.")
 
 
 # --------------------------------------------------------------------------

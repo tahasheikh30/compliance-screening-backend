@@ -27,7 +27,7 @@ LEFT, RIGHT, CW = 50, 545, 495
 TOP, BOTTOM = 790, 62
 PAD_R = 16
 
-F1, F2, F3 = "Helvetica", "Helvetica-Bold", "Helvetica-Oblique"
+F1, F2 = "Helvetica", "Helvetica-Bold"
 
 
 def _c(r, g, b):

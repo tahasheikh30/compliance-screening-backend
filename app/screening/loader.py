@@ -10,6 +10,9 @@ The n8n workflow downloaded every list on every run. This module does the same
   * optionally keeps the parsed list in memory for LIST_CACHE_TTL_SECONDS so a
     burst of screenings does not re-download tens of megabytes each time.
     Failures are never cached. Set the TTL to 0 for a fresh download every time.
+  * keeps the cache warm in the background (start_background_refresh): the lists are loaded when
+    the server starts and reloaded shortly before they expire, so a screening almost never waits
+    for a download.
 
 Nothing is written to disk and no API key is needed.
 """
@@ -68,9 +71,14 @@ class GroupData:
 # HTTP
 # --------------------------------------------------------------------------
 
+# One shared session reuses TLS connections between the parallel list downloads and between reloads.
+_session = requests.Session()
+_session.mount("https://", requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8))
+
+
 def _get(url: str, read_timeout: float = READ_TIMEOUT, **kwargs) -> requests.Response:
     headers = {"User-Agent": HTTP_USER_AGENT, **kwargs.pop("headers", {})}
-    resp = requests.get(url, headers=headers, timeout=(CONNECT_TIMEOUT, read_timeout), **kwargs)
+    resp = _session.get(url, headers=headers, timeout=(CONNECT_TIMEOUT, read_timeout), **kwargs)
     resp.raise_for_status()
     return resp
 
@@ -280,14 +288,20 @@ def _fresh(entry) -> bool:
     return bool(entry) and LIST_CACHE_TTL_SECONDS > 0 and (time.time() - entry.loaded_at) < LIST_CACHE_TTL_SECONDS
 
 
-def load_group(key: str) -> GroupData:
-    """Load one source. Always returns a GroupData; failures come back as .error."""
+def _reload(key: str, max_age: float) -> GroupData:
+    """
+    The cached copy of one source if it is younger than max_age seconds, otherwise download it again.
+    Only one thread downloads a given source at a time; the others wait and reuse the result.
+    """
+    def ok(e) -> bool:
+        return bool(e) and max_age > 0 and (time.time() - e.loaded_at) < max_age
+
     entry = _cache.get(key)
-    if _fresh(entry):
+    if ok(entry):
         return entry
     with _locks[key]:
         entry = _cache.get(key)
-        if _fresh(entry):
+        if ok(entry):
             return entry
         try:
             data = _LOADERS[key]()
@@ -306,11 +320,64 @@ def load_group(key: str) -> GroupData:
         return data
 
 
+def load_group(key: str) -> GroupData:
+    """Load one source. Always returns a GroupData; failures come back as .error."""
+    return _reload(key, LIST_CACHE_TTL_SECONDS)
+
+
 def load_groups() -> dict:
-    """Load every source in parallel."""
+    """Load every source in parallel (no threads at all when everything is already cached)."""
+    entries = {k: _cache.get(k) for k in SOURCE_KEYS}
+    if all(_fresh(e) for e in entries.values()):
+        return entries
     with ThreadPoolExecutor(max_workers=len(SOURCE_KEYS)) as ex:
         futs = {k: ex.submit(load_group, k) for k in SOURCE_KEYS}
         return {k: f.result() for k, f in futs.items()}
+
+
+# --------------------------------------------------------------------------
+# Background refresh
+# --------------------------------------------------------------------------
+
+REFRESH_AT = 0.75   # reload a list once it is this fraction of the TTL old, so it never expires under a request
+_stop = threading.Event()
+_refresher: threading.Thread | None = None
+
+
+def _refresh_loop() -> None:
+    interval = max(5.0, min(300.0, LIST_CACHE_TTL_SECONDS / 8))
+    def one(key: str) -> None:
+        if _stop.is_set():
+            return
+        try:
+            _reload(key, LIST_CACHE_TTL_SECONDS * REFRESH_AT)
+        except Exception:   # never let one bad source stop the others or kill the refresher
+            logger.exception("Background refresh of %s failed", key)
+
+    while not _stop.is_set():
+        with ThreadPoolExecutor(max_workers=len(SOURCE_KEYS)) as ex:
+            list(ex.map(one, SOURCE_KEYS))
+        _stop.wait(interval)
+
+
+def start_background_refresh() -> bool:
+    """
+    Load every list now and keep them fresh. Does nothing when caching is off (TTL 0) or it is
+    already running. A list that fails to refresh keeps its previous copy until that copy expires,
+    after which screenings report the source as unavailable exactly as before. Returns whether
+    a refresher was started.
+    """
+    global _refresher
+    if LIST_CACHE_TTL_SECONDS <= 0 or (_refresher and _refresher.is_alive()):
+        return False
+    _stop.clear()
+    _refresher = threading.Thread(target=_refresh_loop, name="list-refresher", daemon=True)
+    _refresher.start()
+    return True
+
+
+def stop_background_refresh() -> None:
+    _stop.set()
 
 
 def clear_cache(key: str | None = None) -> None:

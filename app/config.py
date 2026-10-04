@@ -52,6 +52,10 @@ MAX_MATCHES = 50
 # Set to 0 to download fresh on every screening, exactly like the workflow.
 LIST_CACHE_TTL_SECONDS = _float_env("LIST_CACHE_TTL_SECONDS", 3600)
 
+# Load every list when the server starts and reload each one shortly before it expires, so a
+# screening does not wait for a 20-40 s download. Needs LIST_CACHE_TTL_SECONDS > 0.
+PRELOAD_LISTS = os.environ.get("PRELOAD_LISTS", "true").strip().lower() not in ("0", "false", "no")
+
 HTTP_USER_AGENT = os.environ.get(
     "HTTP_USER_AGENT", "Mozilla/5.0 (compatible; ComplianceScreening/1.0)"
 )
