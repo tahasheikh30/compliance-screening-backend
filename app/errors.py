@@ -5,7 +5,7 @@ Goal: when something breaks, the person looking at the screen AND the person
 reading the server logs can find each other. Every response carries an
 X-Request-ID; every server-side log line for that request carries the same
 ID; every error body carries it too. "It failed" becomes "request 3f9a...
-failed with FIA_PDF_CORRUPT — here's what to do".
+failed with NACTA_FILE_UNREADABLE — here's what to do".
 
 Error body shape (always this shape, for every error, including 404/405/422/
 429/500 raised by the framework itself):
@@ -15,7 +15,7 @@ Error body shape (always this shape, for every error, including 404/405/422/
                                             # older client reading `detail`
                                             # keeps working
       "error": {
-        "code": "FIA_PDF_CORRUPT",           # stable, greppable identifier
+        "code": "NACTA_FILE_UNREADABLE",     # stable, greppable identifier
         "message": "<human message>",
         "hint": "<what to try next>" | null,
         "request_id": "3f9a1c...",
@@ -31,9 +31,9 @@ includes an `input` key with the raw submitted value — we drop it).
 import contextvars
 import logging
 import re
+import sqlite3
 import time
 import uuid
-import xml.etree.ElementTree as ET
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -105,45 +105,6 @@ def error_response(status: int, code: str, message: str, hint: str | None = None
 
 
 # --------------------------------------------------------------------------
-# Turning arbitrary exceptions from a screening source into something a
-# compliance analyst can act on, WITHOUT leaking file paths or stack frames.
-# The full traceback always goes to the server log under the request ID.
-# --------------------------------------------------------------------------
-
-def describe_exception(exc: BaseException) -> tuple[str, str, str]:
-    """Returns (code, human message, hint) for an exception raised inside a source check."""
-    name = type(exc).__name__
-    module = type(exc).__module__ or ""
-
-    if isinstance(exc, ET.ParseError):
-        return ("SOURCE_DATA_CORRUPT",
-                "The cached list file could not be parsed (it may be truncated or corrupt).",
-                "Re-run the refresh for this list from the Lists & audit tab.")
-    if isinstance(exc, FileNotFoundError):
-        return ("SOURCE_FILE_MISSING",
-                "A file this check needs is missing on the server.",
-                "Refresh the list, or re-upload it. If this keeps happening, check the persistent disk is mounted.")
-    if module.startswith("requests") or module.startswith("urllib3"):
-        if "Timeout" in name:
-            return ("UPSTREAM_TIMEOUT", "The external service took too long to respond.",
-                    "Try again in a minute. If it persists the provider may be down.")
-        if "HTTPError" in name:
-            status = getattr(getattr(exc, "response", None), "status_code", "?")
-            return (f"UPSTREAM_HTTP_{status}", f"The external service answered with HTTP {status}.",
-                    "Try again later; if it persists, the endpoint or credentials may have changed.")
-        return ("UPSTREAM_UNREACHABLE", "Could not reach the external service.",
-                "The server may have no outbound network access, or the provider is down.")
-    if module.startswith("sqlite3"):
-        return ("DATABASE_ERROR", "A database operation failed.",
-                "Check the persistent disk has free space and the database file is writable.")
-    if isinstance(exc, MemoryError):
-        return ("OUT_OF_MEMORY", "The server ran out of memory processing this list.",
-                "Consider a larger Render plan.")
-    return (f"UNEXPECTED_{name.upper()}", f"Unexpected {name} while running this check.",
-            "Send the reference ID to whoever maintains this tool; the full traceback is in the server log.")
-
-
-# --------------------------------------------------------------------------
 # Wiring
 # --------------------------------------------------------------------------
 
@@ -197,6 +158,14 @@ def install(app: FastAPI) -> None:
             headers={"Retry-After": "60"},
         )
 
+    @app.exception_handler(sqlite3.Error)
+    async def _database_error(request: Request, exc: sqlite3.Error):
+        logger.exception("Database error on %s %s", request.method, request.url.path)
+        return error_response(
+            500, "DATABASE_ERROR", "A database operation failed.",
+            "Check the persistent disk has free space and the database file is writable (STORAGE_DIR).",
+        )
+
     @app.exception_handler(Exception)
     async def _unhandled(request: Request, exc: Exception):
         # Backstop only — request_context() normally catches first so that the
@@ -227,7 +196,6 @@ async def request_context(request: Request, call_next):
     incoming = request.headers.get("X-Request-ID", "")
     rid = incoming if _REQUEST_ID_RE.match(incoming) else uuid.uuid4().hex[:16]
     token = request_id_var.set(rid)
-    request.state.request_id = rid
     started = time.perf_counter()
     try:
         try:

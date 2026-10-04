@@ -27,7 +27,7 @@ LEFT, RIGHT, CW = 50, 545, 495
 TOP, BOTTOM = 790, 62
 PAD_R = 16
 
-F1, F2, F3 = "Helvetica", "Helvetica-Bold", "Helvetica-Oblique"
+F1, F2 = "Helvetica", "Helvetica-Bold"
 
 
 def _c(r, g, b):
@@ -267,7 +267,16 @@ def generate_evidence_pdf(r: dict, case_ref: str, out_path: Path | None = None) 
     """Write the evidence PDF for screening result `r` (the dict returned by engine.screen)."""
     app = r["applicant"]
     out_path = out_path or (EVIDENCE_DIR / f"evidence_{re.sub(r'[^A-Za-z0-9_-]', '_', case_ref)}.pdf")
-    d = _Doc(out_path, app["name"])
+    try:
+        _draw_report(_Doc(out_path, app["name"]), r, case_ref)
+    except Exception:
+        out_path.unlink(missing_ok=True)   # never leave a truncated PDF that a later download would serve
+        raise
+    return out_path
+
+
+def _draw_report(d: "_Doc", r: dict, case_ref: str) -> None:
+    app = r["applicant"]
     d.c.setTitle(clean(f"Sanctions screening evidence {case_ref}"))
 
     # header banner
@@ -443,4 +452,3 @@ def generate_evidence_pdf(r: dict, case_ref: str, out_path: Path | None = None) 
 
     d.c.showPage()
     d.c.save()
-    return out_path

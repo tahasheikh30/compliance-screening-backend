@@ -348,3 +348,55 @@ def test_stale_uploaded_file_is_reported_by_the_status_endpoint(client, fake_sou
     assert client.get("/api/admin/nacta", headers=API_HEADERS).json()["stale"] is True
     r = _screen(client)
     assert _by_source(r)["NACTA"]["status"] == "PARTIAL" and r.json()["overall_status"] == "MANUAL_REVIEW"
+
+
+# ---- failure handling --------------------------------------------------------
+
+def test_failed_screening_is_marked_error_not_left_pending(client, monkeypatch):
+    from app.screening import engine
+    monkeypatch.setattr(engine, "screen", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("scorer exploded")))
+    r = _screen(client, full_name="Ali Khan Malik")
+    assert r.status_code == 500 and r.json()["error"]["code"] == "SCREENING_FAILED"
+    assert "scorer exploded" not in r.text                       # internals stay in the server log
+    rows = client.get("/api/applicants", headers=API_HEADERS).json()
+    assert [a["overall_status"] for a in rows] == ["ERROR"]      # never PENDING, never a clearance
+
+
+def test_failure_while_saving_results_is_also_marked_error(client, monkeypatch):
+    from app import database
+    monkeypatch.setattr(database, "insert_result", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("write failed")))
+    assert _screen(client).json()["error"]["code"] == "SCREENING_FAILED"
+    assert client.get("/api/applicants", headers=API_HEADERS).json()[0]["overall_status"] == "ERROR"
+
+
+def test_database_failure_is_explained(client, monkeypatch):
+    import sqlite3
+    from app import database
+    monkeypatch.setattr(database, "list_applicants", lambda *a, **k: (_ for _ in ()).throw(sqlite3.OperationalError("disk I/O error")))
+    r = client.get("/api/applicants", headers={**API_HEADERS, "Origin": "http://localhost:5173"})
+    assert r.status_code == 500 and r.json()["error"]["code"] == "DATABASE_ERROR"
+    assert "disk I/O" not in r.text and r.json()["error"]["request_id"]
+    assert r.headers.get("access-control-allow-origin") == "http://localhost:5173"
+
+
+def test_nacta_save_failure_is_explained_and_keeps_the_old_list(client, fake_sources, monkeypatch):
+    from app.screening import nacta_store
+    fake_sources["nacta"] = "real"
+    good = b"Name,Father Name,CNIC\nZara Test Person,Some Father,4210112345671\n"
+    assert _upload(client, good).status_code == 200
+    monkeypatch.setattr(nacta_store, "save", lambda *a, **k: (_ for _ in ()).throw(OSError("No space left on device")))
+    r = _upload(client, good.replace(b"Zara", b"Mira"))
+    assert r.status_code == 500 and r.json()["error"]["code"] == "NACTA_SAVE_FAILED"
+    assert "No space left" not in r.text
+
+
+def test_malformed_csv_upload_is_a_422_not_a_500(client, fake_sources):
+    fake_sources["nacta"] = "real"
+    r = _upload(client, b"Name,CNIC\n" + b"Z" * 200_000 + b",4210112345671\n")   # over csv's field size limit: csv.Error
+    assert r.status_code == 422 and r.json()["error"]["code"] == "NACTA_FILE_UNREADABLE"
+
+
+def test_absurdly_nested_json_upload_is_a_422_not_a_500(client, fake_sources):
+    fake_sources["nacta"] = "real"
+    r = _upload(client, b"[" * 200_000, content_type="application/json")
+    assert r.status_code == 422 and r.json()["error"]["code"] == "NACTA_FILE_UNREADABLE"

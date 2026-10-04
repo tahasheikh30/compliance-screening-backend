@@ -75,8 +75,7 @@ def _get(url: str, read_timeout: float = READ_TIMEOUT, **kwargs) -> requests.Res
     return resp
 
 
-def _text(resp: requests.Response) -> str:
-    raw = resp.content
+def decode_bytes(raw: bytes) -> str:
     try:
         return raw.decode("utf-8-sig")
     except UnicodeDecodeError:
@@ -84,7 +83,7 @@ def _text(resp: requests.Response) -> str:
 
 
 def fetch_text(url: str, read_timeout: float = READ_TIMEOUT) -> str:
-    return _text(_get(url, read_timeout))
+    return decode_bytes(_get(url, read_timeout).content)
 
 
 def _short(exc: BaseException) -> str:
@@ -199,13 +198,6 @@ def _load_fia() -> GroupData:
         # not an exception: the FIA site is optional in the workflow, the list is simply reported as not screened
         return GroupData("FIA_REDBOOK", [], meta, error="The FIA Red Book could not be loaded. " + reasons)
     return GroupData("FIA_REDBOOK", parsers.prepare(records), meta)
-
-
-def decode_bytes(raw: bytes) -> str:
-    try:
-        return raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        return raw.decode("latin-1")
 
 
 def _read_nacta() -> tuple:
@@ -348,4 +340,4 @@ def fetch_news(name: str) -> str:
     """Google News RSS for the applicant plus adverse keywords. Raises on failure."""
     resp = _get(NEWS_URL, PAGE_READ_TIMEOUT,
                 params={"q": build_news_query(name), "hl": "en-US", "gl": "US", "ceid": "US:en"})
-    return _text(resp)
+    return decode_bytes(resp.content)

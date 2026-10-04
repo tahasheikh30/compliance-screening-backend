@@ -13,6 +13,7 @@ Each parser turns raw text into `Record` objects:
 
 import csv
 import io
+import json
 import re
 from dataclasses import dataclass, field
 
@@ -425,8 +426,6 @@ def parse_news_hits(xml: str, applicant_name: str, limit: int = 20) -> tuple:
 # mirrors ("Primary Title / Name", "Father Name", "CNIC / ID Number", ...), so
 # columns are recognised by name, ignoring case and punctuation.
 
-import json  # noqa: E402
-
 NACTA_LABEL = "NACTA Proscribed Persons (Fourth Schedule)"
 NACTA_PROGRAMME = "Anti-Terrorism Act 1997, Fourth Schedule"
 
@@ -536,7 +535,7 @@ def _nacta_rows(text: str) -> list:
     if t[0] in "[{":
         try:
             data = json.loads(t)
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             raise ValueError(f"The file looks like JSON but could not be parsed ({exc}).") from None
         if isinstance(data, dict):
             lists = [v for v in data.values() if isinstance(v, list) and v and isinstance(v[0], dict)]
@@ -551,13 +550,16 @@ def _nacta_rows(text: str) -> list:
         return _nacta_xml_rows(t)
     first_line = t.splitlines()[0]
     delim = max((",", ";", "\t", "|"), key=first_line.count)
-    grid = [r for r in csv.reader(io.StringIO(t, newline=""), delimiter=delim) if any(c.strip() for c in r)]
+    try:
+        grid = [r for r in csv.reader(io.StringIO(t, newline=""), delimiter=delim) if any(c.strip() for c in r)]
+    except csv.Error as exc:   # e.g. a NUL byte or an over-long field: csv.Error is not a ValueError
+        raise ValueError(f"The file looks like CSV but could not be parsed ({exc}).") from None
     # the header is the first row that has a recognisable name column
     for i, row in enumerate(grid[:15]):
         keys = {_hkey(c) for c in row}
         if keys & _NAME_KEYS or any("name" in k and "father" not in k for k in keys):
             header = row
-            return [dict(zip(header, r)) for r in grid[i + 1:]]
+            return [dict(zip(header, r, strict=False)) for r in grid[i + 1:]]   # short rows are allowed
     raise ValueError("Could not find a Name column. The first row should have headers such as Name, Father Name, CNIC.")
 
 

@@ -6,3 +6,4 @@ evidence/*.pdf
 .env
 .env.*
 !.env.example
+lists/
