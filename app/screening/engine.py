@@ -11,14 +11,14 @@ in the workflow. Every potential match needs a human to verify it.
 """
 
 import re
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from app.config import MATCH_THRESHOLD, MAX_MATCHES, MAX_THRESHOLD, MIN_THRESHOLD
 from app.errors import logger
 from app.screening import loader, parsers
-from app.screening.names import NameScorer
 from app.screening.parsers import normalize_cnic
+from app.screening.names import NameScorer
+from concurrent.futures import ThreadPoolExecutor
 
 SOURCE_LABELS = {
     "UNSC": "UN Security Council Consolidated List",
@@ -208,7 +208,7 @@ def _news(name: str) -> dict:
     return media
 
 
-def source_status(src: dict) -> str:
+def source_status(src: dict, fia_required: bool = True) -> str:
     """HIT / PARTIAL / REVIEW / CLEAR / NOT_CONFIGURED / ERROR for one source."""
     if not src["available"]:
         if src["key"] in ("FIA_REDBOOK", "NACTA"):

@@ -76,8 +76,8 @@ def fetch_with_browser(url: str, fmt: str, out_dir: Path, timeout_s: int, show: 
                 labels = [t.strip() for t in page.locator("button, a").all_inner_texts() if t.strip()][:40]
                 print(f"Could not get the file. Saved {out_dir / 'nacta_debug.png'}.", file=sys.stderr)
                 print(f"Buttons and links visible on the page: {labels}", file=sys.stderr)
-            except Exception as diag_exc:
-                print(f"(Could not capture a debug screenshot either: {type(diag_exc).__name__})", file=sys.stderr)
+            except Exception:
+                pass
             raise
         finally:
             browser.close()

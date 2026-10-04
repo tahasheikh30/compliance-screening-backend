@@ -26,7 +26,6 @@ Endpoints:
 """
 
 import os
-import sqlite3
 from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -97,15 +96,15 @@ def _case_ref(applicant_id: int, when: datetime) -> str:
     return f"CS-{when:%Y%m%d}-{applicant_id:05d}"
 
 
-def _mark_failed(applicant_id: int) -> None:
-    """Never let a failed screening sit as PENDING forever. Must not raise: the original error matters more."""
-    try:
-        db.update_applicant_status(applicant_id, "ERROR")
-    except sqlite3.Error:
-        logger.exception("Could not mark applicant %s as ERROR", applicant_id)
+@app.post("/api/screen", response_model=ScreenResponse, dependencies=[Depends(require_api_key)])
+@limiter.limit("10/minute")
+def screen_applicant(request: Request, req: ScreenRequest):
+    now = datetime.now(timezone.utc)
+    threshold = engine.resolve_threshold(req.threshold)
+    applicant_id = db.insert_applicant(req.full_name, req.cnic, req.father_name, now.isoformat(), "PENDING",
+                                       dob=req.dob, nationality=req.nationality, threshold=threshold)
+    case_ref = _case_ref(applicant_id, now)
 
-
-def _run_screening(req: ScreenRequest, applicant_id: int, case_ref: str, threshold: float) -> ScreenResponse:
     result = engine.screen(req.full_name, req.dob or "", req.nationality or "", threshold,
                            cnic=req.cnic or "", father_name=req.father_name or "")
 
@@ -113,7 +112,7 @@ def _run_screening(req: ScreenRequest, applicant_id: int, case_ref: str, thresho
     rows: list = []
     for key in engine.SOURCE_ORDER:
         src = result["sources"][key]
-        status = engine.source_status(src)
+        status = engine.source_status(src, FIA_REQUIRED)
         statuses[key] = status
         best = src["matches"][0] if src["matches"] else None
         detail = engine.describe_source(src, status, threshold)
@@ -125,47 +124,33 @@ def _run_screening(req: ScreenRequest, applicant_id: int, case_ref: str, thresho
             list_version=src["list_version"], records_screened=src["records"],
             payload={"matches": src["matches"], "articles": src["articles"], "match_count": src["match_count"], "lists": src["lists"]},
         )
-        rows.append((row_id, status))
+        rows.append((row_id, key, src, status, detail, best))
 
     # One evidence PDF per screening. If it cannot be written the finding is still saved.
+    evidence_file = None
     if result["hit"]:
         try:
             pdf_path = evidence.generate_evidence_pdf(result, case_ref)
-            db.set_evidence_file_for_applicant(applicant_id, pdf_path.name)
+            evidence_file = pdf_path.name
+            db.set_evidence_file_for_applicant(applicant_id, evidence_file)
         except Exception:
             logger.exception("Evidence PDF generation failed for applicant %s", applicant_id)
             note = " [Evidence PDF could not be generated. See the server log for this request ID.]"
-            for row_id, status in rows:
+            for row_id, _key, _src, status, _detail, _best in rows:
                 if status in ("HIT", "REVIEW"):
                     db.append_result_detail(row_id, note)
 
     overall = engine.overall_status(statuses, FIA_REQUIRED, NACTA_REQUIRED)
     db.update_applicant_status(applicant_id, overall, records_screened=result["total_records"])
 
+    results_out = [
+        ScreeningResultOut(**r) for r in db.get_results_for_applicant(applicant_id)
+    ]
     return ScreenResponse(
-        applicant_id=applicant_id, full_name=req.full_name, overall_status=overall,
-        results=[ScreeningResultOut(**r) for r in db.get_results_for_applicant(applicant_id)],
+        applicant_id=applicant_id, full_name=req.full_name, overall_status=overall, results=results_out,
         case_ref=case_ref, threshold=threshold, records_screened=result["total_records"],
         sanctions_hit_count=result["sanctions_hit_count"], media_hit_count=result["media_hit_count"],
     )
-
-
-@app.post("/api/screen", response_model=ScreenResponse, dependencies=[Depends(require_api_key)])
-@limiter.limit("10/minute")
-def screen_applicant(request: Request, req: ScreenRequest):
-    now = datetime.now(timezone.utc)
-    threshold = engine.resolve_threshold(req.threshold)
-    applicant_id = db.insert_applicant(req.full_name, req.cnic, req.father_name, now.isoformat(), "PENDING",
-                                       dob=req.dob, nationality=req.nationality, threshold=threshold)
-    try:
-        return _run_screening(req, applicant_id, _case_ref(applicant_id, now), threshold)
-    except Exception as exc:
-        # The applicant row already exists. Mark it, so it is not mistaken for a screening still in progress.
-        logger.exception("Screening failed for applicant %s", applicant_id)
-        _mark_failed(applicant_id)
-        raise AppError(500, "SCREENING_FAILED", "The screening could not be completed.",
-                       "Nothing was cleared for this applicant. Try again; if it keeps failing, quote the reference ID "
-                       "to whoever maintains this tool.") from exc
 
 
 @app.get("/api/applicants", response_model=list[ApplicantSummary], dependencies=[Depends(require_api_key)])
@@ -297,12 +282,7 @@ async def upload_nacta(request: Request, filename: str = "nacta.csv"):
     if not records:
         raise AppError(422, "NACTA_FILE_NO_RECORDS", "The file has no usable records (no names found).",
                        "Check that the first row holds the column headers.")
-    try:
-        meta = nacta_store.save(data, filename, len(records))
-    except OSError as exc:
-        logger.exception("NACTA list could not be saved")
-        raise AppError(500, "NACTA_SAVE_FAILED", "The file was read but could not be saved on the server.",
-                       "Check the persistent disk has free space and is writable (STORAGE_DIR), then upload again.") from exc
+    meta = nacta_store.save(data, filename, len(records))
     loader.clear_cache("NACTA")
     warnings = []
     if len(records) < NACTA_MIN_EXPECTED:

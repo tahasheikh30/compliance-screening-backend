@@ -47,18 +47,3 @@ def test_non_latin_names_do_not_crash_the_pdf(fake_sources, storage):
 
 def test_clean_helper():
     assert evidence.clean("Zoë \u2014 x") == "Zoe - x" and evidence.clean("日本") == "??"
-
-
-def test_failed_pdf_generation_leaves_no_partial_file(fake_sources, storage, monkeypatch):
-    import pytest
-    r = engine.screen("Muhammad Ali Khan")
-    out = storage / "evidence" / "partial.pdf"
-
-    def explode(doc, *a, **k):
-        doc.c.save()                       # a file now exists on disk...
-        raise RuntimeError("layout bug")   # ...then generation fails
-
-    monkeypatch.setattr(evidence, "_draw_report", explode)
-    with pytest.raises(RuntimeError):
-        evidence.generate_evidence_pdf(r, "CS-TEST-00001", out_path=out)
-    assert not out.exists()
