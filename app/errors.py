@@ -34,11 +34,14 @@ import re
 import time
 import uuid
 
+import psycopg
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from slowapi.errors import RateLimitExceeded
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from app.database import DatabaseNotConfigured
 
 request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
 
@@ -156,6 +159,21 @@ def install(app: FastAPI) -> None:
             "Wait a minute and try again. Limits exist to protect the public list publishers and applicant data.",
             headers={"Retry-After": "60"},
         )
+
+    @app.exception_handler(psycopg.OperationalError)   # also covers a pool that timed out waiting for a connection
+    async def _database_down(request: Request, exc: Exception):
+        logger.error("Database unavailable: %s", exc)
+        return error_response(
+            503, "DATABASE_UNAVAILABLE", "The database cannot be reached right now.",
+            "Try again in a moment. If it keeps happening, check that the Supabase project is running "
+            "(free projects pause when they are unused) and that DATABASE_URL is correct.",
+            headers={"Retry-After": "5"})
+
+    @app.exception_handler(DatabaseNotConfigured)
+    async def _database_not_configured(request: Request, exc: Exception):
+        logger.error("%s", exc)
+        return error_response(503, "DATABASE_NOT_CONFIGURED", "The server has no database configured.",
+                              "Set DATABASE_URL on the backend (the Supabase connection string) and redeploy.")
 
     @app.exception_handler(Exception)
     async def _unhandled(request: Request, exc: Exception):

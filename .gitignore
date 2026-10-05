@@ -1,10 +1,6 @@
 __pycache__/
 *.pyc
-screening.db
-evidence/*.pdf
 .venv/
 .env
 .env.*
 !.env.example
-screening.db-wal
-screening.db-shm

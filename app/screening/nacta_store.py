@@ -1,63 +1,31 @@
 """
 Storage for the NACTA Proscribed Persons file.
 
-NACTA publishes this list only through a web app, so the list is uploaded as a CSV or
-JSON file through the API and kept on the persistent disk (STORAGE_DIR/lists). Only
-the most recent upload is kept. The file is stored as uploaded; it is parsed each
-time the list is loaded, so a parser improvement applies to the existing file too.
+NACTA publishes this list only through a web app, so the list is uploaded as a CSV or JSON file
+through the API (by an admin, or by the scheduled GitHub workflow) and kept in the database.
+Only the most recent upload is kept. The file is stored as uploaded; it is parsed each time the
+list is loaded, so a parser improvement applies to the existing file too.
 """
 
-import hashlib
-import json
 import os
 from datetime import datetime, timezone
 
-from app import config
-
-
-def _paths():
-    d = config.LISTS_DIR
-    d.mkdir(parents=True, exist_ok=True)
-    return d / "nacta_persons.dat", d / "nacta_persons.json"
-
-
-def _atomic_write(path, data: bytes) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)  # never leaves a half written list behind
+from app import database as db
 
 
 def save(data: bytes, filename: str, records: int, live: bool = False) -> dict:
-    blob, meta_path = _paths()
-    meta = {
-        # an uploaded file keeps only its file name (never a client side path); a live copy keeps its address
-        "filename": (filename if live else os.path.basename(filename or "nacta.csv"))[:200],
-        "uploaded_at": datetime.now(timezone.utc).isoformat(),
-        "records": int(records),
-        "size": len(data),
-        "sha256": hashlib.sha256(data).hexdigest(),
-        "live": bool(live),   # True when this copy was downloaded from NACTA_PERSONS_URL rather than uploaded
-    }
-    _atomic_write(blob, data)
-    _atomic_write(meta_path, json.dumps(meta).encode())
-    return meta
+    # an uploaded file keeps only its file name (never a client side path); a live copy keeps its address
+    name = (filename if live else os.path.basename(filename or "nacta.csv"))[:200] or "nacta.csv"
+    return db.nacta_put(data, name, records, live)
 
 
 def meta() -> dict | None:
-    _, meta_path = _paths()
-    try:
-        return json.loads(meta_path.read_text())
-    except (OSError, ValueError):
-        return None
+    return db.nacta_meta()
 
 
 def load() -> tuple | None:
     """(file bytes, metadata) of the stored list, or None when nothing was uploaded."""
-    blob, _ = _paths()
-    m = meta()
-    if not m or not blob.exists():
-        return None
-    return blob.read_bytes(), m
+    return db.nacta_get()
 
 
 def age_days(m: dict | None) -> float | None:

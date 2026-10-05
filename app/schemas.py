@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -113,3 +113,28 @@ class ApplicantSummary(BaseModel):
     overall_status: str
     dob: Optional[str] = None
     nationality: Optional[str] = None
+    screened_by: Optional[str] = None   # email of the analyst who ran it (shown to admins, who see everyone's)
+
+
+class MeOut(BaseModel):
+    id: Optional[str]
+    email: str
+    role: str       # "user" or "admin"
+    status: str     # "pending", "approved" or "rejected"
+
+
+class UserOut(BaseModel):
+    id: str
+    email: str
+    role: str
+    status: str
+    created_at: str
+    decided_at: Optional[str] = None
+
+
+class UserStatusIn(BaseModel):
+    status: Literal["approved", "rejected", "pending"]
+
+
+class UserRoleIn(BaseModel):
+    role: Literal["user", "admin"]

@@ -3,43 +3,55 @@ FastAPI backend for the applicant screening tool.
 
 The screening itself is the n8n "Applicant Screening Engine" workflow, ported to
 Python (see app/screening/): the applicant is checked against the UN Security
-Council, OFAC (SDN and Consolidated), UK (FCDO) and FIA Red Book lists, all
+Council, OFAC (SDN and Consolidated), UK (FCDO), FIA Red Book and NACTA lists, all
 downloaded live from the publishers, plus an open news search. A potential match
-produces an evidence PDF. No API keys or third party services are needed.
+produces an evidence PDF. No API keys or third party services are needed for that.
+
+Everything is stored in Supabase (Postgres): users, each person's screening history,
+the evidence PDFs and the NACTA list. People sign in with Supabase Auth, are approved
+by an admin, and see only their own screenings (admins see everyone's). See README.
 
 Run:
     uvicorn app.main:app --reload --port 8000
 
-All endpoints except /api/health require an X-API-Key header matching API_KEY.
+Every endpoint except /api/health needs "Authorization: Bearer <access token>".
 
 Endpoints:
+    GET  /api/me                          who you are and whether you are approved (works while pending)
     POST /api/screen                      run a screening for one applicant (rate limited)
-    GET  /api/applicants                  list past screenings
+    GET  /api/applicants                  your past screenings (admins: everyone's; ?mine=true for their own)
     GET  /api/applicants/{id}             full result for one screening
     GET  /api/applicants/{id}/evidence    evidence PDF of a screening that found something
     GET  /api/evidence/{result_id}        same PDF, addressed by a result row id
     GET  /api/admin/lists                 which lists are cached in memory right now
-    POST /api/admin/refresh               drop the in-memory list cache and reload every list
     GET  /api/admin/nacta                 which NACTA file is loaded and how old it is
-    POST /api/admin/nacta                 upload the NACTA Proscribed Persons CSV or JSON export
-    GET  /api/health                      unauthenticated liveness check
+    POST /api/admin/refresh               (admin) drop the in-memory list cache and reload every list
+    POST /api/admin/nacta                 (admin, or the API key) upload the NACTA CSV or JSON export
+    GET  /api/admin/users                 (admin) people who signed up, ?status=pending to see who is waiting
+    POST /api/admin/users/{id}/status     (admin) approve or reject someone
+    POST /api/admin/users/{id}/role       (admin) make someone an admin, or a normal user again
+    GET  /api/health                      unauthenticated liveness check (?deep=true also checks the database)
 """
 
 import os
+import uuid
 from datetime import datetime, timezone
+from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
 
 from app import database as db
 from app import evidence
 from app import config as app_config
-from app.auth import require_api_key
-from app.config import EVIDENCE_DIR, FIA_REQUIRED, NACTA_REQUIRED, PRELOAD_LISTS
+from app import auth
+from app.auth import AuthUser, require_admin, require_admin_or_service_key, require_approved
+from app.config import FIA_REQUIRED, NACTA_REQUIRED, PRELOAD_LISTS
 from app.errors import AppError, configure_logging, install as install_error_handlers, request_context, logger
-from app.schemas import ApplicantSummary, ScreenRequest, ScreenResponse, ScreeningResultOut
+from app.schemas import (ApplicantSummary, MeOut, ScreenRequest, ScreenResponse, ScreeningResultOut, UserOut,
+                         UserRoleIn, UserStatusIn)
 from app.screening import engine, loader, nacta_store, parsers
 
 configure_logging()
@@ -47,7 +59,12 @@ configure_logging()
 from slowapi import Limiter  # noqa: E402  (after logging config, before app)
 from slowapi.util import get_remote_address  # noqa: E402
 
-limiter = Limiter(key_func=get_remote_address)
+def _rate_key(request: Request) -> str:
+    # one allowance per signed in person (set by app.auth); a request that never got that far is counted by address
+    return getattr(request.state, "rate_key", None) or get_remote_address(request)
+
+
+limiter = Limiter(key_func=_rate_key)
 
 app = FastAPI(title="Applicant Screening API")
 app.state.limiter = limiter
@@ -80,17 +97,26 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["Content-Type", "X-API-Key", "X-Request-ID"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key", "X-Request-ID"],
     expose_headers=["X-Request-ID"],
 )
 
 
 @app.on_event("startup")
 def startup():
-    db.init_db()
-    if not os.environ.get("API_KEY"):
-        logger.warning("API_KEY is not set. Every protected endpoint will return 503 until it is configured. "
-                       "Do not deploy like this.")
+    try:
+        db.init_db()
+    except Exception:
+        # keep serving: /api/health still answers and every other request explains the problem with a 503
+        logger.exception("The database is not reachable at startup. Check DATABASE_URL.")
+    if not app_config.SUPABASE_URL and not app_config.SUPABASE_JWT_SECRET:
+        logger.warning("Neither SUPABASE_URL nor SUPABASE_JWT_SECRET is set, so no sign in can be verified and every "
+                       "user request will be refused. Do not deploy like this.")
+    if not auth.API_KEY:
+        logger.info("API_KEY is not set: the scheduled NACTA upload by access key is disabled.")
+    if app_config.ALLOW_API_KEY_FULL_ACCESS:
+        logger.warning("ALLOW_API_KEY_FULL_ACCESS is on: the API key gives full admin access with no user attribution. "
+                       "Turn it off once the frontend signs users in.")
     if PRELOAD_LISTS and loader.start_background_refresh():
         logger.info("Loading the screening lists in the background and keeping them fresh")
 
@@ -98,19 +124,33 @@ def startup():
 @app.on_event("shutdown")
 def shutdown():
     loader.stop_background_refresh()
+    db.close_pool()
 
 
 def _case_ref(applicant_id: int, when: datetime) -> str:
     return f"CS-{when:%Y%m%d}-{applicant_id:05d}"
 
 
-@app.post("/api/screen", response_model=ScreenResponse, dependencies=[Depends(require_api_key)])
+def _scope(user: AuthUser, mine: bool = False):
+    """Whose screenings this user may see: everyone's (None) for an admin, otherwise only their own."""
+    return None if (user.is_admin and not mine) else user.id
+
+
+@app.get("/api/me", response_model=MeOut)
+@limiter.limit("60/minute")
+def me(request: Request, user: AuthUser = Depends(auth.authenticate)):
+    """Who you are and whether your account is approved yet. Works for a user who is still pending."""
+    return MeOut(id=user.id, email=user.email, role=user.role, status=user.status)
+
+
+@app.post("/api/screen", response_model=ScreenResponse)
 @limiter.limit("10/minute")
-def screen_applicant(request: Request, req: ScreenRequest):
+def screen_applicant(request: Request, req: ScreenRequest, user: AuthUser = Depends(require_approved)):
     now = datetime.now(timezone.utc)
     threshold = engine.resolve_threshold(req.threshold)
     applicant_id = db.insert_applicant(req.full_name, req.cnic, req.father_name, now.isoformat(), "PENDING",
-                                       dob=req.dob, nationality=req.nationality, threshold=threshold)
+                                       dob=req.dob, nationality=req.nationality, threshold=threshold,
+                                       user_id=user.id)
     case_ref = _case_ref(applicant_id, now)
 
     result = engine.screen(req.full_name, req.dob or "", req.nationality or "", threshold,
@@ -136,22 +176,21 @@ def screen_applicant(request: Request, req: ScreenRequest):
                         "lists": src["lists"]},
         })
 
-    # One transaction for all result rows and the final status. The PENDING row inserted above stays
-    # as the record of the attempt if the screening itself fails.
     overall = engine.overall_status(statuses, FIA_REQUIRED, NACTA_REQUIRED)
-    row_ids = db.save_screening(applicant_id, overall, result["total_records"], rows)
 
-    # One evidence PDF per screening. If it cannot be written the finding is still saved.
+    # One evidence PDF per screening, kept in the database. If it cannot be made the finding is still saved.
+    evidence_pdf, evidence_failed = None, False
     if result["hit"]:
         try:
-            pdf_path = evidence.generate_evidence_pdf(result, case_ref)
-            db.set_evidence_file_for_applicant(applicant_id, pdf_path.name)
+            evidence_pdf = evidence.generate_evidence_pdf(result, case_ref)
         except Exception:
             logger.exception("Evidence PDF generation failed for applicant %s", applicant_id)
-            note = " [Evidence PDF could not be generated. See the server log for this request ID.]"
-            for row_id, row in zip(row_ids, rows):
-                if row["status"] in ("HIT", "REVIEW"):
-                    db.append_result_detail(row_id, note)
+            evidence_failed = True
+
+    # One transaction for all result rows, the final status and the PDF. The PENDING row inserted above
+    # stays as the record of the attempt if the screening itself fails.
+    db.save_screening(applicant_id, overall, result["total_records"], rows,
+                      evidence=evidence_pdf, evidence_failed=evidence_failed)
 
     results_out = [
         ScreeningResultOut(**r) for r in db.get_results_for_applicant(applicant_id)
@@ -163,16 +202,17 @@ def screen_applicant(request: Request, req: ScreenRequest):
     )
 
 
-@app.get("/api/applicants", response_model=list[ApplicantSummary], dependencies=[Depends(require_api_key)])
+@app.get("/api/applicants", response_model=list[ApplicantSummary])
 @limiter.limit("30/minute")
-def list_applicants(request: Request):
-    return db.list_applicants()
+def list_applicants(request: Request, mine: bool = False, user: AuthUser = Depends(require_approved)):
+    return db.list_applicants(user_id=_scope(user, mine))
 
 
-@app.get("/api/applicants/{applicant_id}", response_model=ScreenResponse, dependencies=[Depends(require_api_key)])
+@app.get("/api/applicants/{applicant_id}", response_model=ScreenResponse)
 @limiter.limit("30/minute")
-def get_applicant(request: Request, applicant_id: int):
-    applicant = db.get_applicant(applicant_id)
+def get_applicant(request: Request, applicant_id: int, user: AuthUser = Depends(require_approved)):
+    # someone else's screening looks exactly like one that does not exist
+    applicant = db.get_applicant(applicant_id, _scope(user))
     if not applicant:
         raise HTTPException(404, "Applicant not found")
     results = db.get_results_for_applicant(applicant_id)
@@ -188,47 +228,47 @@ def get_applicant(request: Request, applicant_id: int):
     )
 
 
-def _send_evidence(filename: str | None):
-    if not filename:
-        raise AppError(404, "EVIDENCE_NOT_GENERATED", "This result has no evidence PDF.",
-                       "An evidence PDF is only generated when a screening finds a potential match or an adverse "
-                       "news article. If it should exist and does not, generation may have failed: check the server log.")
-    path = EVIDENCE_DIR / filename
-    if not path.exists():
-        raise AppError(404, "EVIDENCE_FILE_MISSING", "The evidence file is recorded but missing on disk.",
-                       "The persistent disk may have been reset since this screening ran (check STORAGE_DIR). "
-                       "The finding itself is still in the database.")
-    return FileResponse(path, media_type="application/pdf", filename=filename)
+_NO_EVIDENCE = ("An evidence PDF is only generated when a screening finds a potential match or an adverse "
+                "news article. If it should exist and does not, generation may have failed: check the server log.")
 
 
-@app.get("/api/evidence/{result_id}", dependencies=[Depends(require_api_key)])
+def _send_evidence(applicant_id: int):
+    ev = db.get_evidence(applicant_id)
+    if not ev:
+        raise AppError(404, "EVIDENCE_NOT_GENERATED", "This screening has no evidence PDF.", _NO_EVIDENCE)
+    return Response(content=bytes(ev["content"]), media_type="application/pdf",
+                    headers={"Content-Disposition": f'attachment; filename="{ev["filename"]}"'})
+
+
+@app.get("/api/evidence/{result_id}")
 @limiter.limit("30/minute")
-def download_evidence(request: Request, result_id: int):
-    result = db.get_result(result_id)
+def download_evidence(request: Request, result_id: int, user: AuthUser = Depends(require_approved)):
+    result = db.get_result(result_id, _scope(user))
     if not result:
         raise AppError(404, "RESULT_NOT_FOUND", "No screening result with that ID.")
-    return _send_evidence(result.get("evidence_file"))
+    if not result.get("evidence_file"):
+        raise AppError(404, "EVIDENCE_NOT_GENERATED", "This result has no evidence PDF.", _NO_EVIDENCE)
+    return _send_evidence(result["applicant_id"])
 
 
-@app.get("/api/applicants/{applicant_id}/evidence", dependencies=[Depends(require_api_key)])
+@app.get("/api/applicants/{applicant_id}/evidence")
 @limiter.limit("30/minute")
-def download_applicant_evidence(request: Request, applicant_id: int):
-    if not db.get_applicant(applicant_id):
+def download_applicant_evidence(request: Request, applicant_id: int, user: AuthUser = Depends(require_approved)):
+    if not db.get_applicant(applicant_id, _scope(user)):
         raise AppError(404, "APPLICANT_NOT_FOUND", "No screening with that ID.")
-    files = [r["evidence_file"] for r in db.get_results_for_applicant(applicant_id) if r.get("evidence_file")]
-    return _send_evidence(files[0] if files else None)
+    return _send_evidence(applicant_id)
 
 
-@app.get("/api/admin/lists", dependencies=[Depends(require_api_key)])
+@app.get("/api/admin/lists")
 @limiter.limit("30/minute")
-def list_cache_status(request: Request):
+def list_cache_status(request: Request, user: AuthUser = Depends(require_approved)):
     """Which lists are held in memory right now, how old they are and how many records they have."""
     return loader.cache_status()
 
 
-@app.post("/api/admin/refresh", dependencies=[Depends(require_api_key)])
+@app.post("/api/admin/refresh")
 @limiter.limit("5/hour")
-def refresh_lists(request: Request):
+def refresh_lists(request: Request, user: AuthUser = Depends(require_admin)):
     """
     Drop the in-memory cache and download every list again now. Each source is
     reported on its own: a failure in one does not stop the others.
@@ -263,9 +303,9 @@ def _nacta_status() -> dict:
     }
 
 
-@app.get("/api/admin/nacta", dependencies=[Depends(require_api_key)])
+@app.get("/api/admin/nacta")
 @limiter.limit("30/minute")
-def nacta_status(request: Request):
+def nacta_status(request: Request, user: AuthUser = Depends(require_approved)):
     """Which NACTA list the screening is using, and how old it is."""
     return _nacta_status()
 
@@ -295,9 +335,10 @@ def _ingest_nacta(data: bytes, filename: str) -> dict:
             "with_cnic": info["with_cnic"], "warnings": warnings}
 
 
-@app.post("/api/admin/nacta", dependencies=[Depends(require_api_key)])
+@app.post("/api/admin/nacta")
 @limiter.limit("10/hour")
-async def upload_nacta(request: Request, filename: str = "nacta.csv"):
+async def upload_nacta(request: Request, filename: str = "nacta.csv",
+                       user: AuthUser = Depends(require_admin_or_service_key)):
     """
     Load the NACTA Proscribed Persons (Fourth Schedule) list. Send the CSV or JSON export as the
     request body (not a multipart form), with the file name in ?filename=. The file replaces the
@@ -313,7 +354,53 @@ async def upload_nacta(request: Request, filename: str = "nacta.csv"):
     return await run_in_threadpool(_ingest_nacta, data, filename)
 
 
+def _user_out(p: dict) -> UserOut:
+    return UserOut(id=p["id"], email=p["email"], role=p["role"], status=p["status"],
+                   created_at=p["created_at"], decided_at=p.get("decided_at"))
+
+
+def _change_user(user_id, admin: AuthUser, **changes) -> UserOut:
+    try:
+        profile = db.update_profile(str(user_id), decided_by=admin.id, **changes)
+    except db.LastAdminError:
+        raise AppError(409, "LAST_ADMIN", "That would leave the tool without an administrator.",
+                       "Make someone else an admin first.") from None
+    if profile is None:
+        raise AppError(404, "USER_NOT_FOUND", "No user with that ID.")
+    auth.invalidate_profile(str(user_id))   # takes effect on this server at once
+    logger.info("User %s changed by %s: %s", user_id, admin.id or admin.via, changes)
+    return _user_out(profile)
+
+
+@app.get("/api/admin/users", response_model=list[UserOut])
+@limiter.limit("60/minute")
+def list_users(request: Request, status: Literal["pending", "approved", "rejected"] | None = None,
+               user: AuthUser = Depends(require_admin)):
+    """People who signed up, newest first. ?status=pending shows who is waiting for approval."""
+    return [_user_out(p) for p in db.list_profiles(status)]
+
+
+@app.post("/api/admin/users/{user_id}/status", response_model=UserOut)
+@limiter.limit("60/minute")
+def set_user_status(request: Request, user_id: uuid.UUID, body: UserStatusIn, user: AuthUser = Depends(require_admin)):
+    """Approve or reject a user."""
+    return _change_user(user_id, user, status=body.status)
+
+
+@app.post("/api/admin/users/{user_id}/role", response_model=UserOut)
+@limiter.limit("60/minute")
+def set_user_role(request: Request, user_id: uuid.UUID, body: UserRoleIn, user: AuthUser = Depends(require_admin)):
+    """Make a user an admin, or a normal user again."""
+    return _change_user(user_id, user, role=body.role)
+
+
 @app.get("/api/health")
-def health():
-    # unauthenticated on purpose: uptime monitors need to reach it
+def health(deep: bool = False):
+    # unauthenticated on purpose: uptime monitors need to reach it. ?deep=true also checks the database.
+    if deep:
+        try:
+            db.ping()
+        except Exception:
+            logger.exception("Health check: the database is not reachable")
+            raise AppError(503, "DATABASE_UNAVAILABLE", "The database cannot be reached right now.") from None
     return {"status": "ok"}

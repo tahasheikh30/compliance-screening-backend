@@ -336,17 +336,16 @@ NACTA_JSON = (b'[{"id": 1, "name": "Live Person", "father_name": "Live Father", 
               b'"province": "Punjab", "district": "HANGU"}]')
 
 
-def _live(fake_sources, monkeypatch, tmp_path, body=NACTA_JSON):
+def _live(fake_sources, monkeypatch, body=NACTA_JSON):
     from app import config
     monkeypatch.setattr(config, "NACTA_PERSONS_URL", NACTA_URL)
-    monkeypatch.setattr(config, "LISTS_DIR", tmp_path / "lists")
     fake_sources["nacta"] = "real"
     fake_sources["bytes"][NACTA_URL] = body
     loader.clear_cache()
 
 
-def test_nacta_is_downloaded_live_and_saved_as_the_last_good_copy(fake_sources, monkeypatch, tmp_path):
-    _live(fake_sources, monkeypatch, tmp_path)
+def test_nacta_is_downloaded_live_and_saved_as_the_last_good_copy(fake_sources, monkeypatch, storage):
+    _live(fake_sources, monkeypatch)
     nacta = engine.screen("Live Person", cnic="3740565359881")["sources"]["NACTA"]
     assert engine.source_status(nacta) == "HIT" and nacta["matches"][0]["father_name"] == "Live Father"
     assert nacta["lists"][0]["published"] == "Retrieved live" and nacta["lists"][0]["status"] == "OK"
@@ -355,8 +354,8 @@ def test_nacta_is_downloaded_live_and_saved_as_the_last_good_copy(fake_sources, 
     assert meta["live"] is True and meta["records"] == 1 and meta["filename"] == "live: " + NACTA_URL
 
 
-def test_a_failed_live_download_falls_back_to_the_last_good_copy_and_says_so(fake_sources, monkeypatch, tmp_path):
-    _live(fake_sources, monkeypatch, tmp_path)
+def test_a_failed_live_download_falls_back_to_the_last_good_copy_and_says_so(fake_sources, monkeypatch, storage):
+    _live(fake_sources, monkeypatch)
     engine.screen("Anyone Here")                       # first screening downloads and saves the copy
     loader.clear_cache("NACTA")
     fake_sources["fail"].add(NACTA_URL)                # NACTA goes down
@@ -367,8 +366,8 @@ def test_a_failed_live_download_falls_back_to_the_last_good_copy_and_says_so(fak
     assert not nacta["partial"]                        # recent enough, so it does not block a clear result
 
 
-def test_a_failed_live_download_with_no_copy_is_not_screened(fake_sources, monkeypatch, tmp_path):
-    _live(fake_sources, monkeypatch, tmp_path)
+def test_a_failed_live_download_with_no_copy_is_not_screened(fake_sources, monkeypatch, storage):
+    _live(fake_sources, monkeypatch)
     fake_sources["fail"].add(NACTA_URL)
     nacta = engine.screen("Anyone Here")["sources"]["NACTA"]
     assert engine.source_status(nacta) == "NOT_CONFIGURED"
@@ -376,8 +375,8 @@ def test_a_failed_live_download_with_no_copy_is_not_screened(fake_sources, monke
     assert "simulated outage" in nacta["error"]
 
 
-def test_a_stale_saved_copy_is_not_used_to_hide_a_failed_download(fake_sources, monkeypatch, tmp_path):
-    _live(fake_sources, monkeypatch, tmp_path)
+def test_a_stale_saved_copy_is_not_used_to_hide_a_failed_download(fake_sources, monkeypatch, storage):
+    _live(fake_sources, monkeypatch)
     engine.screen("Anyone Here")
     loader.clear_cache("NACTA")
     from app import config
@@ -387,8 +386,8 @@ def test_a_stale_saved_copy_is_not_used_to_hide_a_failed_download(fake_sources, 
     assert engine.source_status(nacta) == "NOT_CONFIGURED"
 
 
-def test_a_live_response_that_is_not_a_list_is_rejected_with_the_reason(fake_sources, monkeypatch, tmp_path):
-    _live(fake_sources, monkeypatch, tmp_path, body=b"<html><body>Please complete the captcha</body></html>")
+def test_a_live_response_that_is_not_a_list_is_rejected_with_the_reason(fake_sources, monkeypatch, storage):
+    _live(fake_sources, monkeypatch, body=b"<html><body>Please complete the captcha</body></html>")
     nacta = engine.screen("Anyone Here")["sources"]["NACTA"]
     assert engine.source_status(nacta) == "NOT_CONFIGURED" and "no records" in nacta["error"].lower()
 
@@ -396,5 +395,5 @@ def test_a_live_response_that_is_not_a_list_is_rejected_with_the_reason(fake_sou
 def test_live_xml_download_works(fake_sources, monkeypatch, tmp_path):
     xml = (b'<list><p><Name>Xml Person</Name><CNIC>3740565359881</CNIC></p>'
            b'<p><Name>Other</Name><CNIC>3740565359882</CNIC></p></list>')
-    _live(fake_sources, monkeypatch, tmp_path, body=xml)
+    _live(fake_sources, monkeypatch, body=xml)
     assert engine.source_status(engine.screen("Xml Person")["sources"]["NACTA"]) == "HIT"

@@ -12,15 +12,13 @@ hand written PDF objects:
 One PDF is produced per screening, not per source.
 """
 
+import io
 import re
 import unicodedata
-from pathlib import Path
 
 from reportlab.lib.colors import Color
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen import canvas
-
-from app.config import EVIDENCE_DIR
 
 PAGE_W, PAGE_H = 595, 842
 LEFT, RIGHT, CW = 50, 545, 495
@@ -144,9 +142,9 @@ class _NumberedCanvas(canvas.Canvas):
 class _Doc:
     """A tiny top-down layout helper. y is the current cursor, measured from the page bottom."""
 
-    def __init__(self, path: Path, footer_name: str):
+    def __init__(self, out, footer_name: str):
         _NumberedCanvas.footer_name = clean(footer_name)
-        self.c = _NumberedCanvas(str(path), pagesize=(PAGE_W, PAGE_H))
+        self.c = _NumberedCanvas(out, pagesize=(PAGE_W, PAGE_H))
         self.y = TOP
 
     # primitives (reportlab origin is bottom-left, same as the workflow's PDF)
@@ -263,11 +261,18 @@ class _Doc:
         self.y -= h + 10
 
 
-def generate_evidence_pdf(r: dict, case_ref: str, out_path: Path | None = None) -> Path:
-    """Write the evidence PDF for screening result `r` (the dict returned by engine.screen)."""
+def evidence_filename(case_ref: str) -> str:
+    return f"evidence_{re.sub(r'[^A-Za-z0-9_-]', '_', case_ref)}.pdf"
+
+
+def generate_evidence_pdf(r: dict, case_ref: str) -> tuple:
+    """
+    Build the evidence PDF for screening result `r` (the dict returned by engine.screen).
+    Returns (file name, PDF bytes); nothing is written to disk.
+    """
     app = r["applicant"]
-    out_path = out_path or (EVIDENCE_DIR / f"evidence_{re.sub(r'[^A-Za-z0-9_-]', '_', case_ref)}.pdf")
-    d = _Doc(out_path, app["name"])
+    buf = io.BytesIO()
+    d = _Doc(buf, app["name"])
     d.c.setTitle(clean(f"Sanctions screening evidence {case_ref}"))
 
     # header banner
@@ -443,4 +448,4 @@ def generate_evidence_pdf(r: dict, case_ref: str, out_path: Path | None = None) 
 
     d.c.showPage()
     d.c.save()
-    return out_path
+    return evidence_filename(case_ref), buf.getvalue()

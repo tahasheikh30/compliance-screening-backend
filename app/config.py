@@ -1,30 +1,15 @@
 """
-Central configuration: where data lives on disk and how screening behaves.
+Central configuration: where the data lives and how screening behaves.
 
-Locally, everything defaults to folders inside this repo (fine for dev).
+All state (users, screening history, evidence PDFs and the NACTA list) is in the Supabase
+Postgres database named by DATABASE_URL, so the web server itself keeps nothing on disk and
+can be restarted, redeployed or put to sleep freely.
 
-On Render, set STORAGE_DIR to the persistent disk's mount path (see
-render.yaml) so the SQLite DB and evidence PDFs survive redeploys. Without
-this, Render's filesystem is ephemeral and evidence PDFs and screening
-history are lost on every deploy.
-
-The sanctions lists themselves are NOT stored on disk: every screening
-downloads them live from the official publishers (see app/screening/loader.py),
-optionally reusing an in-memory copy for LIST_CACHE_TTL_SECONDS.
+The sanctions lists themselves are NOT stored anywhere: they are downloaded live from the
+official publishers (see app/screening/loader.py) and kept in memory for LIST_CACHE_TTL_SECONDS.
 """
 
 import os
-from pathlib import Path
-
-_backend_root = Path(__file__).resolve().parent.parent
-STORAGE_DIR = Path(os.environ.get("STORAGE_DIR", str(_backend_root)))
-
-DB_PATH = STORAGE_DIR / "screening.db"
-EVIDENCE_DIR = STORAGE_DIR / "evidence"
-LISTS_DIR = STORAGE_DIR / "lists"   # the NACTA list file uploaded through the API
-
-for d in (STORAGE_DIR, EVIDENCE_DIR, LISTS_DIR):
-    d.mkdir(parents=True, exist_ok=True)
 
 
 def _float_env(name: str, default: float) -> float:
@@ -33,6 +18,26 @@ def _float_env(name: str, default: float) -> float:
     except (TypeError, ValueError):
         return float(default)
 
+
+# --- Database and sign in ------------------------------------------------
+# The Supabase connection string. Use the "Session pooler" one from the dashboard's Connect dialog
+# (postgresql://postgres.<ref>:<password>@<region>.pooler.supabase.com:5432/postgres). URL-encode any
+# special characters in the password.
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+DB_POOL_MIN = int(_float_env("DB_POOL_MIN", 1))
+DB_POOL_MAX = max(DB_POOL_MIN, int(_float_env("DB_POOL_MAX", 8)))
+
+# Users sign in with Supabase Auth and send the access token as "Authorization: Bearer <token>".
+# SUPABASE_URL (https://<ref>.supabase.co) is where the public signing keys are fetched from and what
+# the token's issuer must be. SUPABASE_JWT_SECRET is only needed if the project still signs tokens
+# with the legacy shared secret (HS256); projects with asymmetric signing keys do not need it.
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "").strip()
+
+# API_KEY (an X-API-Key header) is a machine credential: it is accepted only to upload the NACTA list,
+# which is what the scheduled GitHub workflow uses. Set this to true ONLY while an older frontend that
+# still sends the key is being replaced: it then gets full admin access again, without any user attribution.
+ALLOW_API_KEY_FULL_ACCESS = os.environ.get("ALLOW_API_KEY_FULL_ACCESS", "").strip().lower() in ("1", "true", "yes")
 
 # --- Matching ------------------------------------------------------------
 # A name scoring at or above the threshold is reported as a potential match.

@@ -1,31 +1,23 @@
 services:
   - type: web
-    name: account-screening-backend
+    name: compliance-screening-backend
     runtime: python
-    plan: starter
+    plan: free          # no disk is needed: everything is stored in Supabase
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips='*'"
+    healthCheckPath: /api/health
     envVars:
       - key: ALLOWED_ORIGINS
         value: "https://your-frontend.vercel.app"
+      - key: SUPABASE_URL
+        value: "https://qtghepgrcksmkxrzydjc.supabase.co"
+      - key: DATABASE_URL
+        sync: false     # secret: the Supabase "Session pooler" connection string, set in the Render dashboard
+      - key: SUPABASE_JWT_SECRET
+        sync: false     # only if the project still signs tokens with the legacy secret; otherwise leave empty
       - key: API_KEY
-        generateValue: true   # Render will generate and store a random secret
-      - key: STORAGE_DIR
-        value: "/opt/render/project/src/data"   # must match disk.mountPath below exactly
-    disk:
-      name: screening-data
-      mountPath: /opt/render/project/src/data
-      sizeGB: 1
+        generateValue: true   # machine credential for the scheduled NACTA upload only
 
-# The sanctions lists are downloaded live from their publishers on each
-# screening (and kept in memory for LIST_CACHE_TTL_SECONDS), so the disk only
-# holds the SQLite history DB and the evidence PDFs.
-#
-# IMPORTANT: attaching a disk only mounts a filesystem path. The STORAGE_DIR env
-# var above is what tells the app to use it (see app/config.py). If you rename
-# the disk's mountPath, update STORAGE_DIR to match, or the app will keep writing
-# inside the container and lose its data on the next redeploy.
-#
-# Free tier: set `plan: free`, delete the `disk:` block and the STORAGE_DIR line.
-# History and evidence PDFs are then lost on every restart, and the service
-# sleeps when idle, so the first screening after a sleep also re-downloads the lists.
+# Nothing is kept on the server's disk. Users, screening history, evidence PDFs and the NACTA list are
+# all in the Supabase database, so restarts, redeploys and the free plan's sleep lose nothing.
+# The sanctions lists are downloaded live on each screening (and kept in memory for LIST_CACHE_TTL_SECONDS).

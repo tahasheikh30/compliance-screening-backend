@@ -1,44 +1,103 @@
 """
-Shared fixtures. The app reads STORAGE_DIR / API_KEY at import time, so they are
-set here BEFORE anything from `app` is imported. Each test then gets its own empty
-storage folder by re-pointing the module level paths.
+Shared fixtures. The app reads its settings at import time, so they are set here BEFORE anything
+from `app` is imported.
 
-No test touches the network: tests/fixtures.py builds small synthetic copies of
-every feed in the real file formats, and the `fake_sources` fixture swaps the
-loader's download functions for them.
+The tests need a PostgreSQL database to talk to, because that is what the app uses. Point
+TEST_DATABASE_URL at an empty database whose name contains "test" (default:
+postgresql://postgres:postgres@localhost:5432/screening_test), for example
+
+    docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=screening_test postgres:16
+
+The suite refuses to run against anything that is not clearly a test database (and never against
+Supabase), because every test empties the tables.
+
+No test touches the network: tests/fixtures.py builds small synthetic copies of every feed in the
+real file formats, and the `fake_sources` fixture swaps the loader's download functions for them.
+Sign in is real too: tests mint access tokens signed with a test secret, and a few sign them with
+a generated key pair to exercise the public key (JWKS) path.
 """
 import os
 import sys
-import tempfile
+import time
+import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 
-_SESSION_DIR = tempfile.mkdtemp(prefix="screening_tests_")
-os.environ["STORAGE_DIR"] = _SESSION_DIR
+_TEST_DB = os.environ.get("TEST_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/screening_test")
+_parsed = urlparse(_TEST_DB)
+if "supabase" in (_parsed.hostname or "") or "test" not in _parsed.path.lower():
+    raise SystemExit(f"Refusing to run: TEST_DATABASE_URL must point at a throwaway database whose name contains "
+                     f"'test' (every test empties the tables). Got host={_parsed.hostname!r} db={_parsed.path!r}.")
+
+JWT_SECRET = "test-secret-test-secret-test-secret-test-secret-1234"
+SUPABASE_URL = "https://testproject.supabase.co"
+
+os.environ["DATABASE_URL"] = _TEST_DB
 os.environ["API_KEY"] = "test-key"
+os.environ["SUPABASE_URL"] = SUPABASE_URL
+os.environ["SUPABASE_JWT_SECRET"] = JWT_SECRET
 os.environ["ALLOWED_ORIGINS"] = "http://localhost:5173"
 os.environ["LIST_CACHE_TTL_SECONDS"] = "0"
+os.environ["PRELOAD_LISTS"] = "false"
+os.environ.pop("ALLOW_API_KEY_FULL_ACCESS", None)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import jwt  # noqa: E402
 import pytest  # noqa: E402
 
-API_HEADERS = {"X-API-Key": "test-key"}
+ADMIN_ID = "00000000-0000-4000-8000-0000000000a1"
+USER_ID = "00000000-0000-4000-8000-0000000000b1"
+USER2_ID = "00000000-0000-4000-8000-0000000000b2"
+PENDING_ID = "00000000-0000-4000-8000-0000000000c1"
+REJECTED_ID = "00000000-0000-4000-8000-0000000000d1"
+EMAILS = {ADMIN_ID: "admin@example.com", USER_ID: "ana@example.com", USER2_ID: "bilal@example.com",
+          PENDING_ID: "new@example.com", REJECTED_ID: "no@example.com"}
+
+
+def make_token(sub=ADMIN_ID, email=None, *, secret=JWT_SECRET, alg="HS256", headers=None, **claims) -> str:
+    """A Supabase style access token."""
+    now = int(time.time())
+    payload = {"sub": sub, "email": email if email is not None else EMAILS.get(sub, "someone@example.com"),
+               "aud": "authenticated", "role": "authenticated", "iss": f"{SUPABASE_URL}/auth/v1",
+               "iat": now, "exp": now + 3600, **claims}
+    payload = {k: v for k, v in payload.items() if v is not None}
+    return jwt.encode(payload, secret, algorithm=alg, headers=headers)
+
+
+def bearer(sub=ADMIN_ID, **kw) -> dict:
+    return {"Authorization": f"Bearer {make_token(sub, **kw)}"}
+
+
+API_HEADERS = bearer(ADMIN_ID)      # most tests act as the seeded admin
+USER_HEADERS = bearer(USER_ID)
+USER2_HEADERS = bearer(USER2_ID)
+PENDING_HEADERS = bearer(PENDING_ID)
+REJECTED_HEADERS = bearer(REJECTED_ID)
+SERVICE_HEADERS = {"X-API-Key": "test-key"}
+
+_schema_ready = False
 
 
 @pytest.fixture
-def storage(tmp_path, monkeypatch):
-    """Isolated DB + evidence folder."""
-    from app import config, evidence, main
-    monkeypatch.setattr(config, "DB_PATH", tmp_path / "screening.db")
-    ev = tmp_path / "evidence"
-    ev.mkdir()
-    monkeypatch.setattr(config, "EVIDENCE_DIR", ev)
-    monkeypatch.setattr(evidence, "EVIDENCE_DIR", ev)
-    monkeypatch.setattr(main, "EVIDENCE_DIR", ev)
-    lists = tmp_path / "lists"
-    lists.mkdir()
-    monkeypatch.setattr(config, "LISTS_DIR", lists)
-    return tmp_path
+def storage():
+    """An empty database (tables emptied, ids restarted) with five known people: an admin, two approved users,
+    one pending and one rejected."""
+    global _schema_ready
+    from app import auth
+    from app import database as db
+    if not _schema_ready:
+        db.init_db()
+        _schema_ready = True
+    with db.pool().connection() as conn:
+        conn.execute("TRUNCATE evidence_files, nacta_list, screening_results, applicants, profiles RESTART IDENTITY CASCADE")
+        for uid, role, status in ((ADMIN_ID, "admin", "approved"), (USER_ID, "user", "approved"),
+                                  (USER2_ID, "user", "approved"), (PENDING_ID, "user", "pending"),
+                                  (REJECTED_ID, "user", "rejected")):
+            conn.execute("INSERT INTO profiles (id, email, role, status) VALUES (%s, %s, %s, %s)",
+                         (uuid.UUID(uid), EMAILS[uid], role, status))
+    auth.invalidate_profile()
+    return db
 
 
 @pytest.fixture

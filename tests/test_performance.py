@@ -70,8 +70,7 @@ def test_background_refresh_is_off_when_caching_is_off(monkeypatch):
 
 
 def test_results_are_saved_in_one_call_and_indexed(storage):
-    from app import database as db
-    db.init_db()
+    db = storage
     aid = db.insert_applicant("Test Person", None, None, "2026-01-01T00:00:00+00:00", "PENDING")
     row = {"source": "UNSC", "matched_entry": None, "score": None, "status": "CLEAR", "detail": "ok",
            "checked_at": "2026-01-01T00:00:00+00:00", "list_version": None, "records_screened": 3,
@@ -80,7 +79,20 @@ def test_results_are_saved_in_one_call_and_indexed(storage):
     assert len(ids) == 2
     assert db.get_applicant(aid)["overall_status"] == "AUTO_CLEAR"
     assert [r["source"] for r in db.get_results_for_applicant(aid)] == ["UNSC", "OFAC"]
-    with db.get_conn() as conn:
-        names = {r[1] for r in conn.execute("PRAGMA index_list(screening_results)")}
-        assert "idx_results_applicant" in names
-        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    with db.pool().connection() as conn:
+        names = {r["indexname"] for r in conn.execute("SELECT indexname FROM pg_indexes WHERE schemaname = 'public'")}
+    assert {"idx_results_applicant", "idx_applicants_user"} <= names
+
+
+def test_a_failed_save_stores_nothing(storage):
+    """Either every row of a screening is saved or none is."""
+    import pytest
+    db = storage
+    aid = db.insert_applicant("Test Person", None, None, "2026-01-01T00:00:00+00:00", "PENDING")
+    good = {"source": "UNSC", "matched_entry": None, "score": None, "status": "CLEAR", "detail": "ok",
+            "checked_at": "2026-01-01T00:00:00+00:00", "list_version": None, "records_screened": 3, "payload": None}
+    bad = {**good, "source": None}                      # violates NOT NULL on the second row
+    with pytest.raises(Exception):
+        db.save_screening(aid, "AUTO_CLEAR", 3, [good, bad])
+    assert db.get_results_for_applicant(aid) == []
+    assert db.get_applicant(aid)["overall_status"] == "PENDING"
