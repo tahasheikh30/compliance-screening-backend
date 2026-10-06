@@ -47,16 +47,22 @@ Approval, rejection and role changes take effect on the next request. The last a
    UPDATE public.profiles SET status = 'approved', role = 'admin' WHERE email = 'you@example.com';
    ```
    After that, approve everyone else with `GET /api/admin/users?status=pending` and `POST /api/admin/users/{id}/status` with `{"status": "approved"}`.
-4. **The frontend** signs people up and in with `@supabase/supabase-js` and sends the access token on every call:
+4. **The frontend** signs people up and in with `@supabase/supabase-js` and sends **two things on every call**: the app's key and the person's access token:
    ```js
    const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);   // the publishable (anon) key is meant to be public
    await supabase.auth.signUp({ email, password });
    await supabase.auth.signInWithPassword({ email, password });
    const { data: { session } } = await supabase.auth.getSession();         // refreshes an expired token
-   fetch(`${API}/api/me`, { headers: { Authorization: `Bearer ${session.access_token}` } });
+   fetch(`${API}/api/me`, { headers: {
+     "X-API-Key": APP_API_KEY,                                              // which app is calling
+     Authorization: `Bearer ${session.access_token}`,                       // who is using it
+   } });
    ```
-   Call `/api/me` after sign in: `status` is `pending`, `approved` or `rejected` and `role` is `user` or `admin`, which is what the screen should show. Never put the database password or the service role key in the frontend.
-5. **`API_KEY`** is now only a machine credential for the scheduled NACTA upload (`X-API-Key`). It cannot read applicant data. `ALLOW_API_KEY_FULL_ACCESS=true` gives an older frontend full admin access again while it is being replaced; it logs a warning on start and should be turned off as soon as sign in works.
+   Call `/api/me` after sign in: `status` is `pending`, `approved` or `rejected` and `role` is `user` or `admin`, which is what the screen should show. Never put the database password, the service role key or `API_KEY` in the frontend.
+5. **Two different keys.**
+   - **`APP_API_KEY`** identifies the frontend. Set it on the backend, and the same value as `VITE_API_KEY` on the frontend. Every route except `/api/health` refuses a request without it (`AUTH_MISSING_KEY`, `AUTH_INVALID_KEY`), before it even looks at the sign in. It is built into the frontend, so anyone who opens the app can read it: it is an app identifier, not a secret, and on its own it opens nothing (a request with only the app key gets `AUTH_REQUIRED`).
+   - **`API_KEY`** is a secret machine credential for the scheduled NACTA upload (`X-API-Key`, no sign in). It works on that one route only, cannot read applicant data, and must **never** be given to the frontend or set to the same value as `APP_API_KEY` (the backend warns at start if you do, because then anyone who opens the app could replace the NACTA list).
+   - The old `ALLOW_API_KEY_FULL_ACCESS` switch is gone: a key by itself no longer opens anything.
 
 Supabase free projects are paused after a week of inactivity, and the free plan has no automatic backups: for real compliance records, export the tables now and then, or move to a paid plan. Applicant names and CNICs are personal data held by a third party cloud service, so check that this is allowed where you work and pick the region on purpose.
 
@@ -144,7 +150,7 @@ Identical to the workflow:
 
 ## API
 
-All endpoints except `/api/health` need `Authorization: Bearer <access token>` (see above). Rate limits are per signed in person.
+All endpoints except `/api/health` need **both** `X-API-Key: <APP_API_KEY>` (which app) and `Authorization: Bearer <access token>` (who). The only exception is the NACTA upload, which also accepts the secret `API_KEY` on its own. Rate limits are per signed in person.
 
 | Method | Path | Who | Purpose |
 |---|---|---|---|
@@ -157,13 +163,13 @@ All endpoints except `/api/health` need `Authorization: Bearer <access token>` (
 | GET | `/api/admin/lists` | approved | What is cached in memory |
 | GET | `/api/admin/nacta` | approved | Which NACTA file is loaded and how old it is |
 | POST | `/api/admin/refresh` | admin | Clear the cache and reload every list (5/hour) |
-| POST | `/api/admin/nacta` | admin, or `X-API-Key` | Upload the NACTA CSV or JSON export (10/hour) |
+| POST | `/api/admin/nacta` | admin, or the secret `API_KEY` | Upload the NACTA CSV or JSON export (10/hour) |
 | GET | `/api/admin/users` | admin | People who signed up (`?status=pending`) |
 | POST | `/api/admin/users/{id}/status` | admin | `{"status": "approved" or "rejected"}` |
 | POST | `/api/admin/users/{id}/role` | admin | `{"role": "admin" or "user"}` |
 | GET | `/api/health` | anyone | Liveness (`?deep=true` also checks the database) |
 
-Sign in problems come back with a stable `error.code`: `AUTH_REQUIRED`, `AUTH_INVALID_TOKEN`, `AUTH_TOKEN_EXPIRED` (sign in again), `ACCOUNT_PENDING`, `ACCOUNT_REJECTED`, `ADMIN_ONLY`. A database outage is `DATABASE_UNAVAILABLE` (503).
+Problems come back with a stable `error.code`: `AUTH_MISSING_KEY` and `AUTH_INVALID_KEY` (the app's key is missing or wrong: a deployment mistake, not the person's), `AUTH_NOT_CONFIGURED` (503, `APP_API_KEY` not set), `AUTH_REQUIRED`, `AUTH_INVALID_TOKEN`, `AUTH_TOKEN_EXPIRED` (sign in again), `ACCOUNT_PENDING`, `ACCOUNT_REJECTED`, `ADMIN_ONLY`. A database outage is `DATABASE_UNAVAILABLE` (503).
 
 ### `POST /api/screen`
 
@@ -198,7 +204,7 @@ One PDF per screening, generated when there is any hit (watch list or news). It 
 
 ## Configuration
 
-See `.env.example`. Required: `DATABASE_URL`, `SUPABASE_URL`. Common: `ALLOWED_ORIGINS`, `API_KEY` (for the scheduled NACTA upload), `SUPABASE_JWT_SECRET` (legacy token signing only), `DB_POOL_MAX`, `MATCH_THRESHOLD`, `LIST_CACHE_TTL_SECONDS`, `PRELOAD_LISTS`, `FIA_REQUIRED`, `NACTA_REQUIRED`, `NACTA_MAX_AGE_DAYS`, `NACTA_PERSONS_URL`. Without `DATABASE_URL` every request is refused with a 503 that says so; without `SUPABASE_URL` (or the legacy secret) no sign in can be verified, and requests are refused rather than let through.
+See `.env.example`. Required: `DATABASE_URL`, `SUPABASE_URL`. `APP_API_KEY` (the frontend's key; without it every request from the app is refused). Common: `ALLOWED_ORIGINS`, `API_KEY` (the secret for the scheduled NACTA upload), `SUPABASE_JWT_SECRET` (legacy token signing only), `DB_POOL_MAX`, `MATCH_THRESHOLD`, `LIST_CACHE_TTL_SECONDS`, `PRELOAD_LISTS`, `FIA_REQUIRED`, `NACTA_REQUIRED`, `NACTA_MAX_AGE_DAYS`, `NACTA_PERSONS_URL`. Without `DATABASE_URL` every request is refused with a 503 that says so; without `SUPABASE_URL` (or the legacy secret) no sign in can be verified, and requests are refused rather than let through.
 
 ## Run and test
 

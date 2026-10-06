@@ -1,12 +1,14 @@
 """
 Sign in and access control.
 
-People sign up and sign in with Supabase Auth (email and password). The frontend sends the access
-token it gets as
+Every request to the API (except /api/health) must carry TWO things:
 
-    Authorization: Bearer <access token>
+  X-API-Key: <APP_API_KEY>            which app is calling. The frontend sends it automatically.
+  Authorization: Bearer <access token>   who is using it. The person signs in with Supabase Auth
+                                       (email and password) and the frontend sends the token it gets.
 
-and this module checks it, then looks the person up in the `profiles` table:
+The app key is checked first, so a caller that is not the app learns nothing else. The token is then
+verified and the person looked up in the `profiles` table:
 
   * status "pending"  : signed up, waiting for an admin. Can only call GET /api/me.
   * status "approved" : can screen applicants and see their own screening history.
@@ -20,10 +22,11 @@ SUPABASE_JWT_SECRET for projects that still use the legacy shared secret. Expiry
 issuer are checked too. A user's profile is cached for a few seconds, so an approval or a
 rejection takes effect almost at once.
 
-API_KEY (an X-API-Key header) is a machine credential, accepted only to upload the NACTA list
-(the scheduled GitHub workflow uses it). It is NOT a way to read applicant data. Unless
-ALLOW_API_KEY_FULL_ACCESS=true, which exists only to keep an older frontend working while it is
-replaced.
+The app key is NOT a secret (it is built into the frontend), so it never grants access by itself: a
+request with the app key and no valid sign in is refused.
+
+API_KEY is a different, secret key for a machine: the scheduled GitHub workflow that uploads the NACTA
+list sends it as X-API-Key with no sign in. It is accepted on that one route and nowhere else.
 
 Anything not configured fails closed: a request is refused, never let through.
 """
@@ -43,7 +46,7 @@ from app import config
 from app import database as db
 from app.errors import AppError, logger
 
-API_KEY = os.environ.get("API_KEY")
+API_KEY = os.environ.get("API_KEY")     # the machine credential for the scheduled NACTA upload
 
 PROFILE_TTL_SECONDS = 10.0
 _PROFILE_CACHE_MAX = 2000
@@ -55,7 +58,7 @@ class AuthUser:
     email: str
     role: str               # "user" or "admin"
     status: str             # "pending", "approved" or "rejected"
-    via: str = "token"      # "token", "service" (API key on the NACTA upload) or "legacy" (API key, full access)
+    via: str = "token"      # "token" (a signed in person) or "service" (the API key on the NACTA upload)
 
     @property
     def is_admin(self) -> bool:
@@ -185,19 +188,25 @@ def _bearer(authorization: str | None) -> str | None:
     return token.strip()
 
 
-def _key_matches(x_api_key: str) -> bool:
+def _matches(provided: str, expected: str) -> bool:
     # compared as bytes: compare_digest raises TypeError on non-ASCII str, which would turn a
     # mistyped or pasted key into a 500 instead of a clean 401
-    return secrets.compare_digest(x_api_key.encode("utf-8", "replace"), API_KEY.encode("utf-8"))
+    return secrets.compare_digest(provided.encode("utf-8", "replace"), expected.encode("utf-8"))
 
 
-def _check_key(x_api_key: str) -> None:
-    if not API_KEY:
-        raise AppError(503, "AUTH_NOT_CONFIGURED", "The server is not configured to accept an access key.",
-                       "Set the API_KEY environment variable on the backend, or sign in with your account.")
-    if not _key_matches(x_api_key):
-        raise AppError(401, "AUTH_INVALID_KEY", "That access key was rejected.",
-                       "Check it matches the backend's API_KEY exactly (no trailing spaces).")
+def check_app_key(x_api_key: str | None) -> None:
+    """The frontend must identify itself with APP_API_KEY. Refuses with a 401 that says which side to fix."""
+    if not config.REQUIRE_APP_KEY:
+        return
+    if not config.APP_API_KEY:
+        raise AppError(503, "AUTH_NOT_CONFIGURED", "The server is not set up to accept requests from the app.",
+                       "Set APP_API_KEY on the backend (and the same value as VITE_API_KEY on the frontend).")
+    if not x_api_key:
+        raise AppError(401, "AUTH_MISSING_KEY", "This request did not include the app's access key.",
+                       "The frontend sends it as X-API-Key. Set VITE_API_KEY on the frontend and redeploy it.")
+    if not _matches(x_api_key, config.APP_API_KEY):
+        raise AppError(401, "AUTH_INVALID_KEY", "The app's access key was rejected.",
+                       "Check VITE_API_KEY on the frontend matches APP_API_KEY on the backend exactly (no trailing spaces).")
 
 
 def _mark(request: Request, user: AuthUser) -> AuthUser:
@@ -211,20 +220,19 @@ def authenticate(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> AuthUser:
-    """Whoever is signed in, whatever their status. Used by /api/me so a pending user can see where they stand."""
+    """
+    Whoever is signed in, whatever their status, provided the request comes from the app. Used by
+    /api/me so a pending user can see where they stand.
+    """
+    check_app_key(x_api_key)
     token = _bearer(authorization)
-    if token:
-        claims = verify_token(token)
-        prof = _profile(claims["sub"], claims.get("email", ""))
-        return _mark(request, AuthUser(claims["sub"], prof["email"] or claims.get("email", ""),
-                                       prof["role"], prof["status"]))
-    if x_api_key:
-        _check_key(x_api_key)
-        if config.ALLOW_API_KEY_FULL_ACCESS:
-            return _mark(request, AuthUser(None, "api-key", "admin", "approved", via="legacy"))
-        raise AppError(403, "API_KEY_NOT_ACCEPTED", "An access key cannot be used for this request.",
-                       "Sign in with your account.")
-    raise AppError(401, "AUTH_REQUIRED", "Sign in to continue.", "Send the access token as 'Authorization: Bearer <token>'.")
+    if not token:
+        raise AppError(401, "AUTH_REQUIRED", "Sign in to continue.",
+                       "Send the access token as 'Authorization: Bearer <token>'.")
+    claims = verify_token(token)
+    prof = _profile(claims["sub"], claims.get("email", ""))
+    return _mark(request, AuthUser(claims["sub"], prof["email"] or claims.get("email", ""),
+                                   prof["role"], prof["status"]))
 
 
 def require_approved(user: AuthUser = Depends(authenticate)) -> AuthUser:
@@ -248,9 +256,10 @@ def require_admin_or_service_key(
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> AuthUser:
-    """The NACTA upload: an admin signed in, or the scheduled workflow with the API key."""
-    if not authorization and x_api_key:
-        _check_key(x_api_key)
+    """
+    The NACTA upload: the scheduled workflow with the secret API_KEY (no sign in), or a signed in
+    admin using the app. The app key alone never gets in here: it is not the secret.
+    """
+    if not authorization and x_api_key and API_KEY and _matches(x_api_key, API_KEY):
         return _mark(request, AuthUser(None, "service", "admin", "approved", via="service"))
-    user = authenticate(request, authorization, x_api_key)
-    return require_admin(require_approved(user))
+    return require_admin(require_approved(authenticate(request, authorization, x_api_key)))

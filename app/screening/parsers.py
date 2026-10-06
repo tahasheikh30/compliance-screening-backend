@@ -490,7 +490,7 @@ def _nacta_xml_rows(text: str) -> list:
     Records from an XML export: the repeated element that holds one person, with its child
     elements and attributes as fields. Works whatever the element names are.
     """
-    import xml.etree.ElementTree as ET
+    from defusedxml import ElementTree as ET   # refuses entity tricks and external references outright
 
     # entity declarations are the way XML files are made to expand into gigabytes
     if re.search(r"<!\s*(ENTITY|DOCTYPE[^>]*\[)", text, re.I):

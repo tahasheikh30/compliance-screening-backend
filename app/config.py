@@ -34,10 +34,17 @@ DB_POOL_MAX = max(DB_POOL_MIN, int(_float_env("DB_POOL_MAX", 8)))
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "").strip()
 
-# API_KEY (an X-API-Key header) is a machine credential: it is accepted only to upload the NACTA list,
-# which is what the scheduled GitHub workflow uses. Set this to true ONLY while an older frontend that
-# still sends the key is being replaced: it then gets full admin access again, without any user attribution.
-ALLOW_API_KEY_FULL_ACCESS = os.environ.get("ALLOW_API_KEY_FULL_ACCESS", "").strip().lower() in ("1", "true", "yes")
+# Two different keys, because they have different jobs and different exposure:
+#
+# APP_API_KEY identifies the FRONTEND. The browser app sends it as X-API-Key on every request, next to
+# the signed in person's token. It is built into the frontend, so treat it as an app identifier (anyone
+# who can open the app can read it), not a secret: it only proves a request comes from the app, and the
+# person's own sign in is what protects the data. Set REQUIRE_APP_KEY=false only for local development.
+#
+# API_KEY is a machine credential for the scheduled NACTA upload (X-API-Key, no sign in). It stays
+# secret (a GitHub Actions secret), is never given to the frontend, and works on that one route only.
+APP_API_KEY = os.environ.get("APP_API_KEY", "").strip()
+REQUIRE_APP_KEY = os.environ.get("REQUIRE_APP_KEY", "").strip().lower() not in ("0", "false", "no")
 
 # --- Matching ------------------------------------------------------------
 # A name scoring at or above the threshold is reported as a potential match.

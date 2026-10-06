@@ -33,13 +33,14 @@ JWT_SECRET = "test-secret-test-secret-test-secret-test-secret-1234"
 SUPABASE_URL = "https://testproject.supabase.co"
 
 os.environ["DATABASE_URL"] = _TEST_DB
-os.environ["API_KEY"] = "test-key"
+os.environ["API_KEY"] = "test-key"              # the secret machine key (scheduled NACTA upload)
+os.environ["APP_API_KEY"] = "test-app-key"      # the key the frontend sends on every request
 os.environ["SUPABASE_URL"] = SUPABASE_URL
 os.environ["SUPABASE_JWT_SECRET"] = JWT_SECRET
 os.environ["ALLOWED_ORIGINS"] = "http://localhost:5173"
 os.environ["LIST_CACHE_TTL_SECONDS"] = "0"
 os.environ["PRELOAD_LISTS"] = "false"
-os.environ.pop("ALLOW_API_KEY_FULL_ACCESS", None)
+os.environ.pop("REQUIRE_APP_KEY", None)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -65,8 +66,12 @@ def make_token(sub=ADMIN_ID, email=None, *, secret=JWT_SECRET, alg="HS256", head
     return jwt.encode(payload, secret, algorithm=alg, headers=headers)
 
 
+APP_KEY_HEADERS = {"X-API-Key": "test-app-key"}     # what the frontend sends next to the person's token
+
+
 def bearer(sub=ADMIN_ID, **kw) -> dict:
-    return {"Authorization": f"Bearer {make_token(sub, **kw)}"}
+    """A signed in person, calling through the app: the person's token plus the app's key."""
+    return {**APP_KEY_HEADERS, "Authorization": f"Bearer {make_token(sub, **kw)}"}
 
 
 API_HEADERS = bearer(ADMIN_ID)      # most tests act as the seeded admin

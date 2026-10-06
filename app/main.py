@@ -14,7 +14,9 @@ by an admin, and see only their own screenings (admins see everyone's). See READ
 Run:
     uvicorn app.main:app --reload --port 8000
 
-Every endpoint except /api/health needs "Authorization: Bearer <access token>".
+Every endpoint except /api/health needs the app's key ("X-API-Key: <APP_API_KEY>", sent by the frontend)
+AND a signed in person ("Authorization: Bearer <access token>"). The NACTA upload also accepts the secret
+API_KEY on its own, for the scheduled workflow.
 
 Endpoints:
     GET  /api/me                          who you are and whether you are approved (works while pending)
@@ -26,7 +28,7 @@ Endpoints:
     GET  /api/admin/lists                 which lists are cached in memory right now
     GET  /api/admin/nacta                 which NACTA file is loaded and how old it is
     POST /api/admin/refresh               (admin) drop the in-memory list cache and reload every list
-    POST /api/admin/nacta                 (admin, or the API key) upload the NACTA CSV or JSON export
+    POST /api/admin/nacta                 (admin, or the secret API_KEY) upload the NACTA CSV or JSON export
     GET  /api/admin/users                 (admin) people who signed up, ?status=pending to see who is waiting
     POST /api/admin/users/{id}/status     (admin) approve or reject someone
     POST /api/admin/users/{id}/role       (admin) make someone an admin, or a normal user again
@@ -112,11 +114,16 @@ def startup():
     if not app_config.SUPABASE_URL and not app_config.SUPABASE_JWT_SECRET:
         logger.warning("Neither SUPABASE_URL nor SUPABASE_JWT_SECRET is set, so no sign in can be verified and every "
                        "user request will be refused. Do not deploy like this.")
+    if app_config.REQUIRE_APP_KEY and not app_config.APP_API_KEY:
+        logger.warning("APP_API_KEY is not set, so every request from the app will be refused. Set it (and the same "
+                       "value as VITE_API_KEY on the frontend), or set REQUIRE_APP_KEY=false for local development only.")
+    if not app_config.REQUIRE_APP_KEY:
+        logger.warning("REQUIRE_APP_KEY is off: requests are not checked for the app's key. Local development only.")
+    if auth.API_KEY and app_config.APP_API_KEY and auth.API_KEY == app_config.APP_API_KEY:
+        logger.warning("API_KEY and APP_API_KEY are the same value. The app key is built into the frontend, so anyone "
+                       "who opens the app could replace the NACTA list. Give them different values.")
     if not auth.API_KEY:
         logger.info("API_KEY is not set: the scheduled NACTA upload by access key is disabled.")
-    if app_config.ALLOW_API_KEY_FULL_ACCESS:
-        logger.warning("ALLOW_API_KEY_FULL_ACCESS is on: the API key gives full admin access with no user attribution. "
-                       "Turn it off once the frontend signs users in.")
     if PRELOAD_LISTS and loader.start_background_refresh():
         logger.info("Loading the screening lists in the background and keeping them fresh")
 
@@ -293,7 +300,8 @@ def _nacta_status() -> dict:
         "loaded": bool(meta) or live,
         "source": "url" if live else ("upload" if meta else None),
         "live_copy": bool(meta and meta.get("live")),   # the saved copy came from a live download, not an upload
-        "url": app_config.NACTA_PERSONS_URL or None,
+        # the host only: the address itself may carry a token or credentials, and every approved user can read this
+        "url_host": urlparse(app_config.NACTA_PERSONS_URL).hostname if live else None,
         "filename": (meta or {}).get("filename"),
         "uploaded_at": (meta or {}).get("uploaded_at"),
         "records": (meta or {}).get("records"),

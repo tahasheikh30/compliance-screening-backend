@@ -1,4 +1,4 @@
-"""Sign in: token checks, the approval flow, per-user history, the API key, and the database being down."""
+"""Sign in: the app key plus a token on every request, the approval flow, per-user history, the machine key, and the database being down."""
 import time
 import uuid
 
@@ -7,7 +7,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import ec
 
 from app import auth, config
-from tests.conftest import (ADMIN_ID, API_HEADERS, JWT_SECRET, PENDING_HEADERS, PENDING_ID, REJECTED_HEADERS,
+from tests.conftest import (ADMIN_ID, API_HEADERS, APP_KEY_HEADERS, JWT_SECRET, PENDING_HEADERS, PENDING_ID, REJECTED_HEADERS,
                             SERVICE_HEADERS, SUPABASE_URL, USER2_HEADERS, USER2_ID, USER_HEADERS, USER_ID, bearer,
                             make_token)
 
@@ -22,14 +22,16 @@ def _screen(client, headers, name="Completely Unrelated Person"):
 
 # ---- access tokens -----------------------------------------------------------
 
-def test_no_credentials_is_401(client):
-    r = client.get("/api/applicants")
+def test_the_app_key_alone_is_not_a_sign_in(client):
+    r = client.get("/api/applicants", headers=APP_KEY_HEADERS)
+    assert r.status_code == 401 and _code(r) == "AUTH_REQUIRED"
+    r = client.post("/api/screen", json={"full_name": "Ali Khan"}, headers=APP_KEY_HEADERS)
     assert r.status_code == 401 and _code(r) == "AUTH_REQUIRED"
 
 
 @pytest.mark.parametrize("header", ["Bearer not-a-jwt", "Basic abc", "Bearer ", "Bearer"])
 def test_garbage_authorization_is_401(client, header):
-    r = client.get("/api/applicants", headers={"Authorization": header})
+    r = client.get("/api/applicants", headers={**APP_KEY_HEADERS, "Authorization": header})
     assert r.status_code == 401 and _code(r) == "AUTH_INVALID_TOKEN"
 
 
@@ -52,20 +54,20 @@ def test_expired_token_says_so(client):
     {"exp": None},
 ])
 def test_tokens_that_must_be_refused(client, kw):
-    r = client.get("/api/applicants", headers={"Authorization": "Bearer " + make_token(**{"sub": USER_ID, **kw})})
+    r = client.get("/api/applicants", headers={**APP_KEY_HEADERS, "Authorization": "Bearer " + make_token(**{"sub": USER_ID, **kw})})
     assert r.status_code == 401 and _code(r) in ("AUTH_INVALID_TOKEN", "AUTH_TOKEN_EXPIRED")
 
 
 def test_token_without_an_email_is_refused(client):
     tok = make_token(USER_ID, email="")
-    assert client.get("/api/applicants", headers={"Authorization": "Bearer " + tok}).status_code == 401
+    assert client.get("/api/applicants", headers={**APP_KEY_HEADERS, "Authorization": "Bearer " + tok}).status_code == 401
 
 
 def test_unsigned_token_is_refused(client):
     now = int(time.time())
     tok = jwt.encode({"sub": ADMIN_ID, "email": "a@b.c", "aud": "authenticated", "role": "authenticated",
                       "iss": f"{SUPABASE_URL}/auth/v1", "exp": now + 3600}, None, algorithm="none")
-    r = client.get("/api/applicants", headers={"Authorization": "Bearer " + tok})
+    r = client.get("/api/applicants", headers={**APP_KEY_HEADERS, "Authorization": "Bearer " + tok})
     assert r.status_code == 401
 
 
@@ -78,8 +80,8 @@ def test_hs256_without_a_configured_secret_fails_closed(client, monkeypatch):
 def test_public_key_tokens_work_and_a_wrong_key_is_refused(client, monkeypatch):
     key, other = ec.generate_private_key(ec.SECP256R1()), ec.generate_private_key(ec.SECP256R1())
     monkeypatch.setattr(auth, "_signing_key", lambda token: key.public_key())
-    good = {"Authorization": "Bearer " + make_token(USER_ID, secret=key, alg="ES256", headers={"kid": "k1"})}
-    forged = {"Authorization": "Bearer " + make_token(USER_ID, secret=other, alg="ES256", headers={"kid": "k1"})}
+    good = {**APP_KEY_HEADERS, "Authorization": "Bearer " + make_token(USER_ID, secret=key, alg="ES256", headers={"kid": "k1"})}
+    forged = {**APP_KEY_HEADERS, "Authorization": "Bearer " + make_token(USER_ID, secret=other, alg="ES256", headers={"kid": "k1"})}
     assert client.get("/api/applicants", headers=good).status_code == 200
     r = client.get("/api/applicants", headers=forged)
     assert r.status_code == 401 and _code(r) == "AUTH_INVALID_TOKEN"
@@ -89,7 +91,7 @@ def test_public_key_tokens_without_a_project_url_fail_closed(client, monkeypatch
     key = ec.generate_private_key(ec.SECP256R1())
     monkeypatch.setattr(config, "SUPABASE_URL", "")
     tok = make_token(USER_ID, secret=key, alg="ES256", headers={"kid": "k1"})
-    r = client.get("/api/applicants", headers={"Authorization": "Bearer " + tok})
+    r = client.get("/api/applicants", headers={**APP_KEY_HEADERS, "Authorization": "Bearer " + tok})
     assert r.status_code == 503 and _code(r) == "AUTH_NOT_CONFIGURED"
 
 
@@ -101,7 +103,7 @@ def test_signing_key_outage_is_a_503_not_a_401(client, monkeypatch):
         raise PyJWKClientConnectionError("could not fetch")
     monkeypatch.setattr(auth, "_signing_key", down)
     tok = make_token(USER_ID, secret=key, alg="ES256", headers={"kid": "k1"})
-    r = client.get("/api/applicants", headers={"Authorization": "Bearer " + tok})
+    r = client.get("/api/applicants", headers={**APP_KEY_HEADERS, "Authorization": "Bearer " + tok})
     assert r.status_code == 503 and _code(r) == "AUTH_UNAVAILABLE"
 
 
@@ -264,34 +266,90 @@ def test_each_person_has_their_own_rate_limit(client):
     assert _screen(client, USER2_HEADERS).status_code == 200
 
 
-# ---- the API key is a machine credential ---------------------------------------------
+# ---- the app key: which app is calling ------------------------------------------------
 
-def test_api_key_cannot_read_applicant_data(client):
-    r = client.get("/api/applicants", headers=SERVICE_HEADERS)
-    assert r.status_code == 403 and _code(r) == "API_KEY_NOT_ACCEPTED"
-    assert client.post("/api/screen", json={"full_name": "Ali Khan"}, headers=SERVICE_HEADERS).status_code == 403
-    r = client.get("/api/applicants", headers={"X-API-Key": "nope"})
+PROTECTED = [("get", "/api/me"), ("get", "/api/applicants"), ("get", "/api/applicants/1"),
+             ("post", "/api/screen"), ("get", "/api/evidence/1"), ("get", "/api/admin/lists"),
+             ("get", "/api/admin/nacta"), ("post", "/api/admin/refresh"), ("post", "/api/admin/nacta"),
+             ("get", "/api/admin/users")]
+
+
+def _token_only(sub=ADMIN_ID):
+    return {k: v for k, v in bearer(sub).items() if k == "Authorization"}
+
+
+@pytest.mark.parametrize("method,path", PROTECTED)
+def test_every_route_needs_the_app_key_even_with_a_valid_sign_in(client, method, path):
+    r = getattr(client, method)(path, headers=_token_only(ADMIN_ID))
+    assert r.status_code == 401 and _code(r) == "AUTH_MISSING_KEY"
+    r = getattr(client, method)(path, headers={**_token_only(ADMIN_ID), "X-API-Key": "nope"})
     assert r.status_code == 401 and _code(r) == "AUTH_INVALID_KEY"
 
 
-def test_api_key_when_not_configured_is_503(client, monkeypatch):
-    monkeypatch.setattr(auth, "API_KEY", None)
-    r = client.get("/api/applicants", headers=SERVICE_HEADERS)
+def test_the_app_key_is_checked_before_anything_else_is_revealed(client):
+    # no sign in and no key: the answer is about the key, not the token
+    r = client.get("/api/applicants")
+    assert r.status_code == 401 and _code(r) == "AUTH_MISSING_KEY"
+    r = client.get("/api/applicants", headers={"Authorization": "Bearer garbage"})
+    assert _code(r) == "AUTH_MISSING_KEY"
+
+
+def test_health_needs_neither(client):
+    assert client.get("/api/health").status_code == 200
+    assert client.get("/api/health?deep=true").status_code == 200
+
+
+def test_cors_preflight_for_the_app_headers_is_allowed(client):
+    r = client.options("/api/applicants", headers={
+        "Origin": "http://localhost:5173", "Access-Control-Request-Method": "GET",
+        "Access-Control-Request-Headers": "authorization,x-api-key,x-request-id"})
+    assert r.status_code == 200
+    allowed = r.headers["access-control-allow-headers"].lower()
+    assert "x-api-key" in allowed and "authorization" in allowed
+
+
+def test_a_non_ascii_app_key_is_a_clean_401_not_a_500(client):
+    r = client.get("/api/applicants", headers=[(b"x-api-key", "café-key".encode("latin-1")),
+                                               (b"authorization", _token_only(USER_ID)["Authorization"].encode())])
+    assert r.status_code == 401 and _code(r) == "AUTH_INVALID_KEY"
+
+
+def test_app_key_not_configured_fails_closed(client, monkeypatch):
+    monkeypatch.setattr(config, "APP_API_KEY", "")
+    r = client.get("/api/applicants", headers=USER_HEADERS)
     assert r.status_code == 503 and _code(r) == "AUTH_NOT_CONFIGURED"
+    assert client.get("/api/health").status_code == 200
+
+
+def test_the_app_key_check_can_be_switched_off_for_local_development(client, monkeypatch):
+    monkeypatch.setattr(config, "REQUIRE_APP_KEY", False)
+    assert client.get("/api/applicants", headers=_token_only(USER_ID)).status_code == 200
+    assert client.get("/api/applicants").status_code == 401        # a sign in is still required
+
+
+def test_the_app_key_never_opens_data_without_a_sign_in(client):
+    for method, path in PROTECTED:
+        if path == "/api/admin/nacta" and method == "post":
+            continue                                                # covered by the NACTA permissions test
+        r = getattr(client, method)(path, headers=APP_KEY_HEADERS)
+        assert r.status_code == 401 and _code(r) == "AUTH_REQUIRED", (method, path)
+
+
+# ---- the secret API key is a machine credential --------------------------------------------
+
+def test_the_secret_api_key_cannot_read_applicant_data(client):
+    for headers in (SERVICE_HEADERS, {**SERVICE_HEADERS, **_token_only(ADMIN_ID)}):
+        r = client.get("/api/applicants", headers=headers)
+        assert r.status_code == 401 and _code(r) == "AUTH_INVALID_KEY"      # it is not the app's key
+    assert client.post("/api/screen", json={"full_name": "Ali Khan"}, headers=SERVICE_HEADERS).status_code == 401
+
+
+def test_secret_api_key_not_configured_disables_only_the_scheduled_upload(client, monkeypatch):
+    monkeypatch.setattr(auth, "API_KEY", None)
+    body = b"name,cnic\nSome Person,3740565359881\n"
+    r = client.post("/api/admin/nacta?filename=n.csv", content=body, headers={**SERVICE_HEADERS, "Content-Type": "text/csv"})
+    assert r.status_code == 401
     assert client.get("/api/applicants", headers=USER_HEADERS).status_code == 200   # signed in users are unaffected
-
-
-def test_token_wins_when_both_are_sent(client):
-    r = client.get("/api/applicants", headers={**USER_HEADERS, "X-API-Key": "wrong"})
-    assert r.status_code == 200
-
-
-def test_legacy_switch_gives_the_old_frontend_its_access_back(client, monkeypatch):
-    monkeypatch.setattr(config, "ALLOW_API_KEY_FULL_ACCESS", True)
-    r = _screen(client, SERVICE_HEADERS)
-    assert r.status_code == 200
-    rows = client.get("/api/applicants", headers=SERVICE_HEADERS).json()
-    assert len(rows) == 1 and rows[0]["screened_by"] is None
 
 
 def test_nacta_upload_permissions(client, storage):
@@ -301,8 +359,11 @@ def test_nacta_upload_permissions(client, storage):
     assert up(PENDING_HEADERS).status_code == 403
     assert up({}).status_code == 401
     assert up({"X-API-Key": "nope"}).status_code == 401
+    r = up(APP_KEY_HEADERS)                                  # the app key is public: on its own it never uploads
+    assert r.status_code == 401 and _code(r) == "AUTH_REQUIRED"
+    assert up({**SERVICE_HEADERS, "Authorization": "Bearer junk"}).status_code == 401   # the machine key means no sign in
     assert up(SERVICE_HEADERS).status_code == 200            # the scheduled workflow
-    assert up(API_HEADERS).status_code == 200                # an admin
+    assert up(API_HEADERS).status_code == 200                # an admin using the app
     assert storage.nacta_meta()["records"] == 1
 
 

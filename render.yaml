@@ -15,8 +15,10 @@ services:
         sync: false     # secret: the Supabase "Session pooler" connection string, set in the Render dashboard
       - key: SUPABASE_JWT_SECRET
         sync: false     # only if the project still signs tokens with the legacy secret; otherwise leave empty
+      - key: APP_API_KEY
+        sync: false     # the key the frontend sends (VITE_API_KEY on Vercel must be the same value); not a secret
       - key: API_KEY
-        generateValue: true   # machine credential for the scheduled NACTA upload only
+        generateValue: true   # SECRET machine credential for the scheduled NACTA upload only; never give it to the frontend
 
 # Nothing is kept on the server's disk. Users, screening history, evidence PDFs and the NACTA list are
 # all in the Supabase database, so restarts, redeploys and the free plan's sleep lose nothing.
