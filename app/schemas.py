@@ -1,6 +1,12 @@
+import re
 from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
+
+from app.screening import engine
+
+# control and zero width characters have no place in a name and can hide text from a reviewer
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]")
 
 
 class ScreenRequest(BaseModel):
@@ -22,9 +28,13 @@ class ScreenRequest(BaseModel):
     @field_validator("full_name")
     @classmethod
     def name_not_blank(cls, v):
-        v = v.strip()
+        v = _CONTROL.sub("", v).strip()
         if len(v) < 2:
             raise ValueError("full_name cannot be blank")
+        try:
+            engine.check_screenable(v)
+        except engine.UnscreenableName as exc:
+            raise ValueError(str(exc)) from None
         return v
 
     @field_validator("dob", "nationality", "cnic", "father_name")
@@ -138,3 +148,30 @@ class UserStatusIn(BaseModel):
 
 class UserRoleIn(BaseModel):
     role: Literal["user", "admin"]
+
+
+class AuditEntryOut(BaseModel):
+    id: int
+    at: str
+    actor_id: Optional[str] = None
+    actor_email: Optional[str] = None
+    via: str = "token"
+    action: str
+    target_type: Optional[str] = None
+    target_id: Optional[str] = None
+    detail: Optional[dict] = None
+    request_id: Optional[str] = None
+    ip: Optional[str] = None
+    row_hash: str
+
+
+class AuditPageOut(BaseModel):
+    total: int
+    entries: List[AuditEntryOut]
+
+
+class AuditVerifyOut(BaseModel):
+    ok: bool
+    checked: int
+    first_bad_id: Optional[int] = None
+    head: Optional[str] = None

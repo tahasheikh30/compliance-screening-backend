@@ -29,3 +29,18 @@ jobs:
       - run: python -m pytest -q
         env:
           TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/screening_test
+
+  security:
+    # Fails the build on a known vulnerable dependency or a risky code pattern, so they are caught before deploy.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pip-audit bandit ruff
+      - run: ruff check app scripts --select E9,F      # undefined names, unused imports, syntax errors
+      - run: pip-audit -r requirements.txt
+      # B608 skipped: the SQL f-strings in app/database.py only join constant column lists and literal WHERE
+      # fragments; every value goes through %s parameters.
+      - run: bandit -r app -ll -q -s B608

@@ -93,3 +93,14 @@ NACTA_MAX_AGE_DAYS = _float_env("NACTA_MAX_AGE_DAYS", 30)
 # Like the FIA Red Book: when true (the default), a NACTA list that is missing or out
 # of date sends an otherwise clear applicant to manual review.
 NACTA_REQUIRED = os.environ.get("NACTA_REQUIRED", "true").strip().lower() not in ("0", "false", "no")
+
+
+# --- Network safety ------------------------------------------------------
+# Largest single download accepted from a list publisher. The biggest real files are a few tens of megabytes;
+# the cap stops a compromised or misconfigured source from exhausting the server's memory.
+MAX_DOWNLOAD_BYTES = int(_float_env("MAX_DOWNLOAD_MB", 120) * 1024 * 1024)
+
+# --- API surface ---------------------------------------------------------
+# The interactive docs (/docs, /redoc, /openapi.json) describe every route to anyone who asks, so they are off
+# unless you turn them on (local development).
+ENABLE_DOCS = os.environ.get("ENABLE_DOCS", "").strip().lower() in ("1", "true", "yes")

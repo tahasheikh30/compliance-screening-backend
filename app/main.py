@@ -32,16 +32,21 @@ Endpoints:
     GET  /api/admin/users                 (admin) people who signed up, ?status=pending to see who is waiting
     POST /api/admin/users/{id}/status     (admin) approve or reject someone
     POST /api/admin/users/{id}/role       (admin) make someone an admin, or a normal user again
+    GET  /api/admin/audit                 (admin) who did what, paged; /api/admin/audit/verify checks the hash chain
     GET  /api/health                      unauthenticated liveness check (?deep=true also checks the database)
 """
 
+import hashlib
 import os
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Literal
+from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
 
@@ -52,7 +57,7 @@ from app import auth
 from app.auth import AuthUser, require_admin, require_admin_or_service_key, require_approved
 from app.config import FIA_REQUIRED, NACTA_REQUIRED, PRELOAD_LISTS
 from app.errors import AppError, configure_logging, install as install_error_handlers, request_context, logger
-from app.schemas import (ApplicantSummary, MeOut, ScreenRequest, ScreenResponse, ScreeningResultOut, UserOut,
+from app.schemas import (ApplicantSummary, AuditEntryOut, AuditPageOut, AuditVerifyOut, MeOut, ScreenRequest, ScreenResponse, ScreeningResultOut, UserOut,
                          UserRoleIn, UserStatusIn)
 from app.screening import engine, loader, nacta_store, parsers
 
@@ -68,12 +73,33 @@ def _rate_key(request: Request) -> str:
 
 limiter = Limiter(key_func=_rate_key)
 
-app = FastAPI(title="Applicant Screening API")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    _startup()
+    try:
+        yield
+    finally:
+        loader.stop_background_refresh()
+        db.close_pool()
+
+
+# The interactive docs list every route to anyone who asks: off unless ENABLE_DOCS=true (local development).
+app = FastAPI(title="Applicant Screening API", lifespan=lifespan,
+              docs_url="/docs" if app_config.ENABLE_DOCS else None,
+              redoc_url="/redoc" if app_config.ENABLE_DOCS else None,
+              openapi_url="/openapi.json" if app_config.ENABLE_DOCS else None)
 app.state.limiter = limiter
 install_error_handlers(app)  # handlers for AppError, HTTPException, 422, 429 and a catch-all
 
 # Comma-separated list, e.g. ALLOWED_ORIGINS=https://your-app.vercel.app
-allowed_origins = os.environ.get("ALLOWED_ORIGINS", "http://localhost:5173").split(",")
+allowed_origins = [o.strip().rstrip("/") for o in os.environ.get("ALLOWED_ORIGINS", "http://localhost:5173").split(",")
+                   if o.strip()]
+if "*" in allowed_origins:
+    # a wildcard would let any website's script call this API with a signed in person's token
+    logger.warning("ALLOWED_ORIGINS contains '*', which is ignored. List your frontend's exact origin.")
+    allowed_origins = [o for o in allowed_origins if o != "*"]
 
 # Middleware order matters: Starlette's add_middleware() PREPENDS, so the last
 # one registered is outermost. request_context must be registered first (innermost)
@@ -86,15 +112,22 @@ app.middleware("http")(request_context)
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     response = await call_next(request)
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "no-referrer"
+    h = response.headers
+    h["X-Content-Type-Options"] = "nosniff"
+    h["X-Frame-Options"] = "DENY"
+    h["Referrer-Policy"] = "no-referrer"
+    # this is a JSON/PDF API: it never needs to load or run anything, so forbid all of it
+    h["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+    h["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+    h["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+    h["Cross-Origin-Opener-Policy"] = "same-origin"
     # applicant PII: never cache API responses
     if request.url.path.startswith("/api/") and request.url.path != "/api/health":
         response.headers["Cache-Control"] = "no-store"
     return response
 
 
+app.add_middleware(GZipMiddleware, minimum_size=1024)   # screening results with many matches are large JSON
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
@@ -104,8 +137,7 @@ app.add_middleware(
 )
 
 
-@app.on_event("startup")
-def startup():
+def _startup():
     try:
         db.init_db()
     except Exception:
@@ -128,10 +160,19 @@ def startup():
         logger.info("Loading the screening lists in the background and keeping them fresh")
 
 
-@app.on_event("shutdown")
-def shutdown():
-    loader.stop_background_refresh()
-    db.close_pool()
+
+def _audit(request: Request, user: AuthUser, action: str, target_type: str | None = None, target_id=None,
+           detail: dict | None = None) -> None:
+    """
+    Record who did what (ids and outcomes only, never an applicant's name or CNIC). A failure to write the
+    entry is logged loudly but never turns a screening into an error for the analyst.
+    """
+    try:
+        db.audit(action, actor_id=user.id, actor_email=user.email, via=user.via, target_type=target_type,
+                 target_id=target_id, detail=detail, request_id=getattr(request.state, "request_id", None),
+                 ip=request.client.host if request.client else None)
+    except Exception:
+        logger.exception("AUDIT WRITE FAILED for %s (target %s)", action, target_id)
 
 
 def _case_ref(applicant_id: int, when: datetime) -> str:
@@ -155,6 +196,10 @@ def me(request: Request, user: AuthUser = Depends(auth.authenticate)):
 def screen_applicant(request: Request, req: ScreenRequest, user: AuthUser = Depends(require_approved)):
     now = datetime.now(timezone.utc)
     threshold = engine.resolve_threshold(req.threshold)
+    try:
+        engine.check_screenable(req.full_name)   # the request model already checked; this is the safety net
+    except engine.UnscreenableName as exc:
+        raise AppError(422, "NAME_NOT_SCREENABLE", str(exc), "Retype the name in Latin letters.") from None
     applicant_id = db.insert_applicant(req.full_name, req.cnic, req.father_name, now.isoformat(), "PENDING",
                                        dob=req.dob, nationality=req.nationality, threshold=threshold,
                                        user_id=user.id)
@@ -199,6 +244,9 @@ def screen_applicant(request: Request, req: ScreenRequest, user: AuthUser = Depe
     db.save_screening(applicant_id, overall, result["total_records"], rows,
                       evidence=evidence_pdf, evidence_failed=evidence_failed)
 
+    _audit(request, user, "screening.run", "applicant", applicant_id,
+           {"overall_status": overall, "threshold": threshold, "sanctions_hits": result["sanctions_hit_count"],
+            "media_hits": result["media_hit_count"], "evidence": bool(evidence_pdf)})
     results_out = [
         ScreeningResultOut(**r) for r in db.get_results_for_applicant(applicant_id)
     ]
@@ -211,8 +259,14 @@ def screen_applicant(request: Request, req: ScreenRequest, user: AuthUser = Depe
 
 @app.get("/api/applicants", response_model=list[ApplicantSummary])
 @limiter.limit("30/minute")
-def list_applicants(request: Request, mine: bool = False, user: AuthUser = Depends(require_approved)):
-    return db.list_applicants(user_id=_scope(user, mine))
+def list_applicants(request: Request, response: Response, mine: bool = False,
+                    limit: int = Query(100, ge=1, le=200), offset: int = Query(0, ge=0, le=1_000_000),
+                    status: Literal["ESCALATE_TO_COMPLIANCE", "MANUAL_REVIEW", "AUTO_CLEAR", "PENDING"] | None = None,
+                    user: AuthUser = Depends(require_approved)):
+    """Newest first. `limit` and `offset` page through them; X-Total-Count is how many there are in all."""
+    rows, total = db.search_applicants(user_id=_scope(user, mine), status=status, limit=limit, offset=offset)
+    response.headers["X-Total-Count"] = str(total)
+    return rows
 
 
 @app.get("/api/applicants/{applicant_id}", response_model=ScreenResponse)
@@ -222,6 +276,7 @@ def get_applicant(request: Request, applicant_id: int, user: AuthUser = Depends(
     applicant = db.get_applicant(applicant_id, _scope(user))
     if not applicant:
         raise HTTPException(404, "Applicant not found")
+    _audit(request, user, "screening.view", "applicant", applicant_id)
     results = db.get_results_for_applicant(applicant_id)
     try:
         when = datetime.fromisoformat(applicant["submitted_at"])
@@ -239,12 +294,15 @@ _NO_EVIDENCE = ("An evidence PDF is only generated when a screening finds a pote
                 "news article. If it should exist and does not, generation may have failed: check the server log.")
 
 
-def _send_evidence(applicant_id: int):
+def _send_evidence(request: Request, user: AuthUser, applicant_id: int):
     ev = db.get_evidence(applicant_id)
     if not ev:
         raise AppError(404, "EVIDENCE_NOT_GENERATED", "This screening has no evidence PDF.", _NO_EVIDENCE)
+    _audit(request, user, "evidence.download", "applicant", applicant_id, {"sha256": ev["sha256"]})
+    safe_name = "".join(c for c in str(ev["filename"]) if c.isalnum() or c in "._-") or "evidence.pdf"
     return Response(content=bytes(ev["content"]), media_type="application/pdf",
-                    headers={"Content-Disposition": f'attachment; filename="{ev["filename"]}"'})
+                    headers={"Content-Disposition": f'attachment; filename="{safe_name}"',
+                             "X-Content-SHA256": ev["sha256"]})
 
 
 @app.get("/api/evidence/{result_id}")
@@ -255,7 +313,7 @@ def download_evidence(request: Request, result_id: int, user: AuthUser = Depends
         raise AppError(404, "RESULT_NOT_FOUND", "No screening result with that ID.")
     if not result.get("evidence_file"):
         raise AppError(404, "EVIDENCE_NOT_GENERATED", "This result has no evidence PDF.", _NO_EVIDENCE)
-    return _send_evidence(result["applicant_id"])
+    return _send_evidence(request, user, result["applicant_id"])
 
 
 @app.get("/api/applicants/{applicant_id}/evidence")
@@ -263,14 +321,15 @@ def download_evidence(request: Request, result_id: int, user: AuthUser = Depends
 def download_applicant_evidence(request: Request, applicant_id: int, user: AuthUser = Depends(require_approved)):
     if not db.get_applicant(applicant_id, _scope(user)):
         raise AppError(404, "APPLICANT_NOT_FOUND", "No screening with that ID.")
-    return _send_evidence(applicant_id)
+    return _send_evidence(request, user, applicant_id)
 
 
 @app.get("/api/admin/lists")
 @limiter.limit("30/minute")
 def list_cache_status(request: Request, user: AuthUser = Depends(require_approved)):
     """Which lists are held in memory right now, how old they are and how many records they have."""
-    return loader.cache_status()
+    # the address each list is fetched from, and the text sample used to diagnose a PDF, are for admins only
+    return loader.cache_status(detailed=user.is_admin)
 
 
 @app.post("/api/admin/refresh")
@@ -280,6 +339,7 @@ def refresh_lists(request: Request, user: AuthUser = Depends(require_admin)):
     Drop the in-memory cache and download every list again now. Each source is
     reported on its own: a failure in one does not stop the others.
     """
+    _audit(request, user, "lists.refresh")
     loader.clear_cache()
     out = {}
     for key, g in loader.load_groups().items():
@@ -359,7 +419,11 @@ async def upload_nacta(request: Request, filename: str = "nacta.csv",
         raise AppError(413, "NACTA_FILE_TOO_LARGE", "That file is too large for the NACTA list.",
                        "The Fourth Schedule export is a few megabytes at most. Check you chose the right file.")
     # parsing a few thousand rows is CPU work: keep it off the event loop so other requests are not stalled
-    return await run_in_threadpool(_ingest_nacta, data, filename)
+    out = await run_in_threadpool(_ingest_nacta, data, filename)
+    _audit(request, user, "nacta.upload", "nacta_list", None,
+           {"filename": os.path.basename(filename)[:200], "records": out["records"], "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest()})
+    return out
 
 
 def _user_out(p: dict) -> UserOut:
@@ -367,7 +431,7 @@ def _user_out(p: dict) -> UserOut:
                    created_at=p["created_at"], decided_at=p.get("decided_at"))
 
 
-def _change_user(user_id, admin: AuthUser, **changes) -> UserOut:
+def _change_user(request: Request, user_id, admin: AuthUser, **changes) -> UserOut:
     try:
         profile = db.update_profile(str(user_id), decided_by=admin.id, **changes)
     except db.LastAdminError:
@@ -376,6 +440,7 @@ def _change_user(user_id, admin: AuthUser, **changes) -> UserOut:
     if profile is None:
         raise AppError(404, "USER_NOT_FOUND", "No user with that ID.")
     auth.invalidate_profile(str(user_id))   # takes effect on this server at once
+    _audit(request, admin, "user.change", "user", user_id, changes)
     logger.info("User %s changed by %s: %s", user_id, admin.id or admin.via, changes)
     return _user_out(profile)
 
@@ -392,14 +457,34 @@ def list_users(request: Request, status: Literal["pending", "approved", "rejecte
 @limiter.limit("60/minute")
 def set_user_status(request: Request, user_id: uuid.UUID, body: UserStatusIn, user: AuthUser = Depends(require_admin)):
     """Approve or reject a user."""
-    return _change_user(user_id, user, status=body.status)
+    return _change_user(request, user_id, user, status=body.status)
 
 
 @app.post("/api/admin/users/{user_id}/role", response_model=UserOut)
 @limiter.limit("60/minute")
 def set_user_role(request: Request, user_id: uuid.UUID, body: UserRoleIn, user: AuthUser = Depends(require_admin)):
     """Make a user an admin, or a normal user again."""
-    return _change_user(user_id, user, role=body.role)
+    return _change_user(request, user_id, user, role=body.role)
+
+
+@app.get("/api/admin/audit", response_model=AuditPageOut)
+@limiter.limit("30/minute")
+def audit_trail(request: Request, response: Response, limit: int = Query(100, ge=1, le=500),
+                offset: int = Query(0, ge=0, le=1_000_000), action: str | None = Query(None, max_length=60),
+                actor_id: uuid.UUID | None = None, user: AuthUser = Depends(require_admin)):
+    """Who did what, newest first. Entries hold ids and outcomes, never applicant names."""
+    rows, total = db.audit_list(limit, offset, action, str(actor_id) if actor_id else None)
+    return AuditPageOut(total=total, entries=[AuditEntryOut(**r) for r in rows])
+
+
+@app.get("/api/admin/audit/verify", response_model=AuditVerifyOut)
+@limiter.limit("6/hour")
+def audit_verify(request: Request, user: AuthUser = Depends(require_admin)):
+    """Re-compute the whole hash chain. ok=false means an entry was changed, removed or inserted."""
+    result = db.audit_verify()
+    if not result["ok"]:
+        logger.error("AUDIT CHAIN BROKEN at entry %s", result["first_bad_id"])
+    return result
 
 
 @app.get("/api/health")

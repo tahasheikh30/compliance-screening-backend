@@ -17,9 +17,11 @@ The n8n workflow downloaded every list on every run. This module does the same
 Nothing is written to disk and no API key is needed.
 """
 
+import ipaddress
 import re
 import threading
 import time
+from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
@@ -28,7 +30,7 @@ import requests
 from app import config
 from app.config import HTTP_USER_AGENT, LIST_CACHE_TTL_SECONDS
 from app.errors import logger
-from app.screening import nacta_store, parsers
+from app.screening import names, nacta_store, parsers
 
 # Same endpoints as the workflow's "List Sources" node.
 UN_URL = "https://unsolprodfiles.blob.core.windows.net/publiclegacyxmlfiles/EN/consolidatedLegacyByNAME.xml"
@@ -61,10 +63,22 @@ class GroupData:
     meta: list = field(default_factory=list)      # one dict per list, as in the workflow's listMeta
     error: str | None = None                      # set when the whole source could not be screened
     loaded_at: float = field(default_factory=time.time)
+    _index: "names.RecordIndex | None" = field(default=None, repr=False, compare=False)
 
     @property
     def available(self) -> bool:
         return self.error is None
+
+    def warm(self) -> None:
+        """Build the token index now (off the request path) so the first screening does not pay for it."""
+        _ = self.index
+
+    @property
+    def index(self) -> "names.RecordIndex | None":
+        """Token index over the records (see names.RecordIndex); built once, when first needed."""
+        if self._index is None and self.records:
+            self._index = names.RecordIndex(self.records)
+        return self._index
 
 
 # --------------------------------------------------------------------------
@@ -76,10 +90,62 @@ _session = requests.Session()
 _session.mount("https://", requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8))
 
 
+MAX_REDIRECTS = 5
+
+
+class UnsafeDownload(Exception):
+    """A download was refused before or while it ran (unsafe address, too many redirects, too large)."""
+
+
+def _check_url(url: str) -> None:
+    """https only, and never an address that points inside the server's own network."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not host or parsed.username or parsed.password:
+        raise UnsafeDownload("Only plain https addresses are fetched")
+    if host == "localhost" or host.endswith((".local", ".internal", ".localhost")):
+        raise UnsafeDownload("Internal addresses are not fetched")
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return                              # a name, not a literal address
+    if not ip.is_global:
+        raise UnsafeDownload("Internal addresses are not fetched")
+
+
 def _get(url: str, read_timeout: float = READ_TIMEOUT, **kwargs) -> requests.Response:
+    """
+    GET with the safety rules every list download needs: https only, no internal addresses (checked on every
+    redirect hop, before the hop is requested), at most MAX_REDIRECTS redirects, and a cap of
+    MAX_DOWNLOAD_BYTES on the body so a bad source cannot exhaust memory.
+    """
     headers = {"User-Agent": HTTP_USER_AGENT, **kwargs.pop("headers", {})}
-    resp = _session.get(url, headers=headers, timeout=(CONNECT_TIMEOUT, read_timeout), **kwargs)
-    resp.raise_for_status()
+    for _ in range(MAX_REDIRECTS + 1):
+        _check_url(url)
+        resp = _session.get(url, headers=headers, timeout=(CONNECT_TIMEOUT, read_timeout), stream=True,
+                            allow_redirects=False, **kwargs)
+        if resp.is_redirect and resp.headers.get("Location"):
+            url = urljoin(url, resp.headers["Location"])
+            resp.close()
+            kwargs.pop("params", None)      # the redirect target already carries its own query
+            continue
+        break
+    else:
+        raise UnsafeDownload("Too many redirects")
+    try:
+        resp.raise_for_status()
+        declared = resp.headers.get("Content-Length")
+        if declared and declared.isdigit() and int(declared) > config.MAX_DOWNLOAD_BYTES:
+            raise UnsafeDownload(f"The download is larger than the {config.MAX_DOWNLOAD_BYTES // 1048576} MB limit")
+        body = bytearray()
+        for chunk in resp.iter_content(1 << 20):
+            body += chunk
+            if len(body) > config.MAX_DOWNLOAD_BYTES:
+                raise UnsafeDownload(f"The download is larger than the {config.MAX_DOWNLOAD_BYTES // 1048576} MB limit")
+        resp._content = bytes(body)         # so .content and .text work as with a normal response
+        resp._content_consumed = True
+    finally:
+        resp.close()
     return resp
 
 
@@ -316,6 +382,7 @@ def _reload(key: str, max_age: float) -> GroupData:
                                                    "status": "Not available: " + msg}])
         _last_attempt[key] = data
         if data.available:
+            data.warm()
             _cache[key] = data
         return data
 
@@ -389,7 +456,7 @@ def clear_cache(key: str | None = None) -> None:
         _last_attempt.pop(key, None)
 
 
-def cache_status() -> dict:
+def cache_status(detailed: bool = True) -> dict:
     """
     For the Lists page: per source, whether it is held in memory, and every list behind it with its
     own record count and status, taken from the most recent load (successful or not). A source that
@@ -402,7 +469,7 @@ def cache_status() -> dict:
         entry = {"cached": bool(cached), "records": len(cached.records) if cached else 0,
                  "age_seconds": round(time.time() - cached.loaded_at) if cached else None,
                  "error": last.error if last else None,
-                 "lists": [list_info(m, debug=True) for m in last.meta] if last else []}
+                 "lists": [list_info(m, debug=detailed) for m in last.meta] if last else []}
         out[k] = entry
     return out
 

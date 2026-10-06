@@ -411,7 +411,7 @@ def test_database_outage_is_a_clear_503(client, monkeypatch):
 
     def down(*a, **k):
         raise psycopg.OperationalError("connection refused")
-    monkeypatch.setattr(database, "list_applicants", down)
+    monkeypatch.setattr(database, "search_applicants", down)
     r = client.get("/api/applicants", headers=USER_HEADERS)
     assert r.status_code == 503 and _code(r) == "DATABASE_UNAVAILABLE" and r.headers["Retry-After"] == "5"
     assert r.headers["X-Request-ID"] == r.json()["error"]["request_id"]
@@ -422,7 +422,7 @@ def test_missing_database_url_is_a_clear_503(client, monkeypatch):
 
     def nope(*a, **k):
         raise database.DatabaseNotConfigured("DATABASE_URL is not set")
-    monkeypatch.setattr(database, "list_applicants", nope)
+    monkeypatch.setattr(database, "search_applicants", nope)
     r = client.get("/api/applicants", headers=USER_HEADERS)
     assert r.status_code == 503 and _code(r) == "DATABASE_NOT_CONFIGURED"
 

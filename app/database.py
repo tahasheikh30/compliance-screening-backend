@@ -15,6 +15,7 @@ dashboard's Connect dialog (it also works from hosts without IPv6, like Render's
 """
 
 import hashlib
+import json
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -179,10 +180,10 @@ def save_screening(applicant_id, overall_status, records_screened, rows,
         if evidence:
             name, pdf = evidence
             conn.execute(
-                "INSERT INTO evidence_files (applicant_id, filename, content) VALUES (%s, %s, %s) "
+                "INSERT INTO evidence_files (applicant_id, filename, content, sha256) VALUES (%s, %s, %s, %s) "
                 "ON CONFLICT (applicant_id) DO UPDATE SET filename = EXCLUDED.filename, "
-                "content = EXCLUDED.content, created_at = now()",
-                (applicant_id, name, pdf),
+                "content = EXCLUDED.content, sha256 = EXCLUDED.sha256, created_at = now()",
+                (applicant_id, name, pdf, hashlib.sha256(pdf).hexdigest()),
             )
             conn.execute("UPDATE screening_results SET evidence_file = %s "
                          "WHERE applicant_id = %s AND status IN ('HIT', 'REVIEW')", (name, applicant_id))
@@ -223,6 +224,24 @@ def list_applicants(user_id=None, limit=100):
         return [_clean(r) for r in rows]
 
 
+def search_applicants(user_id=None, status=None, limit=100, offset=0) -> tuple:
+    """(rows, total): one page of screenings, newest first, optionally only one overall status."""
+    where, args = [], []
+    if user_id is not None:
+        where.append("a.user_id = %s")
+        args.append(user_id)
+    if status:
+        where.append("a.overall_status = %s")
+        args.append(status)
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    with pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT a.*, p.email AS screened_by FROM applicants a LEFT JOIN profiles p ON p.id = a.user_id"
+            + clause + " ORDER BY a.id DESC LIMIT %s OFFSET %s", args + [limit, offset]).fetchall()
+        total = conn.execute("SELECT count(*) AS n FROM applicants a" + clause, args).fetchone()["n"]
+    return [_clean(r) for r in rows], total
+
+
 def get_result(result_id, user_id=None):
     sql = ("SELECT r.* FROM screening_results r JOIN applicants a ON a.id = r.applicant_id WHERE r.id = %s")
     args: list = [result_id]
@@ -233,10 +252,13 @@ def get_result(result_id, user_id=None):
 
 
 def get_evidence(applicant_id):
-    """{'filename', 'content'} of the screening's evidence PDF, or None."""
+    """{'filename', 'content', 'sha256'} of the screening's evidence PDF, or None."""
     with pool().connection() as conn:
-        return conn.execute("SELECT filename, content FROM evidence_files WHERE applicant_id = %s",
-                            (applicant_id,)).fetchone()
+        row = conn.execute("SELECT filename, content, sha256 FROM evidence_files WHERE applicant_id = %s",
+                           (applicant_id,)).fetchone()
+    if row and not row["sha256"]:      # saved before the hash was recorded
+        row["sha256"] = hashlib.sha256(bytes(row["content"])).hexdigest()
+    return row
 
 
 # --------------------------------------------------------------------------
@@ -326,3 +348,89 @@ def nacta_get() -> tuple | None:
         return None
     content = bytes(row.pop("content"))
     return content, _clean(row)
+
+
+# --------------------------------------------------------------------------
+# Audit log (append only, hash chained)
+# --------------------------------------------------------------------------
+
+AUDIT_GENESIS = "0" * 64
+
+
+def _audit_hash(prev_hash: str, at: datetime, actor_id, actor_email, via, action, target_type, target_id,
+                detail, request_id, ip) -> str:
+    body = json.dumps([prev_hash, _iso(at), str(actor_id) if actor_id else None, actor_email, via, action,
+                       target_type, target_id, detail, request_id, ip],
+                      sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _plain(v):
+    """JSON that survives a trip through jsonb unchanged: numbers that are floats become text."""
+    if isinstance(v, float):
+        return f"{v:g}"
+    if isinstance(v, dict):
+        return {str(k): _plain(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_plain(x) for x in v]
+    return v
+
+
+def audit(action: str, actor_id=None, actor_email=None, via="token", target_type=None, target_id=None,
+          detail=None, request_id=None, ip=None) -> None:
+    """Append one entry. Entries are serialised by an advisory lock so the chain has exactly one order."""
+    at = datetime.now(timezone.utc)
+    target_id = None if target_id is None else str(target_id)
+    actor_id = str(uuid.UUID(str(actor_id))) if actor_id else None   # one spelling, so the hash re-computes
+    detail = _plain(detail)
+    with pool().connection() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", (_ADMIN_LOCK + 2,))
+        last = conn.execute("SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
+        prev = last["row_hash"] if last else AUDIT_GENESIS
+        row_hash = _audit_hash(prev, at, actor_id, actor_email, via, action, target_type, target_id,
+                               detail, request_id, ip)
+        conn.execute(
+            "INSERT INTO audit_log (at, actor_id, actor_email, via, action, target_type, target_id, detail, "
+            "request_id, ip, prev_hash, row_hash) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (at, actor_id, actor_email, via, action, target_type, target_id,
+             Jsonb(detail) if detail is not None else None, request_id, ip, prev, row_hash))
+
+
+def audit_list(limit=100, offset=0, action=None, actor_id=None) -> tuple:
+    """(entries, total), newest first."""
+    where, args = [], []
+    if action:
+        where.append("action = %s")
+        args.append(action)
+    if actor_id:
+        where.append("actor_id = %s")
+        args.append(actor_id)
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    with pool().connection() as conn:
+        rows = conn.execute("SELECT id, at, actor_id, actor_email, via, action, target_type, target_id, detail, "
+                            "request_id, ip, row_hash FROM audit_log" + clause +
+                            " ORDER BY id DESC LIMIT %s OFFSET %s", args + [limit, offset]).fetchall()
+        total = conn.execute("SELECT count(*) AS n FROM audit_log" + clause, args).fetchone()["n"]
+    return [_clean(r) for r in rows], total
+
+
+def audit_verify() -> dict:
+    """
+    Walk the whole chain. ok is False at the first entry whose stored hash does not match its content or
+    whose prev_hash is not the hash of the entry before it (an entry was changed, removed or inserted).
+    `head` is the newest hash: keep a copy somewhere else (a ticket, an email) and a later rewrite of the
+    whole table, chain included, is still detectable.
+    """
+    prev, checked, last_id = AUDIT_GENESIS, 0, 0
+    with pool().connection() as conn:
+        while True:
+            rows = conn.execute("SELECT * FROM audit_log WHERE id > %s ORDER BY id LIMIT 1000", (last_id,)).fetchall()
+            if not rows:
+                break
+            for r in rows:
+                expected = _audit_hash(r["prev_hash"], r["at"], r["actor_id"], r["actor_email"], r["via"], r["action"],
+                                       r["target_type"], r["target_id"], r["detail"], r["request_id"], r["ip"])
+                if r["prev_hash"] != prev or r["row_hash"] != expected:
+                    return {"ok": False, "checked": checked, "first_bad_id": r["id"], "head": None}
+                prev, checked, last_id = r["row_hash"], checked + 1, r["id"]
+    return {"ok": True, "checked": checked, "first_bad_id": None, "head": prev if checked else None}

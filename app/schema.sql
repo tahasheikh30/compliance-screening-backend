@@ -79,8 +79,44 @@ CREATE TABLE IF NOT EXISTS nacta_list (
     live         boolean NOT NULL DEFAULT false
 );
 
+-- Integrity of the evidence: SHA-256 of the PDF, so a copy that was altered after the screening is detectable.
+ALTER TABLE evidence_files ADD COLUMN IF NOT EXISTS sha256 text;
+
+-- Who did what. Append only, and tamper evident: every entry stores the hash of the previous one
+-- (prev_hash) and its own (row_hash = SHA-256 of prev_hash plus the entry), so changing or removing any
+-- past entry breaks the chain from that point on, which GET /api/admin/audit/verify reports. The entry
+-- holds ids and outcomes, never an applicant's name or CNIC. actor_id has no foreign key on purpose: the
+-- record must outlive the account.
+CREATE TABLE IF NOT EXISTS audit_log (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    at           timestamptz NOT NULL,
+    actor_id     uuid,
+    actor_email  text,
+    via          text NOT NULL DEFAULT 'token',
+    action       text NOT NULL,
+    target_type  text,
+    target_id    text,
+    detail       jsonb,
+    request_id   text,
+    ip           text,
+    prev_hash    text NOT NULL,
+    row_hash     text NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_at ON audit_log (at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log (actor_id, id DESC);
+
+CREATE OR REPLACE FUNCTION audit_log_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'audit_log is append only';
+END;
+$$;
+DROP TRIGGER IF EXISTS audit_log_no_change ON audit_log;
+CREATE TRIGGER audit_log_no_change BEFORE UPDATE OR DELETE ON audit_log
+    FOR EACH ROW EXECUTE FUNCTION audit_log_append_only();
+
 ALTER TABLE profiles          ENABLE ROW LEVEL SECURITY;
 ALTER TABLE applicants        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE screening_results ENABLE ROW LEVEL SECURITY;
 ALTER TABLE evidence_files    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE nacta_list        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_log         ENABLE ROW LEVEL SECURITY;

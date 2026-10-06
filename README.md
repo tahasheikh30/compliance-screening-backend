@@ -141,12 +141,21 @@ both (optional):
 
 Identical to the workflow:
 
-1. Names are upper-cased, stripped of accents and punctuation, and stripped of titles and particles (Dr, Haji, Al, Bin, ...). Common surnames such as Sheikh and Syed are kept.
+1. Names are upper-cased, stripped of accents and punctuation, and stripped of titles and particles (Dr, Haji, Al, Bin, ...). Common surnames such as Sheikh and Syed are kept. Letters that do not decompose (Ł, Ø, Đ, Ð, Þ, Æ, Œ) are folded to Latin rather than dropped.
+   **Spelling variants are folded** before scoring, on both sides: MOHAMMED, MOHAMMAD, MUHAMMED, MOHD and MD all become MUHAMMAD; SYED, SAYYID, SAYED become one spelling; CHAUDHRY, CHOWDHURY, CHOUDHARY likewise (about 45 families, listed in `app/screening/names.py`). Fused and split forms meet too (ABDULRAHMAN = ABDUL RAHMAN), but ABDULLAH is never cut. Plain Jaro-Winkler scored MOHAMMED against MUHAMMAD at 0.85, under the 0.88 token cutoff, so that listed person was missed. `NAME_VARIANTS=false` turns this off and gives the original workflow's raw-spelling scores.
 2. Every applicant token is compared with every candidate token using Jaro-Winkler. A token pair below **0.88** counts as no match.
 3. The score is symmetric: unmatched tokens on either side lower it. A score at or above the **threshold** (default 85, per request 50 to 100) is a potential match.
 4. Every primary name and alias is scored; the best one is reported.
 5. The applicant's birth year is compared with the listed record and reported as supporting evidence. **Date of birth and nationality never filter matches** (the one exception is a CNIC match, above, which adds a match). A match is not a confirmed identity: a person must verify it.
 6. News: an article counts when its title or summary contains the applicant's surname plus at least one more name part, and an adverse keyword (arrested, fraud, laundering, terror, ...). News hits are unverified leads.
+
+### Speed
+
+Each list is indexed by name token when it loads. A screening scores the applicant's tokens against the list's unique tokens, then visits only records that could still reach the threshold (a record that holds one of three names cannot score 85). The result is **identical** to scanning every record (`tests/test_matching_quality.py` compares the two on random lists, with repeated tokens and at thresholds from 50 to 100) but far cheaper. On a synthetic 65,000-name list, a screening for the most common name shapes (MUHAMMAD ALI KHAN) takes about 14 ms instead of 290 ms; for a less common name, about 0.1 ms instead of 230 ms. List downloads happen in the background, so a screening never waits for them.
+
+### Names that cannot be screened
+
+A name typed in Urdu, Arabic, Cyrillic or any non-Latin script would normalise to nothing, score 0 against every record and come back clear. It is refused with a 422 instead (`VALIDATION_ERROR`, "write the name in Latin letters"), also when only part of the name is non-Latin. Hidden control and zero-width characters are removed from names.
 
 ## API
 
@@ -156,17 +165,19 @@ All endpoints except `/api/health` need **both** `X-API-Key: <APP_API_KEY>` (whi
 |---|---|---|---|
 | GET | `/api/me` | any signed in user | Your email, `role` and approval `status` |
 | POST | `/api/screen` | approved | Screen one applicant (10/min) |
-| GET | `/api/applicants` | approved | Your past screenings (admins: everyone's, `?mine=true` for their own) |
+| GET | `/api/applicants` | approved | Your past screenings (admins: everyone's, `?mine=true` for their own). `?limit=` (1-200), `?offset=`, `?status=`; the `X-Total-Count` header holds the total |
 | GET | `/api/applicants/{id}` | approved | One screening with all results |
 | GET | `/api/applicants/{id}/evidence` | approved | Evidence PDF of that screening |
 | GET | `/api/evidence/{result_id}` | approved | Same PDF, by result row |
-| GET | `/api/admin/lists` | approved | What is cached in memory |
+| GET | `/api/admin/lists` | approved | What is cached in memory (source addresses and PDF samples are shown to admins only) |
 | GET | `/api/admin/nacta` | approved | Which NACTA file is loaded and how old it is |
 | POST | `/api/admin/refresh` | admin | Clear the cache and reload every list (5/hour) |
 | POST | `/api/admin/nacta` | admin, or the secret `API_KEY` | Upload the NACTA CSV or JSON export (10/hour) |
 | GET | `/api/admin/users` | admin | People who signed up (`?status=pending`) |
 | POST | `/api/admin/users/{id}/status` | admin | `{"status": "approved" or "rejected"}` |
 | POST | `/api/admin/users/{id}/role` | admin | `{"role": "admin" or "user"}` |
+| GET | `/api/admin/audit` | admin | Who did what, newest first (`?limit=`, `?offset=`, `?action=`, `?actor_id=`) |
+| GET | `/api/admin/audit/verify` | admin | Re-computes the audit hash chain (6/hour) |
 | GET | `/api/health` | anyone | Liveness (`?deep=true` also checks the database) |
 
 Problems come back with a stable `error.code`: `AUTH_MISSING_KEY` and `AUTH_INVALID_KEY` (the app's key is missing or wrong: a deployment mistake, not the person's), `AUTH_NOT_CONFIGURED` (503, `APP_API_KEY` not set), `AUTH_REQUIRED`, `AUTH_INVALID_TOKEN`, `AUTH_TOKEN_EXPIRED` (sign in again), `ACCOUNT_PENDING`, `ACCOUNT_REJECTED`, `ADMIN_ONLY`. A database outage is `DATABASE_UNAVAILABLE` (503).
@@ -202,9 +213,36 @@ The response has one result row per source (`UNSC`, `OFAC`, `UKSL`, `FIA_REDBOOK
 
 One PDF per screening, generated when there is any hit (watch list or news). It has the same sections as the workflow's report: result banner, summary cards, applicant, screening details, per-list status and result, method note, one card per match, adverse media, and a reviewer decision block. It is attached to every `HIT` and `REVIEW` row of that screening.
 
+## Security
+
+What is in place:
+
+- **Every request is authenticated twice** (app key and signed-in person), tokens are verified locally with the project's public keys, expiry, issuer and audience are checked, anything not configured fails closed, and keys are compared in constant time.
+- **A user can only reach their own screenings**; someone else's is indistinguishable from one that does not exist. Admin actions are separate and rate limited.
+- **Outbound requests are constrained.** The server fetches lists from public publishers and, for the FIA Red Book, follows PDF links scraped from fia.gov.pk. Only `https` is fetched; internal, loopback, link-local and cloud-metadata addresses are refused, on every redirect hop and before the hop is requested; at most 5 redirects; every download is capped (`MAX_DOWNLOAD_MB`, default 120) so a bad source cannot exhaust memory. Scraped FIA links are accepted only if they point at `fia.gov.pk` itself, so a tampered page cannot steer the server at another host (`fia.gov.pk.evil.example`, `fia.gov.pk@evil.example` and bare IPs are dropped). XML is parsed with `defusedxml`.
+- **Response headers**: `Content-Security-Policy: default-src 'none'`, HSTS, `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy: no-referrer`, a locked-down `Permissions-Policy`, and `Cache-Control: no-store` on every API response (applicant data is never cached). A wildcard in `ALLOWED_ORIGINS` is ignored. `/docs`, `/redoc` and `/openapi.json` are off unless `ENABLE_DOCS=true`.
+- **No personal data in logs or errors**: request bodies and query strings are never logged, and validation errors never echo what was submitted.
+- **Dependencies and code are scanned on every push** (`pip-audit` and `bandit` in `.github/workflows/tests.yml`).
+- **Evidence integrity**: each evidence PDF's SHA-256 is stored when it is made and returned as `X-Content-SHA256` on download; compare it with the file you hold.
+
+### Audit trail
+
+`GET /api/admin/audit` lists who ran a screening, viewed one, downloaded evidence, approved or changed a user, uploaded the NACTA list or refreshed the lists. Entries hold ids, outcomes and the evidence hash, **never an applicant's name or CNIC**. The log is append only (the database rejects UPDATE and DELETE) and **tamper evident**: every entry stores the hash of the one before it, so `GET /api/admin/audit/verify` reports the first entry that was altered, removed or inserted. To also catch someone who rewrites the whole table, chain included, copy the `head` hash it returns to somewhere outside the database now and then. A failure to write an entry is logged as `AUDIT WRITE FAILED` but does not fail the screening.
+
+### What this does not cover
+
+Be clear-eyed about these before relying on the service for regulated records:
+
+- **No rate limit before sign-in.** Limits are per signed-in person, so a flood of unauthenticated requests is limited only by the host. Put Cloudflare or another WAF in front for that.
+- **Limits are held in the process.** With more than one instance they are per instance. Use a shared store (Redis) if you scale out.
+- **The client address in the audit log is whatever the proxy reports.** `--forwarded-allow-ips='*'` makes uvicorn believe the first `X-Forwarded-For` value, which a client can set. Restrict it to your proxy's address where you can, and do not treat that field as proof of origin.
+- **A host name that later resolves to an internal address (DNS rebinding) is not checked**; only literal addresses and redirect targets are.
+- **Personal data is stored unencrypted at the application level** (it relies on the database's encryption at rest) and there is **no retention or deletion policy**. AML record-keeping rules usually set a minimum, so decide yours.
+- **Name matching is not identity verification.** Every hit needs a person's decision.
+
 ## Configuration
 
-See `.env.example`. Required: `DATABASE_URL`, `SUPABASE_URL`. `APP_API_KEY` (the frontend's key; without it every request from the app is refused). Common: `ALLOWED_ORIGINS`, `API_KEY` (the secret for the scheduled NACTA upload), `SUPABASE_JWT_SECRET` (legacy token signing only), `DB_POOL_MAX`, `MATCH_THRESHOLD`, `LIST_CACHE_TTL_SECONDS`, `PRELOAD_LISTS`, `FIA_REQUIRED`, `NACTA_REQUIRED`, `NACTA_MAX_AGE_DAYS`, `NACTA_PERSONS_URL`. Without `DATABASE_URL` every request is refused with a 503 that says so; without `SUPABASE_URL` (or the legacy secret) no sign in can be verified, and requests are refused rather than let through.
+See `.env.example`. Required: `DATABASE_URL`, `SUPABASE_URL`. `APP_API_KEY` (the frontend's key; without it every request from the app is refused). Common: `ALLOWED_ORIGINS`, `API_KEY` (the secret for the scheduled NACTA upload), `SUPABASE_JWT_SECRET` (legacy token signing only), `DB_POOL_MAX`, `MATCH_THRESHOLD`, `LIST_CACHE_TTL_SECONDS`, `PRELOAD_LISTS`, `FIA_REQUIRED`, `NACTA_REQUIRED`, `NACTA_MAX_AGE_DAYS`, `NACTA_PERSONS_URL`, `NAME_VARIANTS`, `MAX_DOWNLOAD_MB`, `ENABLE_DOCS`. Without `DATABASE_URL` every request is refused with a 503 that says so; without `SUPABASE_URL` (or the legacy secret) no sign in can be verified, and requests are refused rather than let through.
 
 ## Run and test
 
@@ -233,9 +271,17 @@ Tests use synthetic copies of every feed and never touch the network. Sign in is
 ## Known limits
 
 - Matching is name based and will produce false positives for common names. Every hit needs a human decision.
-- With the 0.88 token cutoff, some spelling variants are not matched (for example MUHAMMAD vs MOHAMMED scores 0.85). MUHAMMAD vs MOHAMMAD and MUHAMMED do match. This is inherited from the workflow.
+- Spelling variants are matched only if they are in the variant table or close enough under Jaro-Winkler (0.88 per token). The table covers the common Arabic, Urdu and Persian name families, not every transliteration. Jaro-Winkler's prefix bonus also scores short and long forms of a name closely (ABDUL vs ABDULLAH is 0.93), which errs toward flagging.
+- Names must be typed in Latin letters. There is no automatic Urdu or Arabic transliteration; such names are refused rather than screened badly.
 - The FIA Red Book is read by text extraction from PDFs found on fia.gov.pk, using the workflow's patterns. If FIA changes the page or PDF layout, that source reports as not screened rather than clear.
 - Lists are public downloads, so a publisher outage or a block on the server's IP shows up as `ERROR` for that source.
+
+## Docker
+
+```bash
+docker build -t screening-backend .
+docker run -p 8000:8000 --env-file .env screening-backend      # runs as a non-root user, with a health check
+```
 
 ## Deploying
 

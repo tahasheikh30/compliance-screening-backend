@@ -14,6 +14,7 @@ Each parser turns raw text into `Record` objects:
 import csv
 import io
 import re
+from urllib.parse import urlparse
 from dataclasses import dataclass, field
 
 from app.screening.names import tokens, jw
@@ -238,6 +239,7 @@ _PUB_JSON = re.compile(
     re.I,
 )
 _PDF_LINK = re.compile(r'<a[^>]*href="([^"]+\.pdf)"[^>]*>([\s\S]*?)</a>', re.I)
+_FIA_HOSTS = frozenset({"www.fia.gov.pk", "fia.gov.pk"})
 _FIA_HOST = re.compile(r"^https?://(www\.)?fia\.gov\.pk", re.I)
 
 
@@ -257,6 +259,12 @@ def find_redbook_editions(pages: list) -> list:
         if not re.match(r"^https?:", url, re.I):
             url = "https://www.fia.gov.pk/" + url.lstrip("/")
         url = _FIA_HOST.sub("https://www.fia.gov.pk", url)
+        # The link comes from a scraped web page, so it is untrusted: only the FIA's own https host is
+        # fetched. Anything else (an internal address, another site, fia.gov.pk.evil.example, a user@host
+        # trick) is dropped, never requested.
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or parsed.hostname not in _FIA_HOSTS or parsed.username or parsed.password:
+            return
         if url in seen:
             return
         seen.add(url)

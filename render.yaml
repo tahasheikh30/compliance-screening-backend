@@ -4,7 +4,7 @@ services:
     runtime: python
     plan: free          # no disk is needed: everything is stored in Supabase
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips='*'"
+    startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT --no-server-header --proxy-headers --forwarded-allow-ips='*'"
     healthCheckPath: /api/health
     envVars:
       - key: ALLOWED_ORIGINS

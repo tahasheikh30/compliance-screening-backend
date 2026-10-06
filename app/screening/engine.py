@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 from app.config import MATCH_THRESHOLD, MAX_MATCHES, MAX_THRESHOLD, MIN_THRESHOLD
 from app.errors import logger
-from app.screening import loader, parsers
+from app.screening import loader, names, parsers
 from app.screening.parsers import normalize_cnic
 from app.screening.names import NameScorer
 from concurrent.futures import ThreadPoolExecutor
@@ -29,6 +29,20 @@ SOURCE_LABELS = {
     "ADVERSE_MEDIA": "Adverse media (open news search)",
 }
 SOURCE_ORDER = ("UNSC", "OFAC", "UKSL", "FIA_REDBOOK", "NACTA", "ADVERSE_MEDIA")
+
+
+class UnscreenableName(ValueError):
+    """The name cannot be compared with the lists, so screening it would only ever look clear."""
+
+
+UNSCREENABLE_MESSAGE = ("The name must be written in Latin letters (for example MUHAMMAD ALI KHAN). Names typed in "
+                        "Urdu, Arabic or another script cannot be compared with the lists, and would wrongly look clear.")
+
+
+def check_screenable(name: str) -> None:
+    """Refuse a name that would produce no tokens, or that loses letters when normalised."""
+    if names.has_unsupported_script(name) or not names.tokens(name):
+        raise UnscreenableName(UNSCREENABLE_MESSAGE)
 
 
 def resolve_threshold(value) -> float:
@@ -84,7 +98,7 @@ def _rank(m: dict):
 
 
 def match_records(scorer: NameScorer, records: list, threshold: float, dob_year: str,
-                  cnic: str = "", father_scorer=None, limit: int | None = None) -> tuple:
+                  cnic: str = "", father_scorer=None, limit: int | None = None, index=None) -> tuple:
     """
     Returns (matches, total): the best `limit` potential matches (all of them when limit is None),
     ranked CNIC matches first and then by score, and how many records matched in all.
@@ -95,9 +109,16 @@ def match_records(scorer: NameScorer, records: list, threshold: float, dob_year:
 
     The result dicts (aliases, remarks, father's name scoring) are only built for the records that
     are kept, so a low threshold on a common name that matches thousands of records stays cheap.
+
+    With `index` (a names.RecordIndex built from these same records) only the records that can score at
+    all are visited, in list order; the outcome is identical to scanning every record.
     """
     cands = []   # (rank, record, best score, index of the best name); in record order, so ties keep it
-    for r in records:
+    if index is not None and threshold > 0 and index.size == len(records):
+        visit = (records[i] for i in index.candidates(scorer.q, cnic, threshold))
+    else:
+        visit = records
+    for r in visit:
         best, best_i = 0.0, 0
         for i, tk in enumerate(r.toks):
             s = scorer.score_tokens(tk)
@@ -119,6 +140,7 @@ def screen(name: str, dob: str = "", nationality: str = "", threshold=None,
     status ERROR / NOT_CONFIGURED, never as CLEAR.
     """
     name = str(name or "").strip()
+    check_screenable(name)
     dob = str(dob or "").strip()
     nationality = str(nationality or "").strip()
     thr = resolve_threshold(threshold)
@@ -145,7 +167,8 @@ def screen(name: str, dob: str = "", nationality: str = "", threshold=None,
         g = groups[key]
         lists_meta.extend(g.meta)
         # a low threshold on a common name must not produce a huge response: keep the best MAX_MATCHES
-        matches, found_count = (match_records(scorer, g.records, thr, dob_year, cnic, father_scorer, limit=MAX_MATCHES)
+        matches, found_count = (match_records(scorer, g.records, thr, dob_year, cnic, father_scorer, limit=MAX_MATCHES,
+                                           index=g.index)
                                 if g.available else ([], 0))
         total_records += len(g.records)
         sanctions_hits += found_count

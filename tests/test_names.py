@@ -23,7 +23,7 @@ def test_honorifics_and_particles_removed_but_common_surnames_kept():
     ("MUHAMMAD ALI KHAN", 100, 100),
     ("Khan, Muhammad Ali", 100, 100),          # order does not matter
     ("Dr. Muhammad Ali Khan", 100, 100),       # titles ignored
-    ("Mohammad Ali Khan", 95, 99.9),           # transliteration variant
+    ("Mohammad Ali Khan", 100, 100),           # transliteration variants of one name are folded together
     ("Ahmed Raza", 0, 0),                      # unrelated
 ])
 def test_scores(cand, low, high):
