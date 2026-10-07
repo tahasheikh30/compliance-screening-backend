@@ -24,6 +24,8 @@ class ScreenRequest(BaseModel):
     threshold: Optional[float] = None
     cnic: Optional[str] = Field(default=None, max_length=20)
     father_name: Optional[str] = Field(default=None, max_length=200)
+    # Enrol this person in continuous monitoring: they are screened again whenever a watch list changes.
+    monitor: bool = False
 
     @field_validator("full_name")
     @classmethod
@@ -113,6 +115,7 @@ class ScreenResponse(BaseModel):
     records_screened: Optional[int] = None
     sanctions_hit_count: Optional[int] = None
     media_hit_count: Optional[int] = None
+    monitored: bool = False
 
 
 class ApplicantSummary(BaseModel):
@@ -124,6 +127,8 @@ class ApplicantSummary(BaseModel):
     dob: Optional[str] = None
     nationality: Optional[str] = None
     screened_by: Optional[str] = None   # email of the analyst who ran it (shown to admins, who see everyone's)
+    monitored: bool = False
+    last_monitored_at: Optional[str] = None
 
 
 class MeOut(BaseModel):
@@ -175,3 +180,57 @@ class AuditVerifyOut(BaseModel):
     checked: int
     first_bad_id: Optional[int] = None
     head: Optional[str] = None
+
+
+class MonitoringIn(BaseModel):
+    enabled: bool
+
+
+class MonitoringOut(BaseModel):
+    applicant_id: int
+    monitored: bool
+    monitored_since: Optional[str] = None
+    last_monitored_at: Optional[str] = None
+    new_alerts: int = 0       # found by the check that runs at the moment of enrolment
+
+
+class AlertOut(BaseModel):
+    id: int
+    applicant_id: int
+    applicant_name: str
+    source: str
+    list: str = ""
+    ref: str
+    matched_name: Optional[str] = None
+    score: Optional[float] = None
+    status: Literal["open", "confirmed", "dismissed"]
+    created_at: str
+    decided_at: Optional[str] = None
+    note: Optional[str] = None
+    match: Optional[dict] = None   # the full potential match, as in a screening result
+
+
+class AlertDecisionIn(BaseModel):
+    status: Literal["open", "confirmed", "dismissed"]
+    note: Optional[str] = Field(default=None, max_length=500)
+
+    @field_validator("note")
+    @classmethod
+    def clean_note(cls, v):
+        v = _CONTROL.sub("", v).strip() if v else v
+        return v or None
+
+
+class SourceMonitoringOut(BaseModel):
+    source: str
+    last_checked_at: Optional[str] = None
+    applicants_checked: Optional[int] = None
+    new_alerts: Optional[int] = None
+
+
+class MonitoringStatusOut(BaseModel):
+    enabled: bool
+    interval_seconds: float
+    monitored_applicants: int
+    open_alerts: int
+    sources: List[SourceMonitoringOut]

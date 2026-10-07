@@ -28,7 +28,12 @@ from psycopg_pool import ConnectionPool
 from app import config
 
 _SCHEMA = Path(__file__).with_name("schema.sql").read_text(encoding="utf-8")
+# Every advisory lock key the app uses, in one place so two features can never pick the same number (a clash
+# makes one feature wait for the other, or for itself).
 _ADMIN_LOCK = 727_274_001   # serialises changes to who is an admin, so the last admin cannot be removed by a race
+SCHEMA_LOCK = _ADMIN_LOCK + 1       # init_db: several servers starting at once
+AUDIT_LOCK = _ADMIN_LOCK + 2        # one writer at a time, so the audit hash chain has a single order
+MONITORING_LOCK = 727_274_010       # one instance at a time runs the continuous monitoring check
 
 _pool: ConnectionPool | None = None
 _pool_lock = threading.Lock()
@@ -88,7 +93,7 @@ def close_pool() -> None:
 def init_db() -> None:
     """Open the pool and make sure every table exists (idempotent; safe with several servers starting at once)."""
     with pool().connection() as conn:
-        conn.execute("SELECT pg_advisory_xact_lock(%s)", (_ADMIN_LOCK + 1,))
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_LOCK,))
         conn.execute(_SCHEMA)
 
 
@@ -384,7 +389,7 @@ def audit(action: str, actor_id=None, actor_email=None, via="token", target_type
     actor_id = str(uuid.UUID(str(actor_id))) if actor_id else None   # one spelling, so the hash re-computes
     detail = _plain(detail)
     with pool().connection() as conn:
-        conn.execute("SELECT pg_advisory_xact_lock(%s)", (_ADMIN_LOCK + 2,))
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", (AUDIT_LOCK,))
         last = conn.execute("SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
         prev = last["row_hash"] if last else AUDIT_GENESIS
         row_hash = _audit_hash(prev, at, actor_id, actor_email, via, action, target_type, target_id,
@@ -434,3 +439,136 @@ def audit_verify() -> dict:
                     return {"ok": False, "checked": checked, "first_bad_id": r["id"], "head": None}
                 prev, checked, last_id = r["row_hash"], checked + 1, r["id"]
     return {"ok": True, "checked": checked, "first_bad_id": None, "head": prev if checked else None}
+
+
+# --------------------------------------------------------------------------
+# Continuous monitoring
+# --------------------------------------------------------------------------
+
+def set_monitoring(applicant_id: int, enabled: bool, user_id=None) -> dict | None:
+    """Enrol or un-enrol one screening. With user_id, only if that user ran it. Returns the row, or None."""
+    scope, args = ("", []) if user_id is None else (" AND user_id = %s", [user_id])
+    if enabled:
+        sql = ("UPDATE applicants SET monitored = true, "
+               "monitored_since = CASE WHEN monitored THEN monitored_since ELSE now() END WHERE id = %s")
+    else:
+        sql = "UPDATE applicants SET monitored = false WHERE id = %s"
+    with pool().connection() as conn:
+        return _clean(conn.execute(sql + scope + " RETURNING *", [applicant_id] + args).fetchone())
+
+
+def monitored_batch(after_id: int, limit: int = 500) -> list:
+    """The next monitored applicants after `after_id`, with what is needed to screen them again."""
+    with pool().connection() as conn:
+        return [_clean(r) for r in conn.execute(
+            "SELECT id, user_id, full_name, cnic, father_name, dob, nationality, threshold FROM applicants "
+            "WHERE monitored AND id > %s ORDER BY id LIMIT %s", (after_id, limit)).fetchall()]
+
+
+def baseline_matches(applicant_ids: list) -> dict:
+    """
+    {applicant_id: {(source, list, id), ...}}: the matches already found when each person was first screened, so
+    only a NEW match is alerted. (An alert that was raised later is excluded by the unique key instead.)
+    """
+    out: dict = {}
+    if not applicant_ids:
+        return out
+    with pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT r.applicant_id, r.source, m->>'list' AS list, m->>'id' AS ref FROM screening_results r "
+            "CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(r.payload->'matches') = 'array' "
+            "THEN r.payload->'matches' ELSE '[]'::jsonb END) m WHERE r.applicant_id = ANY(%s)",
+            (list(applicant_ids),)).fetchall()
+    for r in rows:
+        out.setdefault(r["applicant_id"], set()).add((r["source"], r["list"] or "", r["ref"] or ""))
+    return out
+
+
+def add_alert(applicant_id: int, source: str, list_name: str, ref: str, matched_name: str, score: float,
+              payload: dict) -> int | None:
+    """Record a new potential match. Returns the alert id, or None if this match was already alerted."""
+    with pool().connection() as conn:
+        row = conn.execute(
+            "INSERT INTO monitoring_alerts (applicant_id, source, list, ref, matched_name, score, payload) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (applicant_id, source, list, ref) DO NOTHING "
+            "RETURNING id", (applicant_id, source, list_name or "", str(ref), matched_name, score, Jsonb(payload))
+        ).fetchone()
+        return row["id"] if row else None
+
+
+def mark_monitored_checked(applicant_ids: list) -> None:
+    if applicant_ids:
+        with pool().connection() as conn:
+            conn.execute("UPDATE applicants SET last_monitored_at = now() WHERE id = ANY(%s)", (list(applicant_ids),))
+
+
+_ALERT_COLS = ("al.id, al.applicant_id, a.full_name AS applicant_name, al.source, al.list, al.ref, al.matched_name, "
+               "al.score, al.payload, al.status, al.created_at, al.decided_at, al.note")
+
+
+def _alert_row(row: dict | None) -> dict | None:
+    d = _clean(row)
+    if d is not None:
+        d["match"] = d.pop("payload", None)
+    return d
+
+
+def list_alerts(user_id=None, status=None, limit=100, offset=0) -> tuple:
+    """(rows, total): alerts newest first. With user_id only those on that user's own screenings."""
+    where, args = [], []
+    if user_id is not None:
+        where.append("a.user_id = %s")
+        args.append(user_id)
+    if status:
+        where.append("al.status = %s")
+        args.append(status)
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    frm = " FROM monitoring_alerts al JOIN applicants a ON a.id = al.applicant_id"
+    with pool().connection() as conn:
+        rows = conn.execute("SELECT " + _ALERT_COLS + frm + clause + " ORDER BY al.id DESC LIMIT %s OFFSET %s",
+                            args + [limit, offset]).fetchall()
+        total = conn.execute("SELECT count(*) AS n" + frm + clause, args).fetchone()["n"]
+    return [_alert_row(r) for r in rows], total
+
+
+def get_alert(alert_id: int, user_id=None) -> dict | None:
+    sql = ("SELECT " + _ALERT_COLS + " FROM monitoring_alerts al JOIN applicants a ON a.id = al.applicant_id "
+           "WHERE al.id = %s")
+    args: list = [alert_id]
+    if user_id is not None:
+        sql, args = sql + " AND a.user_id = %s", args + [user_id]
+    with pool().connection() as conn:
+        return _alert_row(conn.execute(sql, args).fetchone())
+
+
+def decide_alert(alert_id: int, status: str, note: str | None, decided_by) -> None:
+    with pool().connection() as conn:
+        conn.execute("UPDATE monitoring_alerts SET status = %s, note = %s, decided_by = %s, "
+                     "decided_at = CASE WHEN %s = 'open' THEN NULL ELSE now() END WHERE id = %s",
+                     (status, note, decided_by, status, alert_id))
+
+
+def monitoring_state() -> dict:
+    """{source: {'fingerprint', 'checked_at', 'rescreened', 'new_alerts'}}"""
+    with pool().connection() as conn:
+        return {r["source"]: _clean(r) for r in conn.execute("SELECT * FROM monitoring_state").fetchall()}
+
+
+def monitoring_state_put(source: str, fingerprint: str, rescreened: int, new_alerts: int) -> None:
+    with pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO monitoring_state (source, fingerprint, checked_at, rescreened, new_alerts) "
+            "VALUES (%s, %s, now(), %s, %s) ON CONFLICT (source) DO UPDATE SET fingerprint = EXCLUDED.fingerprint, "
+            "checked_at = now(), rescreened = EXCLUDED.rescreened, new_alerts = EXCLUDED.new_alerts",
+            (source, fingerprint, rescreened, new_alerts))
+
+
+def monitoring_counts(user_id=None) -> dict:
+    """How many applicants are monitored and how many alerts are open (only the user's own, with user_id)."""
+    scope, args = ("", []) if user_id is None else (" AND user_id = %s", [user_id])
+    with pool().connection() as conn:
+        monitored = conn.execute("SELECT count(*) AS n FROM applicants WHERE monitored" + scope, args).fetchone()["n"]
+        open_alerts = conn.execute(
+            "SELECT count(*) AS n FROM monitoring_alerts al JOIN applicants a ON a.id = al.applicant_id "
+            "WHERE al.status = 'open'" + scope.replace("user_id", "a.user_id"), args).fetchone()["n"]
+    return {"monitored_applicants": monitored, "open_alerts": open_alerts}

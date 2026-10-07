@@ -151,7 +151,16 @@ Identical to the workflow:
 
 ### Speed
 
-Each list is indexed by name token when it loads. A screening scores the applicant's tokens against the list's unique tokens, then visits only records that could still reach the threshold (a record that holds one of three names cannot score 85). The result is **identical** to scanning every record (`tests/test_matching_quality.py` compares the two on random lists, with repeated tokens and at thresholds from 50 to 100) but far cheaper. On a synthetic 65,000-name list, a screening for the most common name shapes (MUHAMMAD ALI KHAN) takes about 14 ms instead of 290 ms; for a less common name, about 0.1 ms instead of 230 ms. List downloads happen in the background, so a screening never waits for them.
+Each list is indexed by name token when it loads. A screening scores the applicant's tokens against the list's unique tokens, then visits only records that could still reach the threshold (a record that holds one of three names cannot score 85). The result is **identical** to scanning every record (`tests/test_matching_quality.py` compares the two on random lists, with repeated tokens and at thresholds from 50 to 100) but far cheaper. Measured on a synthetic 65,000-name list (not the real lists), against 200 to 305 ms for the full scan:
+
+| Name | First look at its words | Repeated |
+|---|---|---|
+| MUHAMMAD ALI KHAN (the heaviest case) | about 36 ms | about 15 ms |
+| MOHAMMED HUSSAIN SHAH | about 22 ms | about 9 ms |
+| ABDUL RAHMAN MALIK | about 14 ms | about 3 ms |
+| An uncommon name | about 8 ms | about 0.1 ms |
+
+"First look" is the cost of comparing a word with every distinct word on the list; it is remembered until that list reloads. List downloads happen in the background, so a screening never waits for them.
 
 ### Names that cannot be screened
 
@@ -178,6 +187,7 @@ All endpoints except `/api/health` need **both** `X-API-Key: <APP_API_KEY>` (whi
 | POST | `/api/admin/users/{id}/role` | admin | `{"role": "admin" or "user"}` |
 | GET | `/api/admin/audit` | admin | Who did what, newest first (`?limit=`, `?offset=`, `?action=`, `?actor_id=`) |
 | GET | `/api/admin/audit/verify` | admin | Re-computes the audit hash chain (6/hour) |
+| | | | See **Continuous monitoring** above for the monitoring endpoints |
 | GET | `/api/health` | anyone | Liveness (`?deep=true` also checks the database) |
 
 Problems come back with a stable `error.code`: `AUTH_MISSING_KEY` and `AUTH_INVALID_KEY` (the app's key is missing or wrong: a deployment mistake, not the person's), `AUTH_NOT_CONFIGURED` (503, `APP_API_KEY` not set), `AUTH_REQUIRED`, `AUTH_INVALID_TOKEN`, `AUTH_TOKEN_EXPIRED` (sign in again), `ACCOUNT_PENDING`, `ACCOUNT_REJECTED`, `ADMIN_ONLY`. A database outage is `DATABASE_UNAVAILABLE` (503).
@@ -212,6 +222,42 @@ The response has one result row per source (`UNSC`, `OFAC`, `UKSL`, `FIA_REDBOOK
 ### Evidence PDF
 
 One PDF per screening, generated when there is any hit (watch list or news). It has the same sections as the workflow's report: result banner, summary cards, applicant, screening details, per-list status and result, method note, one card per match, adverse media, and a reviewer decision block. It is attached to every `HIT` and `REVIEW` row of that screening.
+
+## Continuous monitoring
+
+A screening is a photograph of one day. Someone who is clear today can be listed next week, so people can be **enrolled in monitoring** and are screened again automatically whenever a watch list changes.
+
+**Enrol** a person when you screen them (`"monitor": true` in `POST /api/screen`) or later with `POST /api/applicants/{id}/monitoring` and `{"enabled": true}`. Enrolling later also checks them against the current lists straight away, so someone screened weeks ago is not left unchecked until the next list update. Monitoring is opt-in on purpose: it keeps personal data and re-checks it, so it is a decision for each person. `{"enabled": false}` stops it.
+
+**How it decides to re-screen.** Every list has a fingerprint, a hash of its records' ids, names, dates of birth and CNICs. The fingerprint each list had when everyone was last checked is stored in the database. Every `MONITOR_INTERVAL_SECONDS` (default 900) the current fingerprints are compared; for each list that changed, every monitored person is screened against that list only, with the same matcher, threshold, CNIC and father's name as their original screening.
+
+**What becomes an alert.** Only a **new** potential match: not one the person already had when first screened, and not one already alerted. A match is therefore raised once, however many times a list changes, and the original screening is never rewritten.
+
+| | |
+|---|---|
+| `GET /api/monitoring/alerts` | New potential matches, newest first. `?status=open` (default), `confirmed` or `dismissed`; `?limit=`, `?offset=`; `X-Total-Count` has the total. Analysts see alerts on their own screenings, admins see all |
+| `POST /api/monitoring/alerts/{id}/decision` | `{"status": "confirmed" or "dismissed" or "open", "note": "..."}`: a person's decision, with who and when |
+| `GET /api/monitoring/status` | Whether monitoring is on, how many people are watched, how many alerts are open, when each list was last checked |
+| `POST /api/admin/monitoring/run` | Admin: run the check now. `?force=true` re-screens everyone against every list |
+
+**Safe by construction.**
+- A list that could not be loaded is skipped, never read as "the list became empty", and its stored fingerprint is not moved.
+- The stored fingerprint moves forward only after every monitored person was checked. An interrupted run is repeated at the next pass, and the unique key on (person, list, record) makes the repeat harmless.
+- A database lock means only one server instance runs the check at a time.
+- A stored name that cannot be screened (for example one saved in another script) is **counted and reported** (`skipped_unscreenable`), never passed as clear.
+- A list seen for the first time is only recorded; people screened before monitoring existed are checked when they are enrolled.
+- Everything is in the audit trail (`monitoring.enrol`, `monitoring.alert`, `monitoring.decision`, `monitoring.run`), with ids only.
+
+**Notification.** Set `MONITOR_WEBHOOK_URL` and it is called when new alerts appear, with a JSON body of alert and applicant **ids only** (never a name), signed with HMAC-SHA256 in `X-Signature: sha256=...` if `MONITOR_WEBHOOK_SECRET` is set. The address must be `https` and not internal. There is no email; the webhook can feed one.
+
+**Capacity.** Re-screening is background work on one core. On a synthetic 65,000-name list it is about 10 ms per person per changed list (about 6,000 people a minute). Several lists changing in one pass multiply that, so 5,000 monitored people and three changed lists is a few minutes.
+
+**What monitoring does not do.**
+- It does not repeat the **adverse media** search. That is a per-person web search with unverified results; run it by hand when you want fresh news.
+- It does not alert on a list **removal** or on a changed detail of a match that was already reported.
+- A person's original screening keeps at most 50 matches per list, so for a very common name at a low threshold, matches beyond the 50th were not recorded and may alert later as if new.
+- It needs the lists to be up. A list that is down for days is not checked, and the status page shows it.
+- Monitored people's names and CNICs stay in the database for as long as they are monitored. Decide your retention policy before enrolling people.
 
 ## Security
 

@@ -104,3 +104,15 @@ MAX_DOWNLOAD_BYTES = int(_float_env("MAX_DOWNLOAD_MB", 120) * 1024 * 1024)
 # The interactive docs (/docs, /redoc, /openapi.json) describe every route to anyone who asks, so they are off
 # unless you turn them on (local development).
 ENABLE_DOCS = os.environ.get("ENABLE_DOCS", "").strip().lower() in ("1", "true", "yes")
+
+
+# --- Continuous monitoring -----------------------------------------------
+# Applicants who are enrolled in monitoring are re-screened whenever a watch list changes. The check runs in the
+# background every MONITOR_INTERVAL_SECONDS (at least 60). Set MONITORING=false to switch the background check off
+# (an admin can still run it by hand).
+MONITORING_ENABLED = os.environ.get("MONITORING", "true").strip().lower() not in ("0", "false", "no")
+MONITOR_INTERVAL_SECONDS = max(60.0, _float_env("MONITOR_INTERVAL_SECONDS", 900))
+# Optional: told when new alerts appear. The message holds alert and applicant ids only, never a name, and is signed
+# with HMAC-SHA256 (X-Signature: sha256=...) when MONITOR_WEBHOOK_SECRET is set.
+MONITOR_WEBHOOK_URL = os.environ.get("MONITOR_WEBHOOK_URL", "").strip()
+MONITOR_WEBHOOK_SECRET = os.environ.get("MONITOR_WEBHOOK_SECRET", "").strip()

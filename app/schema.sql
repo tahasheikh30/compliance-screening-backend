@@ -114,9 +114,47 @@ DROP TRIGGER IF EXISTS audit_log_no_change ON audit_log;
 CREATE TRIGGER audit_log_no_change BEFORE UPDATE OR DELETE ON audit_log
     FOR EACH ROW EXECUTE FUNCTION audit_log_append_only();
 
+-- Continuous monitoring. An applicant is only re-screened when someone enrolled them (monitored); keeping
+-- someone under watch is a decision, not a default. monitoring_alerts holds each NEW potential match found
+-- by a re-screen: the unique key means a match is raised once, however many times a list changes.
+ALTER TABLE applicants ADD COLUMN IF NOT EXISTS monitored          boolean NOT NULL DEFAULT false;
+ALTER TABLE applicants ADD COLUMN IF NOT EXISTS monitored_since    timestamptz;
+ALTER TABLE applicants ADD COLUMN IF NOT EXISTS last_monitored_at  timestamptz;
+CREATE INDEX IF NOT EXISTS idx_applicants_monitored ON applicants (id) WHERE monitored;
+
+CREATE TABLE IF NOT EXISTS monitoring_alerts (
+    id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    applicant_id   bigint NOT NULL REFERENCES applicants (id) ON DELETE CASCADE,
+    source         text NOT NULL,
+    list           text NOT NULL DEFAULT '',
+    ref            text NOT NULL,
+    matched_name   text,
+    score          double precision,
+    payload        jsonb,
+    status         text NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'confirmed', 'dismissed')),
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    decided_at     timestamptz,
+    decided_by     uuid REFERENCES profiles (id) ON DELETE SET NULL,
+    note           text,
+    UNIQUE (applicant_id, source, list, ref)
+);
+CREATE INDEX IF NOT EXISTS idx_alerts_status ON monitoring_alerts (status, id DESC);
+CREATE INDEX IF NOT EXISTS idx_alerts_decided_by ON monitoring_alerts (decided_by);
+
+-- The fingerprint of each source the last time every monitored applicant was checked against it.
+CREATE TABLE IF NOT EXISTS monitoring_state (
+    source       text PRIMARY KEY,
+    fingerprint  text NOT NULL,
+    checked_at   timestamptz NOT NULL DEFAULT now(),
+    rescreened   integer NOT NULL DEFAULT 0,
+    new_alerts   integer NOT NULL DEFAULT 0
+);
+
 ALTER TABLE profiles          ENABLE ROW LEVEL SECURITY;
 ALTER TABLE applicants        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE screening_results ENABLE ROW LEVEL SECURITY;
 ALTER TABLE evidence_files    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE nacta_list        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_log         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE monitoring_alerts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE monitoring_state  ENABLE ROW LEVEL SECURITY;

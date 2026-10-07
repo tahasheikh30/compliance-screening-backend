@@ -17,6 +17,7 @@ The n8n workflow downloaded every list on every run. This module does the same
 Nothing is written to disk and no API key is needed.
 """
 
+import hashlib
 import ipaddress
 import re
 import threading
@@ -64,14 +65,31 @@ class GroupData:
     error: str | None = None                      # set when the whole source could not be screened
     loaded_at: float = field(default_factory=time.time)
     _index: "names.RecordIndex | None" = field(default=None, repr=False, compare=False)
+    _fingerprint: str | None = field(default=None, repr=False, compare=False)
 
     @property
     def available(self) -> bool:
         return self.error is None
 
     def warm(self) -> None:
-        """Build the token index now (off the request path) so the first screening does not pay for it."""
+        """Build the token index and fingerprint now (off the request path) so the first screening does not pay for them."""
         _ = self.index
+        _ = self.fingerprint
+
+    @property
+    def fingerprint(self) -> str:
+        """
+        A hash of what screening depends on: every record's list, id, names, date of birth and CNIC. It is the same
+        whenever the publisher's content is the same (download time and publication dates are not part of it), so a
+        different value means the list really changed. Continuous monitoring uses it to know when to re-screen.
+        """
+        if self._fingerprint is None:
+            h = hashlib.sha256()
+            for row in sorted((r.list, str(r.id), r.primary, "|".join(r.names), r.dob, r.cnic) for r in self.records):
+                h.update("\x1f".join(row).encode("utf-8"))
+                h.update(b"\x1e")
+            self._fingerprint = h.hexdigest()
+        return self._fingerprint
 
     @property
     def index(self) -> "names.RecordIndex | None":

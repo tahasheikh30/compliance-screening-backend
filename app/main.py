@@ -32,6 +32,10 @@ Endpoints:
     GET  /api/admin/users                 (admin) people who signed up, ?status=pending to see who is waiting
     POST /api/admin/users/{id}/status     (admin) approve or reject someone
     POST /api/admin/users/{id}/role       (admin) make someone an admin, or a normal user again
+    POST /api/applicants/{id}/monitoring  enrol a screened person in continuous monitoring (or stop)
+    GET  /api/monitoring/alerts           new potential matches found by re-screening; /decision records the outcome
+    GET  /api/monitoring/status           monitoring state: people watched, open alerts, last check per list
+    POST /api/admin/monitoring/run        (admin) run the check now (?force=true re-screens everyone)
     GET  /api/admin/audit                 (admin) who did what, paged; /api/admin/audit/verify checks the hash chain
     GET  /api/health                      unauthenticated liveness check (?deep=true also checks the database)
 """
@@ -54,10 +58,12 @@ from app import database as db
 from app import evidence
 from app import config as app_config
 from app import auth
+from app import monitoring
 from app.auth import AuthUser, require_admin, require_admin_or_service_key, require_approved
 from app.config import FIA_REQUIRED, NACTA_REQUIRED, PRELOAD_LISTS
 from app.errors import AppError, configure_logging, install as install_error_handlers, request_context, logger
-from app.schemas import (ApplicantSummary, AuditEntryOut, AuditPageOut, AuditVerifyOut, MeOut, ScreenRequest, ScreenResponse, ScreeningResultOut, UserOut,
+from app.schemas import (AlertDecisionIn, AlertOut, ApplicantSummary, AuditEntryOut, AuditPageOut, AuditVerifyOut, MeOut,
+                         MonitoringIn, MonitoringOut, MonitoringStatusOut, SourceMonitoringOut, ScreenRequest, ScreenResponse, ScreeningResultOut, UserOut,
                          UserRoleIn, UserStatusIn)
 from app.screening import engine, loader, nacta_store, parsers
 
@@ -81,6 +87,7 @@ async def lifespan(_app: FastAPI):
     try:
         yield
     finally:
+        monitoring.stop()
         loader.stop_background_refresh()
         db.close_pool()
 
@@ -158,6 +165,9 @@ def _startup():
         logger.info("API_KEY is not set: the scheduled NACTA upload by access key is disabled.")
     if PRELOAD_LISTS and loader.start_background_refresh():
         logger.info("Loading the screening lists in the background and keeping them fresh")
+    if monitoring.start():
+        logger.info("Continuous monitoring is on: monitored applicants are re-screened when a list changes "
+                    "(checked every %d s)", int(app_config.MONITOR_INTERVAL_SECONDS))
 
 
 
@@ -244,6 +254,9 @@ def screen_applicant(request: Request, req: ScreenRequest, user: AuthUser = Depe
     db.save_screening(applicant_id, overall, result["total_records"], rows,
                       evidence=evidence_pdf, evidence_failed=evidence_failed)
 
+    if req.monitor:
+        db.set_monitoring(applicant_id, True)
+        _audit(request, user, "monitoring.enrol", "applicant", applicant_id)
     _audit(request, user, "screening.run", "applicant", applicant_id,
            {"overall_status": overall, "threshold": threshold, "sanctions_hits": result["sanctions_hit_count"],
             "media_hits": result["media_hit_count"], "evidence": bool(evidence_pdf)})
@@ -254,6 +267,7 @@ def screen_applicant(request: Request, req: ScreenRequest, user: AuthUser = Depe
         applicant_id=applicant_id, full_name=req.full_name, overall_status=overall, results=results_out,
         case_ref=case_ref, threshold=threshold, records_screened=result["total_records"],
         sanctions_hit_count=result["sanctions_hit_count"], media_hit_count=result["media_hit_count"],
+        monitored=req.monitor,
     )
 
 
@@ -286,7 +300,7 @@ def get_applicant(request: Request, applicant_id: int, user: AuthUser = Depends(
         applicant_id=applicant_id, full_name=applicant["full_name"], overall_status=applicant["overall_status"],
         results=[ScreeningResultOut(**r) for r in results],
         case_ref=_case_ref(applicant_id, when), threshold=applicant.get("threshold"),
-        records_screened=applicant.get("records_screened"),
+        records_screened=applicant.get("records_screened"), monitored=bool(applicant.get("monitored")),
     )
 
 
@@ -465,6 +479,82 @@ def set_user_status(request: Request, user_id: uuid.UUID, body: UserStatusIn, us
 def set_user_role(request: Request, user_id: uuid.UUID, body: UserRoleIn, user: AuthUser = Depends(require_admin)):
     """Make a user an admin, or a normal user again."""
     return _change_user(request, user_id, user, role=body.role)
+
+
+# --------------------------------------------------------------------------
+# Continuous monitoring
+# --------------------------------------------------------------------------
+
+@app.post("/api/applicants/{applicant_id}/monitoring", response_model=MonitoringOut)
+@limiter.limit("30/minute")
+def set_applicant_monitoring(request: Request, applicant_id: int, body: MonitoringIn,
+                             user: AuthUser = Depends(require_approved)):
+    """
+    Put a screened person under continuous monitoring (or take them out): they are screened again whenever a
+    watch list changes, and any NEW potential match becomes an alert. Enrolling also checks them against the
+    current lists straight away, so someone screened weeks ago is not left unchecked until the next list update.
+    """
+    applicant = db.get_applicant(applicant_id, _scope(user))
+    if not applicant:
+        raise HTTPException(404, "Applicant not found")
+    if body.enabled:
+        try:
+            engine.check_screenable(applicant["full_name"])
+        except engine.UnscreenableName as exc:
+            raise AppError(422, "NAME_NOT_SCREENABLE", str(exc), "Screen the person again with the name in Latin letters.") from None
+    db.set_monitoring(applicant_id, body.enabled, _scope(user))
+    new_alerts = len(monitoring.check_applicant(applicant_id)) if body.enabled else 0
+    _audit(request, user, "monitoring.enrol" if body.enabled else "monitoring.stop", "applicant", applicant_id,
+           {"new_alerts": new_alerts} if body.enabled else None)
+    row = db.get_applicant(applicant_id) or {}
+    return MonitoringOut(applicant_id=applicant_id, monitored=bool(row.get("monitored")),
+                         monitored_since=row.get("monitored_since"), last_monitored_at=row.get("last_monitored_at"),
+                         new_alerts=new_alerts)
+
+
+@app.get("/api/monitoring/alerts", response_model=list[AlertOut])
+@limiter.limit("60/minute")
+def monitoring_alerts(request: Request, response: Response,
+                      status: Literal["open", "confirmed", "dismissed"] | None = "open",
+                      limit: int = Query(100, ge=1, le=200), offset: int = Query(0, ge=0, le=1_000_000),
+                      user: AuthUser = Depends(require_approved)):
+    """New potential matches found by re-screening, newest first (default: the open ones). X-Total-Count has the total."""
+    rows, total = db.list_alerts(_scope(user), status, limit, offset)
+    response.headers["X-Total-Count"] = str(total)
+    return rows
+
+
+@app.post("/api/monitoring/alerts/{alert_id}/decision", response_model=AlertOut)
+@limiter.limit("60/minute")
+def decide_monitoring_alert(request: Request, alert_id: int, body: AlertDecisionIn,
+                            user: AuthUser = Depends(require_approved)):
+    """Record a person's decision on an alert: confirmed (a real match) or dismissed (someone else with the same name)."""
+    if not db.get_alert(alert_id, _scope(user)):
+        raise AppError(404, "ALERT_NOT_FOUND", "No alert with that ID.")
+    db.decide_alert(alert_id, body.status, body.note, user.id)
+    _audit(request, user, "monitoring.decision", "alert", alert_id, {"status": body.status})
+    return db.get_alert(alert_id, _scope(user))
+
+
+@app.get("/api/monitoring/status", response_model=MonitoringStatusOut)
+@limiter.limit("60/minute")
+def monitoring_status(request: Request, user: AuthUser = Depends(require_approved)):
+    """Whether monitoring is on, how many people are watched, how many alerts are open, and when each list was last checked."""
+    state = db.monitoring_state()
+    return MonitoringStatusOut(
+        enabled=app_config.MONITORING_ENABLED, interval_seconds=app_config.MONITOR_INTERVAL_SECONDS,
+        **db.monitoring_counts(_scope(user)),
+        sources=[SourceMonitoringOut(source=k, last_checked_at=(state.get(k) or {}).get("checked_at"),
+                                     applicants_checked=(state.get(k) or {}).get("rescreened"),
+                                     new_alerts=(state.get(k) or {}).get("new_alerts")) for k in loader.SOURCE_KEYS])
+
+
+@app.post("/api/admin/monitoring/run")
+@limiter.limit("6/hour")
+def run_monitoring_now(request: Request, force: bool = False, user: AuthUser = Depends(require_admin)):
+    """Run the monitoring check now. `force=true` re-screens every monitored person against every list, changed or not."""
+    _audit(request, user, "monitoring.run_requested", detail={"force": force})
+    return monitoring.run_once(force=force)
 
 
 @app.get("/api/admin/audit", response_model=AuditPageOut)

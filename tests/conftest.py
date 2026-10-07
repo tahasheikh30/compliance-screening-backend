@@ -40,6 +40,7 @@ os.environ["SUPABASE_JWT_SECRET"] = JWT_SECRET
 os.environ["ALLOWED_ORIGINS"] = "http://localhost:5173"
 os.environ["LIST_CACHE_TTL_SECONDS"] = "0"
 os.environ["PRELOAD_LISTS"] = "false"
+os.environ["MONITORING"] = "false"          # tests run the check themselves, never in the background
 os.environ.pop("REQUIRE_APP_KEY", None)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -95,7 +96,7 @@ def storage():
         db.init_db()
         _schema_ready = True
     with db.pool().connection() as conn:
-        conn.execute("TRUNCATE evidence_files, nacta_list, screening_results, applicants, profiles, audit_log RESTART IDENTITY CASCADE")
+        conn.execute("TRUNCATE evidence_files, nacta_list, screening_results, applicants, profiles, audit_log, monitoring_state RESTART IDENTITY CASCADE")
         for uid, role, status in ((ADMIN_ID, "admin", "approved"), (USER_ID, "user", "approved"),
                                   (USER2_ID, "user", "approved"), (PENDING_ID, "user", "pending"),
                                   (REJECTED_ID, "user", "rejected")):
