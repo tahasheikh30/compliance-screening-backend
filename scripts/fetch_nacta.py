@@ -19,8 +19,15 @@ is no web address a program can fetch. A browser can click the button, so this s
     # watch it work (a visible browser window), useful the first time
     python scripts/fetch_nacta.py --show
 
+NACTA asks for a reCAPTCHA ("Please verify to download") before it lets the list be exported, and a script must not
+get past that. Unattended (headless) runs, such as the scheduled GitHub workflow, therefore stop straight away with a
+clear message and exit code 4. To run it with a person present, use --show: a browser window opens, tick "I'm not a
+robot", and the script carries on with the download, the checks and the upload.
+
+    python scripts/fetch_nacta.py --show --upload
+
 Exit codes: 0 done, 1 could not download, 2 the file could not be read or looks incomplete (too few people, or far fewer than the page shows),
-3 the upload was refused.
+3 the upload was refused, 4 NACTA showed a reCAPTCHA that nobody solved (headless run, or not solved in time).
 
 If NACTA changes the page and the button cannot be found, the script saves nacta_debug.png and prints
 what it could see, so the cause can be fixed quickly.
@@ -31,6 +38,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -41,9 +49,70 @@ DEFAULT_URL = "https://nfs.nacta.gov.pk/"
 MIN_EXPECTED = 1000          # the Fourth Schedule has several thousand people; far fewer means a partial export
 COUNT_WARN = 0.02            # a difference from the count shown on the page above this is reported
 COUNT_FAIL = 0.10            # above this the file is refused: it is probably partial and must not replace a good list
+CAPTCHA_WAIT = 300           # seconds a person gets to tick the reCAPTCHA when the browser window is shown
+CAPTCHA_RECLICK_AFTER = 5    # seconds after the dialog closes before the export button is clicked once more
+
+CAPTCHA_HEADLESS_MESSAGE = (
+    "NACTA now shows a reCAPTCHA (\"Please verify to download\") before it lets the list be exported, so this cannot "
+    "run unattended. Nothing was downloaded or uploaded. Run it where a person can tick the box: "
+    "python scripts/fetch_nacta.py --show --upload  (a browser window opens, tick \"I'm not a robot\", and the script "
+    "carries on). Or download the JSON in your own browser and upload it on the Lists page."
+)
 
 
-def fetch_with_browser(url: str, fmt: str, out_dir: Path, timeout_s: int, show: bool) -> tuple:
+class CaptchaRequired(Exception):
+    """NACTA is asking for a reCAPTCHA that nobody solved. The message says what to do."""
+
+
+def captcha_showing(page) -> bool:
+    """True while NACTA's 'Please verify to download' dialog (the reCAPTCHA) is on screen."""
+    try:
+        if page.get_by_text(re.compile(r"verify\s+to\s+download", re.I)).first.is_visible():
+            return True
+        return page.locator("iframe[title='reCAPTCHA']").first.is_visible()
+    except Exception:
+        return False
+
+
+def await_download(page, downloads: list, click, show: bool, timeout_s: int, captcha_wait_s: int, now=time.monotonic):
+    """
+    Clicks the export button (click()) and waits for the browser's download event (the page's handler appends each
+    download to `downloads`). If the reCAPTCHA appears: a headless run stops at once with CaptchaRequired; with the
+    window shown, the person gets captcha_wait_s seconds to tick it, and once the dialog closes the button is clicked
+    once more if the site has not started the download by itself.
+    """
+    click()
+    deadline = now() + timeout_s
+    captcha_seen = False
+    closed_at = None
+    reclicked = False
+    while True:
+        if downloads:
+            return downloads[0]
+        if captcha_showing(page):
+            if not show:
+                raise CaptchaRequired(CAPTCHA_HEADLESS_MESSAGE)
+            if not captcha_seen:
+                captcha_seen = True
+                print(f"NACTA is asking for a reCAPTCHA. Tick \"I'm not a robot\" in the browser window; "
+                      f"waiting up to {captcha_wait_s} seconds.", file=sys.stderr)
+                deadline = now() + captcha_wait_s
+            closed_at = None
+        elif captcha_seen and not reclicked:
+            closed_at = closed_at if closed_at is not None else now()
+            if now() - closed_at >= CAPTCHA_RECLICK_AFTER:
+                reclicked = True
+                click()
+                deadline = now() + timeout_s
+        if now() > deadline:
+            if captcha_seen and not reclicked:
+                raise CaptchaRequired(f"The reCAPTCHA was not solved within {captcha_wait_s} seconds, so nothing was downloaded.")
+            raise TimeoutError(f"No download started within {timeout_s} seconds"
+                               + (" after the reCAPTCHA was solved." if captcha_seen else " (no reCAPTCHA was shown)."))
+        page.wait_for_timeout(300)
+
+
+def fetch_with_browser(url: str, fmt: str, out_dir: Path, timeout_s: int, show: bool, captcha_wait_s: int = CAPTCHA_WAIT) -> tuple:
     """Returns (path of the downloaded file, the 'Total Results' count shown on the page or None)."""
     from playwright.sync_api import sync_playwright
 
@@ -52,6 +121,8 @@ def fetch_with_browser(url: str, fmt: str, out_dir: Path, timeout_s: int, show: 
         browser = p.chromium.launch(headless=not show)
         context = browser.new_context(accept_downloads=True, locale="en-US", viewport={"width": 1366, "height": 900})
         page = context.new_page()
+        downloads: list = []
+        page.on("download", lambda d: downloads.append(d))
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=60_000)
             # A Blazor Server page draws itself only once its connection to the server is up, so wait
@@ -63,13 +134,17 @@ def fetch_with_browser(url: str, fmt: str, out_dir: Path, timeout_s: int, show: 
 
             # the label may be styled upper case, so match it ignoring case
             button = page.get_by_text(re.compile(rf"^\s*{fmt}\s*$", re.I)).first
-            with page.expect_download(timeout=timeout_s * 1000) as info:
-                button.click()
-            download = info.value
+            download = await_download(page, downloads, button.click, show, timeout_s, captcha_wait_s)
             name = download.suggested_filename or f"nacta.{fmt}"
             path = out_dir / re.sub(r"[^A-Za-z0-9._-]", "_", name)
             download.save_as(path)
             return path, total
+        except CaptchaRequired:
+            try:
+                page.screenshot(path=str(out_dir / "nacta_debug.png"), full_page=True)
+            except Exception:
+                pass
+            raise
         except Exception:
             try:
                 page.screenshot(path=str(out_dir / "nacta_debug.png"), full_page=True)
@@ -126,6 +201,8 @@ def main(argv=None) -> int:
                     help="which export button to click (default json; excel is saved but cannot be uploaded)")
     ap.add_argument("--out", default="nacta_download", help="folder for the downloaded file")
     ap.add_argument("--timeout", type=int, default=120, help="seconds to wait for the page and the download")
+    ap.add_argument("--captcha-wait", type=int, default=CAPTCHA_WAIT,
+                    help="with --show: seconds to wait for a person to tick the reCAPTCHA (default %(default)s)")
     ap.add_argument("--min-records", type=int, default=MIN_EXPECTED)
     ap.add_argument("--show", action="store_true", help="show the browser window")
     ap.add_argument("--upload", action="store_true", help="upload the file to the screening backend")
@@ -138,7 +215,10 @@ def main(argv=None) -> int:
         return 3
 
     try:
-        path, total = fetch_with_browser(args.url, args.format, Path(args.out), args.timeout, args.show)
+        path, total = fetch_with_browser(args.url, args.format, Path(args.out), args.timeout, args.show, args.captcha_wait)
+    except CaptchaRequired as exc:
+        print(f"Could not download the NACTA list: {exc}", file=sys.stderr)
+        return 4
     except Exception as exc:
         print(f"Could not download the NACTA list: {type(exc).__name__}: {str(exc)[:300]}", file=sys.stderr)
         return 1
