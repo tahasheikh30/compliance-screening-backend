@@ -116,3 +116,14 @@ MONITOR_INTERVAL_SECONDS = max(60.0, _float_env("MONITOR_INTERVAL_SECONDS", 900)
 # with HMAC-SHA256 (X-Signature: sha256=...) when MONITOR_WEBHOOK_SECRET is set.
 MONITOR_WEBHOOK_URL = os.environ.get("MONITOR_WEBHOOK_URL", "").strip()
 MONITOR_WEBHOOK_SECRET = os.environ.get("MONITOR_WEBHOOK_SECRET", "").strip()
+
+
+# --- Batch screening -------------------------------------------------------
+# One uploaded file of applicants, screened row by row in the background. Each row is a normal screening.
+BATCH_MAX_ROWS = max(1, int(_float_env("BATCH_MAX_ROWS", 500)))
+BATCH_MAX_FILE_BYTES = int(_float_env("BATCH_MAX_FILE_MB", 10) * 1024 * 1024)
+# How many batches may run at once on this server. Each one is sequential, so this bounds the load the lists,
+# the news search and the database see.
+BATCH_MAX_RUNNING = max(1, int(_float_env("BATCH_MAX_RUNNING", 2)))
+# A short pause between rows, so a long file does not hammer the news search.
+BATCH_ROW_DELAY_SECONDS = max(0.0, _float_env("BATCH_ROW_DELAY_SECONDS", 0.5))

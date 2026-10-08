@@ -66,6 +66,21 @@ Approval, rejection and role changes take effect on the next request. The last a
 
 Supabase free projects are paused after a week of inactivity, and the free plan has no automatic backups: for real compliance records, export the tables now and then, or move to a paid plan. Applicant names and CNICs are personal data held by a third party cloud service, so check that this is allowed where you work and pick the region on purpose.
 
+## Batch screening
+
+`POST /api/batch` screens a whole file of applicants. Send an Excel (`.xlsx`, `.xls`), CSV or Word (`.docx`, first table) file as the **raw request body** (not a multipart form) with the name in `?filename=`; `?threshold=` and `?monitor=true` apply to every row. The server replies `202` with a batch and screens the rows one after the other in the background. Poll `GET /api/batches/{id}` for progress.
+
+- **The file.** The column names are in the first row. Only `Full name` is required; `Date of birth`, `Nationality`, `CNIC`, `Father or husband` and `Province` are optional (common alternative headings such as `Name`, `DOB` and `NIC` are understood). At most `BATCH_MAX_ROWS` (500) rows and `BATCH_MAX_FILE_MB` (10) MB.
+- **Every row is an ordinary screening.** It appears in the person's history, has a case and an evidence PDF, and can be monitored. Nothing about a batch needs a new screen in the frontend to be trustworthy: open a row's `applicant_id` like any other case.
+- **A bad row never rejects the file and never looks clear.** A row with no name, a name in Urdu or another script, or a value that is too long is reported on its own row as `invalid` with the reason; a row whose screening raised an error is `failed`; a row that was not reached (Cancel, restart) stays `pending`. Only a `screened` row has an outcome.
+- **One batch per person at a time** (enforced by the database), and at most `BATCH_MAX_RUNNING` (2) batches running on the server. `POST /api/batches/{id}/cancel` stops after the current row.
+- **Restarts.** The rows are held in memory while a batch runs. If the server restarts, the batch is marked `interrupted` on the next start; rows already screened are kept. Render's free plan sleeps only when idle, and a running batch keeps it awake. This assumes **one server instance**: a second instance starting would mark the first one's running batches interrupted.
+- **Downloads.** `GET /api/batches/{id}/results.xlsx` (one line per row of the uploaded file, text stored as text so a name can never become a formula) and `GET /api/batches/{id}/evidence.zip` (every evidence PDF with a `manifest.csv` of SHA-256 hashes).
+- **Privacy.** A batch is visible only to the person who uploaded it, administrators included, like history. The audit trail records the batch (file hash, row count, outcomes) and each row's screening carries the batch id, never a name.
+- **Safety of uploads.** Spreadsheets and Word files are zip archives: the declared uncompressed size is checked before unpacking, and XML is read with `defusedxml`.
+
+Deploy note: the new tables (`batches`, `batch_rows`) are created by the backend on start. If you run `supabase/setup.sql` by hand, run it again so the public API's access to them is revoked too.
+
 ## NACTA Proscribed Persons
 
 NACTA publishes the Fourth Schedule list (about 5,300 people) at `nfs.nacta.gov.pk`, which has Excel,

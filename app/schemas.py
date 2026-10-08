@@ -238,3 +238,33 @@ class MonitoringStatusOut(BaseModel):
     monitored_applicants: int
     open_alerts: int
     sources: List[SourceMonitoringOut]
+
+
+class BatchRowOut(BaseModel):
+    row: int                              # the row in the uploaded file
+    full_name: str
+    # pending: waiting its turn. screened: has a case (applicant_id). invalid: the row itself was unusable.
+    # failed: the screening raised an error. Only a screened row has an outcome; nothing else is ever "clear".
+    state: Literal["pending", "screened", "invalid", "failed"]
+    error: Optional[str] = None
+    applicant_id: Optional[int] = None
+    overall_status: Optional[str] = None
+    sanctions: Optional[int] = None       # potential matches across the sanctions and watch lists
+    news: Optional[int] = None            # adverse news articles found
+    case_ref: Optional[str] = None
+    dob: Optional[str] = None             # what the file said, for the case view (as in the history list)
+    nationality: Optional[str] = None
+
+
+class BatchOut(BaseModel):
+    id: int
+    filename: str
+    status: Literal["running", "done", "cancelled", "interrupted"]
+    total: int
+    done: int                             # rows no longer pending (screened, invalid or failed)
+    threshold: float
+    monitor: bool
+    created_at: str
+    finished_at: Optional[str] = None
+    counts: dict
+    rows: List[BatchRowOut] = []

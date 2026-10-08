@@ -21,6 +21,9 @@ API_KEY on its own, for the scheduled workflow.
 Endpoints:
     GET  /api/me                          who you are and whether you are approved (works while pending)
     POST /api/screen                      run a screening for one applicant (rate limited)
+    POST /api/batch                       screen a whole file (Excel, CSV or Word table) in the background
+    GET  /api/batches/{id}                progress and per-row results; /cancel stops it; /results.xlsx and
+                                          /evidence.zip download the outcome (a batch is private to its uploader)
     GET  /api/applicants                  your past screenings (admins: everyone's; ?mine=true for their own)
     GET  /api/applicants/{id}             full result for one screening
     GET  /api/applicants/{id}/evidence    evidence PDF of a screening that found something
@@ -43,8 +46,10 @@ Endpoints:
 """
 
 import hashlib
+import io
 import os
 import uuid
+import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Literal
@@ -60,11 +65,14 @@ from app import database as db
 from app import evidence
 from app import config as app_config
 from app import auth
+from app import batch as batch_runner
+from app import batch_files
 from app import monitoring
 from app.auth import AuthUser, require_admin, require_admin_or_service_key, require_approved
 from app.config import FIA_REQUIRED, NACTA_REQUIRED, PRELOAD_LISTS
 from app.errors import AppError, configure_logging, install as install_error_handlers, request_context, logger
-from app.schemas import (AlertDecisionIn, AlertOut, ApplicantSummary, AuditEntryOut, AuditPageOut, AuditVerifyOut, MeOut,
+from app.schemas import (AlertDecisionIn, AlertOut, ApplicantSummary, AuditEntryOut, AuditPageOut, AuditVerifyOut,
+                         BatchOut, BatchRowOut, MeOut,
                          MonitoringIn, MonitoringOut, MonitoringStatusOut, SourceMonitoringOut, ScreenRequest, ScreenResponse, ScreeningResultOut, UserOut,
                          UserRoleIn, UserStatusIn)
 from app.screening import engine, loader, nacta_store, parsers
@@ -165,6 +173,12 @@ def _startup():
                        "who opens the app could replace the NACTA list. Give them different values.")
     if not auth.API_KEY:
         logger.info("API_KEY is not set: the scheduled NACTA upload by access key is disabled.")
+    try:
+        n = db.batch_interrupt_running()
+        if n:
+            logger.warning("%d batch(es) were still running when the server stopped and are marked interrupted", n)
+    except Exception:
+        logger.exception("Could not mark interrupted batches")
     if PRELOAD_LISTS and loader.start_background_refresh():
         logger.info("Loading the screening lists in the background and keeping them fresh")
     if monitoring.start():
@@ -173,7 +187,7 @@ def _startup():
 
 
 
-def _audit(request: Request, user: AuthUser, action: str, target_type: str | None = None, target_id=None,
+def _audit(request: Request | None, user: AuthUser, action: str, target_type: str | None = None, target_id=None,
            detail: dict | None = None) -> None:
     """
     Record who did what (ids and outcomes only, never an applicant's name or CNIC). A failure to write the
@@ -181,8 +195,8 @@ def _audit(request: Request, user: AuthUser, action: str, target_type: str | Non
     """
     try:
         db.audit(action, actor_id=user.id, actor_email=user.email, via=user.via, target_type=target_type,
-                 target_id=target_id, detail=detail, request_id=getattr(request.state, "request_id", None),
-                 ip=request.client.host if request.client else None)
+                 target_id=target_id, detail=detail, request_id=getattr(request.state, "request_id", None) if request else None,
+                 ip=request.client.host if request and request.client else None)
     except Exception:
         logger.exception("AUDIT WRITE FAILED for %s (target %s)", action, target_id)
 
@@ -206,6 +220,15 @@ def me(request: Request, user: AuthUser = Depends(auth.authenticate)):
 @app.post("/api/screen", response_model=ScreenResponse)
 @limiter.limit("10/minute")
 def screen_applicant(request: Request, req: ScreenRequest, user: AuthUser = Depends(require_approved)):
+    return _screen_one(req, user, request)
+
+
+def _screen_one(req: ScreenRequest, user: AuthUser, request: Request | None = None,
+                batch_id: int | None = None) -> ScreenResponse:
+    """
+    One screening, saved to the person's history. Used by the screening route and, row by row, by a batch
+    (which has no request: it runs in a background thread, so the audit entry carries the batch id instead).
+    """
     now = datetime.now(timezone.utc)
     threshold = engine.resolve_threshold(req.threshold)
     try:
@@ -259,10 +282,12 @@ def screen_applicant(request: Request, req: ScreenRequest, user: AuthUser = Depe
 
     if req.monitor:
         db.set_monitoring(applicant_id, True)
-        _audit(request, user, "monitoring.enrol", "applicant", applicant_id)
+        _audit(request, user, "monitoring.enrol", "applicant", applicant_id,
+               {"batch_id": batch_id} if batch_id is not None else None)
     _audit(request, user, "screening.run", "applicant", applicant_id,
            {"overall_status": overall, "threshold": threshold, "sanctions_hits": result["sanctions_hit_count"],
-            "media_hits": result["media_hit_count"], "evidence": bool(evidence_pdf)})
+            "media_hits": result["media_hit_count"], "evidence": bool(evidence_pdf),
+            **({"batch_id": batch_id} if batch_id is not None else {})})
     results_out = [
         ScreeningResultOut(**r) for r in db.get_results_for_applicant(applicant_id)
     ]
@@ -272,6 +297,157 @@ def screen_applicant(request: Request, req: ScreenRequest, user: AuthUser = Depe
         sanctions_hit_count=result["sanctions_hit_count"], media_hit_count=result["media_hit_count"],
         monitored=req.monitor,
     )
+
+
+# --------------------------------------------------------------------------
+# Batch screening: upload a file of applicants, screen it in the background, poll for progress
+# --------------------------------------------------------------------------
+
+def _batch_out(user_batch: dict, with_rows: bool = True) -> BatchOut:
+    rows = db.batch_rows(user_batch["id"])
+    out_rows = []
+    for r in rows:
+        when = db._when(r["submitted_at"]) if r.get("submitted_at") else None
+        out_rows.append(BatchRowOut(
+            row=r["row_no"], full_name=r["full_name"], state=r["state"], error=r.get("error"),
+            applicant_id=r["applicant_id"], overall_status=r.get("overall_status"),
+            sanctions=r["sanctions"] if r["state"] == "screened" else None,
+            news=r["news"] if r["state"] == "screened" else None,
+            case_ref=_case_ref(r["applicant_id"], when) if r["state"] == "screened" and when else None,
+            dob=r.get("dob"), nationality=r.get("nationality")))
+    counts = {"screened": 0, "invalid": 0, "failed": 0, "pending": 0,
+              "ESCALATE_TO_COMPLIANCE": 0, "MANUAL_REVIEW": 0, "AUTO_CLEAR": 0}
+    for r in out_rows:
+        counts[r.state] += 1
+        if r.state == "screened" and r.overall_status in counts:
+            counts[r.overall_status] += 1
+    return BatchOut(
+        id=user_batch["id"], filename=user_batch["filename"], status=user_batch["status"], total=user_batch["total"],
+        done=user_batch["total"] - counts["pending"], threshold=user_batch["threshold"],
+        monitor=bool(user_batch["monitor"]), created_at=user_batch["created_at"],
+        finished_at=user_batch.get("finished_at"), counts=counts, rows=out_rows if with_rows else [])
+
+
+def _own_batch(user: AuthUser, batch_id: int) -> dict:
+    # like history: only the person who uploaded a batch can see it, administrators included
+    b = db.batch_get(batch_id, user.id)
+    if not b:
+        raise AppError(404, "BATCH_NOT_FOUND", "No batch with that ID.")
+    return b
+
+
+@app.post("/api/batch", response_model=BatchOut, status_code=202)
+@limiter.limit("20/hour")
+async def start_batch(request: Request, filename: str = Query("applicants.xlsx", max_length=255),
+                      threshold: float | None = None, monitor: bool = False,
+                      user: AuthUser = Depends(require_approved)):
+    """
+    Screen a whole file. Send the Excel, CSV or Word file as the request body (not a multipart form), with the
+    file name in ?filename=. Every row is screened in the background as an ordinary screening; poll
+    GET /api/batches/{id} for progress. A row that cannot be screened is reported on its own row, it does not
+    reject the file.
+    """
+    name = os.path.basename(filename.replace("\\", "/"))
+    if batch_files.extension_of(name) not in batch_files.ALLOWED_EXTENSIONS:
+        raise AppError(415, "BATCH_FILE_TYPE", "That file type is not supported.",
+                       "Use an Excel file (.xlsx or .xls), a CSV, or a Word file (.docx).")
+    data = await request.body()
+    if not data:
+        raise AppError(400, "BATCH_FILE_EMPTY", "The upload was empty.", "Choose the file again and retry.")
+    if len(data) > app_config.BATCH_MAX_FILE_BYTES:
+        raise AppError(413, "BATCH_FILE_TOO_LARGE", "That file is too large.",
+                       f"The limit is {app_config.BATCH_MAX_FILE_BYTES // (1024 * 1024)} MB. Split it into smaller files.")
+    if db.batch_running_count(user.id):
+        raise AppError(409, "BATCH_ALREADY_RUNNING", "You already have a batch running.",
+                       "Wait for it to finish, or cancel it, before starting another.")
+    if not batch_runner.capacity_left():
+        raise AppError(429, "BATCH_BUSY", "The server is busy with other batches.", "Try again in a few minutes.")
+
+    thr = engine.resolve_threshold(threshold)
+    try:
+        parsed = await run_in_threadpool(batch_files.parse_applicants, data, name, app_config.BATCH_MAX_ROWS)
+    except batch_files.BatchFileError as exc:
+        raise AppError(422, exc.code, exc.message, exc.hint) from None
+    prepared = batch_runner.prepare_rows(parsed, thr, monitor)
+    usable = [(row, req) for row, req in prepared if req is not None]
+    if not usable:
+        first = next((row["error"] for row, _ in prepared if row.get("error")), None)
+        raise AppError(422, "BATCH_NO_VALID_ROWS", "None of the rows in that file could be screened.",
+                       f"First problem: {first}" if first else None)
+
+    try:
+        batch_id = db.batch_create(user.id, name[:200], thr, monitor, [row for row, _ in prepared])
+    except db.BatchAlreadyRunning:
+        raise AppError(409, "BATCH_ALREADY_RUNNING", "You already have a batch running.",
+                       "Wait for it to finish, or cancel it, before starting another.") from None
+    _audit(request, user, "batch.start", "batch", batch_id,
+           {"rows": len(prepared), "screenable": len(usable), "threshold": thr, "monitor": monitor,
+            "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+
+    def finished(status: str) -> None:
+        counts = {}
+        for r in db.batch_rows(batch_id):
+            key = r["overall_status"] if r["state"] == "screened" else r["state"]
+            counts[key] = counts.get(key, 0) + 1
+        _audit(None, user, "batch.finish", "batch", batch_id, {"status": status, "outcomes": counts})
+
+    batch_runner.start(batch_id, usable, lambda req: _screen_one(req, user, None, batch_id), finished)
+    return _batch_out(db.batch_get(batch_id))
+
+
+@app.get("/api/batches/{batch_id}", response_model=BatchOut)
+@limiter.limit("120/minute")
+def get_batch(request: Request, batch_id: int, user: AuthUser = Depends(require_approved)):
+    """Progress and per-row results of a batch. Poll this while status is 'running'."""
+    return _batch_out(_own_batch(user, batch_id))
+
+
+@app.post("/api/batches/{batch_id}/cancel", response_model=BatchOut)
+@limiter.limit("30/minute")
+def cancel_batch(request: Request, batch_id: int, user: AuthUser = Depends(require_approved)):
+    """Stop after the row being screened. Rows already screened are kept; the rest are reported as not screened."""
+    b = _own_batch(user, batch_id)
+    if b["status"] == "running" and batch_runner.cancel(batch_id):
+        _audit(request, user, "batch.cancel", "batch", batch_id)
+    return _batch_out(b)
+
+
+@app.get("/api/batches/{batch_id}/results.xlsx")
+@limiter.limit("30/minute")
+def download_batch_results(request: Request, batch_id: int, user: AuthUser = Depends(require_approved)):
+    """The batch as a spreadsheet: one line per row of the uploaded file, including rows that were not screened."""
+    b = _own_batch(user, batch_id)
+
+    def case_ref(r):
+        return _case_ref(r["applicant_id"], db._when(r["submitted_at"]))
+
+    content = batch_files.results_workbook(b, db.batch_rows(batch_id), case_ref)
+    _audit(request, user, "batch.results.download", "batch", batch_id, {"sha256": hashlib.sha256(content).hexdigest()})
+    return Response(content=content, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f'attachment; filename="screening-results-{batch_id}.xlsx"'})
+
+
+@app.get("/api/batches/{batch_id}/evidence.zip")
+@limiter.limit("10/minute")
+def download_batch_evidence(request: Request, batch_id: int, user: AuthUser = Depends(require_approved)):
+    """Every evidence PDF the batch produced, with a manifest of their SHA-256 hashes."""
+    _own_batch(user, batch_id)
+    files = db.batch_evidence(batch_id)
+    if not files:
+        raise AppError(404, "EVIDENCE_NOT_GENERATED", "This batch has no evidence PDFs.", _NO_EVIDENCE)
+    buf = io.BytesIO()
+    manifest = ["row,file,sha256"]
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for f in files:
+            safe = "".join(c for c in str(f["filename"]) if c.isalnum() or c in "._-") or "evidence.pdf"
+            member = f"row-{f['row_no']}-{safe}"
+            z.writestr(member, bytes(f["content"]))
+            manifest.append(f"{f['row_no']},{member},{f['sha256']}")
+        z.writestr("manifest.csv", "\r\n".join(manifest) + "\r\n")
+    _audit(request, user, "batch.evidence.download", "batch", batch_id, {"files": len(files)})
+    return Response(content=buf.getvalue(), media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="evidence-batch-{batch_id}.zip"'})
+
 
 
 @app.get("/api/applicants", response_model=list[ApplicantSummary])

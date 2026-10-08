@@ -9,3 +9,6 @@ slowapi==0.1.9
 psycopg[binary,pool]==3.3.6
 PyJWT[crypto]>=2.12,<3
 defusedxml>=0.7.1,<0.8
+
+openpyxl==3.1.5
+xlrd==2.0.1

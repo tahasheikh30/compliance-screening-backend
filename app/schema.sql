@@ -151,6 +151,38 @@ CREATE TABLE IF NOT EXISTS monitoring_state (
     new_alerts   integer NOT NULL DEFAULT 0
 );
 
+-- Batch screening. One row per uploaded file; each row of the file becomes a normal screening (an applicants
+-- row, with its evidence PDF) so history, case view and evidence work exactly as for a single screening.
+-- batch_rows records what happened to every row of the file, including rows that could not be screened
+-- (invalid: the row itself was unusable, failed: the screening raised an error). The rows' input is kept in
+-- memory while the batch runs and is not stored beyond the applicants row it produces.
+CREATE TABLE IF NOT EXISTS batches (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id      uuid REFERENCES profiles (id) ON DELETE SET NULL,
+    filename     text NOT NULL,
+    threshold    double precision NOT NULL,
+    monitor      boolean NOT NULL DEFAULT false,
+    status       text NOT NULL DEFAULT 'running'
+                 CHECK (status IN ('running', 'done', 'cancelled', 'interrupted')),
+    total        integer NOT NULL,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    finished_at  timestamptz
+);
+CREATE INDEX IF NOT EXISTS idx_batches_user ON batches (user_id, id DESC);
+-- one running batch per person, enforced by the database so two quick clicks cannot start two
+CREATE UNIQUE INDEX IF NOT EXISTS idx_batches_one_running ON batches (user_id) WHERE status = 'running';
+
+CREATE TABLE IF NOT EXISTS batch_rows (
+    batch_id      bigint NOT NULL REFERENCES batches (id) ON DELETE CASCADE,
+    row_no        integer NOT NULL,
+    full_name     text NOT NULL DEFAULT '',
+    state         text NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'screened', 'invalid', 'failed')),
+    applicant_id  bigint REFERENCES applicants (id) ON DELETE SET NULL,
+    error         text,
+    PRIMARY KEY (batch_id, row_no)
+);
+CREATE INDEX IF NOT EXISTS idx_batch_rows_applicant ON batch_rows (applicant_id);
+
 ALTER TABLE profiles          ENABLE ROW LEVEL SECURITY;
 ALTER TABLE applicants        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE screening_results ENABLE ROW LEVEL SECURITY;
@@ -159,3 +191,5 @@ ALTER TABLE nacta_list        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_log         ENABLE ROW LEVEL SECURITY;
 ALTER TABLE monitoring_alerts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE monitoring_state  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE batches           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE batch_rows        ENABLE ROW LEVEL SECURITY;

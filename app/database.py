@@ -21,6 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
@@ -45,6 +46,10 @@ class DatabaseNotConfigured(RuntimeError):
 
 class LastAdminError(Exception):
     """The change would leave the system without an approved admin."""
+
+
+class BatchAlreadyRunning(Exception):
+    """This person already has a batch running."""
 
 
 # --------------------------------------------------------------------------
@@ -573,3 +578,100 @@ def monitoring_counts(user_id=None) -> dict:
             "SELECT count(*) AS n FROM monitoring_alerts al JOIN applicants a ON a.id = al.applicant_id "
             "WHERE al.status = 'open'" + scope.replace("user_id", "a.user_id"), args).fetchone()["n"]
     return {"monitored_applicants": monitored, "open_alerts": open_alerts}
+
+
+# --------------------------------------------------------------------------
+# Batch screening
+# --------------------------------------------------------------------------
+
+def batch_create(user_id, filename: str, threshold: float, monitor: bool, rows: list) -> int:
+    """
+    Record an uploaded file and every row in it, in one transaction. `rows` is a list of dicts with row_no,
+    full_name, and either state 'pending' (will be screened) or state 'invalid' with an error message.
+    """
+    with pool().connection() as conn:
+        try:
+            b = conn.execute(
+                "INSERT INTO batches (user_id, filename, threshold, monitor, total) VALUES (%s, %s, %s, %s, %s) "
+                "RETURNING id", (user_id, filename, threshold, monitor, len(rows))).fetchone()
+        except psycopg.errors.UniqueViolation:
+            raise BatchAlreadyRunning() from None
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO batch_rows (batch_id, row_no, full_name, state, error) VALUES (%s, %s, %s, %s, %s)",
+                [(b["id"], r["row_no"], r["full_name"][:200], r["state"], r.get("error")) for r in rows])
+        return b["id"]
+
+
+def batch_row_screened(batch_id: int, row_no: int, applicant_id: int) -> None:
+    with pool().connection() as conn:
+        conn.execute("UPDATE batch_rows SET state = 'screened', applicant_id = %s, error = NULL "
+                     "WHERE batch_id = %s AND row_no = %s", (applicant_id, batch_id, row_no))
+
+
+def batch_row_failed(batch_id: int, row_no: int, error: str) -> None:
+    with pool().connection() as conn:
+        conn.execute("UPDATE batch_rows SET state = 'failed', error = %s WHERE batch_id = %s AND row_no = %s",
+                     (error[:500], batch_id, row_no))
+
+
+def batch_finish(batch_id: int, status: str) -> None:
+    with pool().connection() as conn:
+        conn.execute("UPDATE batches SET status = %s, finished_at = now() WHERE id = %s AND status = 'running'",
+                     (status, batch_id))
+
+
+def batch_interrupt_running() -> int:
+    """A batch still marked running when the server starts was cut off by a restart: say so. Returns how many."""
+    with pool().connection() as conn:
+        cur = conn.execute("UPDATE batches SET status = 'interrupted', finished_at = now() WHERE status = 'running'")
+        return cur.rowcount
+
+
+def batch_running_count(user_id=None) -> int:
+    sql, args = "SELECT count(*) AS n FROM batches WHERE status = 'running'", []
+    if user_id is not None:
+        sql, args = sql + " AND user_id = %s", [user_id]
+    with pool().connection() as conn:
+        return conn.execute(sql, args).fetchone()["n"]
+
+
+def batch_get(batch_id: int, user_id=None) -> dict | None:
+    """One batch. With user_id, only if that user uploaded it."""
+    sql, args = "SELECT * FROM batches WHERE id = %s", [batch_id]
+    if user_id is not None:
+        sql, args = sql + " AND user_id = %s", args + [user_id]
+    with pool().connection() as conn:
+        return _clean(conn.execute(sql, args).fetchone())
+
+
+def batch_rows(batch_id: int) -> list:
+    """Every row of a batch in file order, with the screening it produced (outcome and how many hits)."""
+    with pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT r.row_no, r.full_name, r.state, r.error, r.applicant_id, "
+            "       a.overall_status, a.submitted_at, a.dob, a.nationality, a.cnic, a.father_name, a.province, "
+            "       COALESCE(s.sanctions, 0) AS sanctions, COALESCE(s.news, 0) AS news "
+            "FROM batch_rows r "
+            "LEFT JOIN applicants a ON a.id = r.applicant_id "
+            "LEFT JOIN LATERAL ("
+            "    SELECT sum(CASE WHEN sr.source <> 'ADVERSE_MEDIA' "
+            "                    THEN COALESCE((sr.payload->>'match_count')::int, 0) ELSE 0 END)::int AS sanctions, "
+            "           sum(CASE WHEN sr.source = 'ADVERSE_MEDIA' AND jsonb_typeof(sr.payload->'articles') = 'array' "
+            "                    THEN jsonb_array_length(sr.payload->'articles') ELSE 0 END)::int AS news "
+            "    FROM screening_results sr WHERE sr.applicant_id = a.id) s ON true "
+            "WHERE r.batch_id = %s ORDER BY r.row_no", (batch_id,)).fetchall()
+    return [_clean(r) for r in rows]
+
+
+def batch_evidence(batch_id: int) -> list:
+    """(row_no, applicant_id, filename, content, sha256) of every evidence PDF a batch produced."""
+    with pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT r.row_no, r.applicant_id, e.filename, e.content, e.sha256 FROM batch_rows r "
+            "JOIN evidence_files e ON e.applicant_id = r.applicant_id WHERE r.batch_id = %s ORDER BY r.row_no",
+            (batch_id,)).fetchall()
+    for r in rows:
+        if not r["sha256"]:
+            r["sha256"] = hashlib.sha256(bytes(r["content"])).hexdigest()
+    return rows
