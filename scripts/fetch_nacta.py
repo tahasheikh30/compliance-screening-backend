@@ -19,6 +19,10 @@ is no web address a program can fetch. A browser can click the button, so this s
     # watch it work (a visible browser window), useful the first time
     python scripts/fetch_nacta.py --show
 
+The downloaded file is only a stepping stone: the list itself is stored in the database through the upload. By
+default the download goes to a temporary folder that is deleted when the script ends, so nothing is left on the
+computer. Pass --out FOLDER to keep the file (the scheduled workflow does, so it can keep its debug screenshot).
+
 NACTA asks for a reCAPTCHA ("Please verify to download") before it lets the list be exported, and a script must not
 get past that. Unattended (headless) runs, such as the scheduled GitHub workflow, therefore stop straight away with a
 clear message and exit code 4. To run it with a person present, use --show: a browser window opens, tick "I'm not a
@@ -37,7 +41,9 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -199,7 +205,10 @@ def main(argv=None) -> int:
     ap.add_argument("--url", default=DEFAULT_URL, help="the NACTA page (default %(default)s)")
     ap.add_argument("--format", default="json", choices=["json", "xml", "excel"],
                     help="which export button to click (default json; excel is saved but cannot be uploaded)")
-    ap.add_argument("--out", default="nacta_download", help="folder for the downloaded file")
+    ap.add_argument("--out", default=None,
+                    help="keep the downloaded file in this folder. Without it the file goes to a temporary folder that is "
+                         "deleted when the script ends (the list itself lives in the database); only --format excel, "
+                         "which is never uploaded, falls back to ./nacta_download")
     ap.add_argument("--timeout", type=int, default=120, help="seconds to wait for the page and the download")
     ap.add_argument("--captcha-wait", type=int, default=CAPTCHA_WAIT,
                     help="with --show: seconds to wait for a person to tick the reCAPTCHA (default %(default)s)")
@@ -214,8 +223,26 @@ def main(argv=None) -> int:
         print("--upload needs SCREENING_API_URL and SCREENING_API_KEY (or --api-url and --api-key).", file=sys.stderr)
         return 3
 
+    if args.out or args.format == "excel":
+        return _run(args, Path(args.out or "nacta_download"))
+
+    # The default: nothing is left on the computer. The download lives in a temporary folder that is removed when
+    # the script ends, whatever the outcome. Only when something went wrong is the debug screenshot kept (as
+    # ./nacta_debug.png), because it is the quickest way to see what the page showed.
+    with tempfile.TemporaryDirectory(prefix="nacta_") as tmp:
+        try:
+            return _run(args, Path(tmp))
+        finally:
+            shot = Path(tmp) / "nacta_debug.png"
+            if shot.exists():
+                kept = Path.cwd() / "nacta_debug.png"
+                shutil.copyfile(shot, kept)
+                print(f"A screenshot of what the page showed was kept as {kept}.", file=sys.stderr)
+
+
+def _run(args, out_dir: Path) -> int:
     try:
-        path, total = fetch_with_browser(args.url, args.format, Path(args.out), args.timeout, args.show, args.captcha_wait)
+        path, total = fetch_with_browser(args.url, args.format, out_dir, args.timeout, args.show, args.captcha_wait)
     except CaptchaRequired as exc:
         print(f"Could not download the NACTA list: {exc}", file=sys.stderr)
         return 4

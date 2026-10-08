@@ -150,3 +150,43 @@ def test_captcha_showing_is_false_when_the_page_errors():
         def get_by_text(self, *a, **k):
             raise RuntimeError("page closed")
     assert fetch_nacta.captcha_showing(Broken()) is False
+
+
+# --- where the downloaded file goes ----------------------------------------------------------------------------------
+
+def _fake_browser(monkeypatch, record_dir, fail=False):
+    def fake(url, fmt, out_dir, timeout_s, show, captcha_wait_s=300):
+        record_dir.append(Path(out_dir))
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if fail:
+            (out_dir / "nacta_debug.png").write_bytes(b"png")
+            raise RuntimeError("page changed")
+        return _file(out_dir, 1500), 1500
+    monkeypatch.setattr(fetch_nacta, "fetch_with_browser", fake)
+
+
+def test_default_download_goes_to_a_temporary_folder_that_is_removed(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    used = []
+    _fake_browser(monkeypatch, used)
+    monkeypatch.setattr(fetch_nacta, "upload", lambda *a: {"records": 1500, "uploaded_at": "now"})
+    assert fetch_nacta.main(["--upload", "--api-url", "http://x", "--api-key", "k"]) == 0
+    assert not used[0].exists()                         # the temporary folder is gone
+    assert list(tmp_path.iterdir()) == []               # and nothing was left in the working folder
+
+
+def test_a_failed_default_run_keeps_only_the_debug_screenshot(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    used = []
+    _fake_browser(monkeypatch, used, fail=True)
+    assert fetch_nacta.main([]) == 1
+    assert not used[0].exists()
+    assert [p.name for p in tmp_path.iterdir()] == ["nacta_debug.png"]
+
+
+def test_out_keeps_the_file(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    _fake_browser(monkeypatch, [])
+    assert fetch_nacta.main(["--out", "keep"]) == 0
+    assert (tmp_path / "keep" / "nacta.json").exists()

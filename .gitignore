@@ -5,3 +5,4 @@ __pycache__/
 .env.*
 !.env.example
 nacta_download/
+nacta_debug.png
