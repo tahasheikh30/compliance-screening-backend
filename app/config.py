@@ -33,6 +33,10 @@ DB_POOL_MAX = max(DB_POOL_MIN, int(_float_env("DB_POOL_MAX", 8)))
 # with the legacy shared secret (HS256); projects with asymmetric signing keys do not need it.
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "").strip()
+# SECRET. Needed only to delete a person's sign in account (the People tab's Delete). It can do anything to the
+# project's auth users, so it lives on the backend only, never in the frontend. Without it Delete is refused and
+# Disable still works.
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
 # Two different keys, because they have different jobs and different exposure:
 #

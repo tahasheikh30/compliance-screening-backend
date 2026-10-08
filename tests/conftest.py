@@ -97,7 +97,7 @@ def storage():
         db.init_db()
         _schema_ready = True
     with db.pool().connection() as conn:
-        conn.execute("TRUNCATE batch_rows, batches, evidence_files, nacta_list, screening_results, applicants, profiles, audit_log, monitoring_state RESTART IDENTITY CASCADE")
+        conn.execute("TRUNCATE deleted_users, batch_rows, batches, evidence_files, nacta_list, screening_results, applicants, profiles, audit_log, monitoring_state RESTART IDENTITY CASCADE")
         for uid, role, status in ((ADMIN_ID, "admin", "approved"), (USER_ID, "user", "approved"),
                                   (USER2_ID, "user", "approved"), (PENDING_ID, "user", "pending"),
                                   (REJECTED_ID, "user", "rejected")):

@@ -139,7 +139,7 @@ class MeOut(BaseModel):
     id: Optional[str]
     email: str
     role: str       # "user" or "admin"
-    status: str     # "pending", "approved" or "rejected"
+    status: str     # "pending", "approved", "rejected" or "disabled"
 
 
 class UserOut(BaseModel):
@@ -152,7 +152,13 @@ class UserOut(BaseModel):
 
 
 class UserStatusIn(BaseModel):
-    status: Literal["approved", "rejected", "pending"]
+    status: Literal["approved", "rejected", "pending", "disabled"]
+
+
+class UserDeletedOut(BaseModel):
+    id: str
+    email: str
+    sign_in_removed: bool       # the person's sign in account at the authentication service was removed too
 
 
 class UserRoleIn(BaseModel):

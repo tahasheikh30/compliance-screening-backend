@@ -15,6 +15,8 @@ services:
         sync: false     # secret: the Supabase "Session pooler" connection string, set in the Render dashboard
       - key: SUPABASE_JWT_SECRET
         sync: false     # only if the project still signs tokens with the legacy secret; otherwise leave empty
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false     # SECRET, optional: lets admins delete a person's sign in account (People tab). Without it Delete is refused; Disable still works
       - key: APP_API_KEY
         sync: false     # the key the frontend sends (VITE_API_KEY on Vercel must be the same value); not a secret
       - key: API_KEY

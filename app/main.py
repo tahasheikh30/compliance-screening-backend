@@ -66,6 +66,7 @@ from app import evidence
 from app import config as app_config
 from app import auth
 from app import batch as batch_runner
+from app import supabase_admin
 from app import batch_files
 from app import monitoring
 from app.auth import AuthUser, require_admin, require_admin_or_service_key, require_approved
@@ -73,7 +74,7 @@ from app.config import FIA_REQUIRED, NACTA_REQUIRED, PRELOAD_LISTS
 from app.errors import AppError, configure_logging, install as install_error_handlers, request_context, logger
 from app.schemas import (AlertDecisionIn, AlertOut, ApplicantSummary, AuditEntryOut, AuditPageOut, AuditVerifyOut,
                          BatchOut, BatchRowOut, MeOut,
-                         MonitoringIn, MonitoringOut, MonitoringStatusOut, SourceMonitoringOut, ScreenRequest, ScreenResponse, ScreeningResultOut, UserOut,
+                         MonitoringIn, MonitoringOut, MonitoringStatusOut, SourceMonitoringOut, ScreenRequest, ScreenResponse, ScreeningResultOut, UserDeletedOut, UserOut,
                          UserRoleIn, UserStatusIn)
 from app.screening import engine, loader, nacta_store, parsers
 
@@ -656,7 +657,7 @@ def _change_user(request: Request, user_id, admin: AuthUser, **changes) -> UserO
 
 @app.get("/api/admin/users", response_model=list[UserOut])
 @limiter.limit("60/minute")
-def list_users(request: Request, status: Literal["pending", "approved", "rejected"] | None = None,
+def list_users(request: Request, status: Literal["pending", "approved", "rejected", "disabled"] | None = None,
                user: AuthUser = Depends(require_admin)):
     """People who signed up, newest first. ?status=pending shows who is waiting for approval."""
     return [_user_out(p) for p in db.list_profiles(status)]
@@ -679,8 +680,52 @@ def list_user_applicants(request: Request, response: Response, user_id: uuid.UUI
 @app.post("/api/admin/users/{user_id}/status", response_model=UserOut)
 @limiter.limit("60/minute")
 def set_user_status(request: Request, user_id: uuid.UUID, body: UserStatusIn, user: AuthUser = Depends(require_admin)):
-    """Approve or reject a user."""
+    """Approve, reject, disable (or switch back on) a user. An admin cannot disable their own account."""
+    if body.status == "disabled" and str(user_id) == user.id:
+        raise AppError(409, "CANNOT_DISABLE_SELF", "You cannot disable your own account.",
+                       "Ask another administrator to do it.")
     return _change_user(request, user_id, user, status=body.status)
+
+
+@app.delete("/api/admin/users/{user_id}", response_model=UserDeletedOut)
+@limiter.limit("20/minute")
+def delete_user(request: Request, user_id: uuid.UUID, user: AuthUser = Depends(require_admin)):
+    """
+    Delete a person: their sign in account and their profile. Their past screenings stay in the history (with
+    nobody's name on them, visible to administrators only), so the compliance record is never lost.
+    The person is disabled first, so they are locked out at once and a failure half way never leaves them with
+    access. Refused for yourself, for the last administrator, and when the sign in service is not set up.
+    """
+    uid = str(user_id)
+    if uid == user.id:
+        raise AppError(409, "CANNOT_DELETE_SELF", "You cannot delete your own account.",
+                       "Ask another administrator to do it.")
+    if not supabase_admin.configured():
+        raise AppError(503, "USER_DELETE_NOT_CONFIGURED", "Deleting people is not set up on this server.",
+                       "Set SUPABASE_SERVICE_ROLE_KEY on the backend, or use Disable instead.")
+    try:
+        profile = db.update_profile(uid, status="disabled", decided_by=user.id)   # locks them out; keeps the last admin
+    except db.LastAdminError:
+        raise AppError(409, "LAST_ADMIN", "That would leave the tool without an administrator.",
+                       "Make someone else an admin first.") from None
+    if profile is None:
+        raise AppError(404, "USER_NOT_FOUND", "No user with that ID.")
+    auth.invalidate_profile(uid)
+    try:
+        removed = supabase_admin.delete_auth_user(uid)
+    except supabase_admin.AuthServiceError as exc:
+        logger.error("Deleting user %s: %s", uid, exc)
+        _audit(request, user, "user.delete.failed", "user", uid, {"email": profile["email"]})
+        raise AppError(502, "USER_DELETE_FAILED", "The account was disabled but could not be removed.",
+                       "The sign in service did not answer. Try Delete again in a moment.") from None
+    try:
+        db.delete_profile(uid)
+    except db.LastAdminError:       # cannot happen once they are disabled; never delete the last admin regardless
+        raise AppError(409, "LAST_ADMIN", "That would leave the tool without an administrator.") from None
+    auth.invalidate_profile(uid)
+    _audit(request, user, "user.delete", "user", uid, {"email": profile["email"], "sign_in_removed": removed})
+    logger.info("User %s deleted by %s", uid, user.id or user.via)
+    return UserDeletedOut(id=uid, email=profile["email"], sign_in_removed=removed)
 
 
 @app.post("/api/admin/users/{user_id}/role", response_model=UserOut)

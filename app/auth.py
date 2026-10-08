@@ -13,6 +13,8 @@ verified and the person looked up in the `profiles` table:
   * status "pending"  : signed up, waiting for an admin. Can only call GET /api/me.
   * status "approved" : can screen applicants and see their own screening history.
   * status "rejected" : refused.
+  * status "disabled" : an admin switched the account off; refused until an admin switches it back on.
+  * deleted           : the profile is gone and the person cannot come back with an old token (401).
   * role "admin"      : an approved user who also sees everyone's history, approves new users,
                         and manages the lists.
 
@@ -57,7 +59,7 @@ class AuthUser:
     id: str | None          # None for the API key
     email: str
     role: str               # "user" or "admin"
-    status: str             # "pending", "approved" or "rejected"
+    status: str             # "pending", "approved", "rejected" or "disabled"
     via: str = "token"      # "token" (a signed in person) or "service" (the API key on the NACTA upload)
 
     @property
@@ -165,6 +167,10 @@ def _profile(user_id: str, email: str) -> dict:
     if hit and hit[0] > now:
         return hit[1]
     prof = db.get_profile(user_id)
+    if prof is None and db.is_deleted_user(user_id):
+        # an admin deleted this person; their old token must not quietly create a new pending profile
+        raise AppError(401, "AUTH_ACCOUNT_DELETED", "This account has been deleted.",
+                       "Contact the compliance team if you think that is a mistake.")
     if prof is None or (email and prof["email"] != email):
         # a user the sign up trigger has not seen (pending), or an email that changed
         prof = db.upsert_profile(user_id, email)
@@ -239,6 +245,9 @@ def require_approved(user: AuthUser = Depends(authenticate)) -> AuthUser:
     if user.status == "pending":
         raise AppError(403, "ACCOUNT_PENDING", "Your account is waiting for approval by an administrator.",
                        "You can use the tool as soon as it has been approved.")
+    if user.status == "disabled":
+        raise AppError(403, "ACCOUNT_DISABLED", "Your account has been disabled by an administrator.",
+                       "Contact an administrator to have it switched back on.")
     if user.status == "rejected":
         raise AppError(403, "ACCOUNT_REJECTED", "Your account request was declined.",
                        "Contact an administrator if you think this is a mistake.")

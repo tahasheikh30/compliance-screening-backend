@@ -36,7 +36,13 @@ The tables are in `app/schema.sql` (the backend applies it on start, it is safe 
 | Screen, own history and evidence | no | yes | yes |
 | Everyone's history, user approval, list refresh, NACTA upload | no | no | yes |
 
-Approval, rejection and role changes take effect on the next request. The last admin cannot be demoted or rejected.
+Approval, rejection, disabling and role changes take effect on the next request (other server instances see them within about 10 seconds). The last admin cannot be demoted, rejected, disabled or deleted.
+
+### Disabling and deleting people
+
+- **Disable** (`POST /api/admin/users/{id}/status` with `{"status": "disabled"}`) switches an account off without losing anything: the person gets `403 ACCOUNT_DISABLED`, a batch they have running stops before its next row, and **Enable** is the same call with `{"status": "approved"}`. You cannot disable yourself.
+- **Delete** (`DELETE /api/admin/users/{id}`) removes the person's sign in account at Supabase and their profile. It disables them first, so they are locked out at once and a failure half way never leaves them with access (the call then answers `502 USER_DELETE_FAILED`; try again). **Their past screenings stay**, with nobody's name on them and visible to administrators only, so the compliance record is never lost; the audit trail records who deleted whom. A deleted person's old token is refused with `401 AUTH_ACCOUNT_DELETED` instead of creating a new pending profile. You cannot delete yourself or the last administrator.
+- Delete needs **`SUPABASE_SERVICE_ROLE_KEY`** on the backend (Supabase dashboard, Project Settings, API Keys: the `service_role` or secret key). It is a powerful secret: set it only in the Render dashboard, never in the frontend or in git. Without it Delete answers `503 USER_DELETE_NOT_CONFIGURED` and Disable still works.
 
 ### Setting it up
 

@@ -35,7 +35,7 @@ ON CONFLICT (id) DO NOTHING;
 REVOKE ALL ON public.profiles, public.applicants, public.screening_results,
               public.evidence_files, public.nacta_list, public.audit_log,
               public.monitoring_alerts, public.monitoring_state,
-              public.batches, public.batch_rows FROM anon, authenticated;
+              public.batches, public.batch_rows, public.deleted_users FROM anon, authenticated;
 
 -- 4. The first admin. Replace the address with the one you signed up with, and run it by hand:
 --      UPDATE public.profiles SET status = 'approved', role = 'admin' WHERE email = 'you@example.com';

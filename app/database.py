@@ -324,6 +324,33 @@ def update_profile(user_id, status=None, role=None, decided_by=None):
         ).fetchone())
 
 
+def delete_profile(user_id) -> dict | None:
+    """
+    Delete a person's profile and remember that they were deleted. Their screenings, batches and the decisions
+    they made stay, with the link to them cleared (user_id becomes NULL and only admins see those screenings).
+    Returns the deleted profile, or None when there is no such user. Raises LastAdminError if they are the
+    last approved admin.
+    """
+    with pool().connection() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", (_ADMIN_LOCK,))
+        cur = conn.execute("SELECT * FROM profiles WHERE id = %s FOR UPDATE", (user_id,)).fetchone()
+        if cur is None:
+            return None
+        if cur["status"] == "approved" and cur["role"] == "admin":
+            n = conn.execute("SELECT count(*) AS n FROM profiles WHERE status = 'approved' AND role = 'admin'"
+                             ).fetchone()["n"]
+            if n <= 1:
+                raise LastAdminError()
+        conn.execute("INSERT INTO deleted_users (id) VALUES (%s) ON CONFLICT (id) DO NOTHING", (user_id,))
+        conn.execute("DELETE FROM profiles WHERE id = %s", (user_id,))
+        return _clean(cur)
+
+
+def is_deleted_user(user_id) -> bool:
+    with pool().connection() as conn:
+        return conn.execute("SELECT 1 FROM deleted_users WHERE id = %s", (user_id,)).fetchone() is not None
+
+
 # --------------------------------------------------------------------------
 # NACTA list
 # --------------------------------------------------------------------------

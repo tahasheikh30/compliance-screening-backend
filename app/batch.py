@@ -125,7 +125,7 @@ def _run(batch_id: int, items: list, screen_one, finished) -> None:
             if cp["cancel_requested"]:
                 status = "cancelled"
                 break
-            if cp["user_status"] != "approved":  # rejected or removed since the upload: no more screening for them
+            if cp["user_status"] != "approved":  # rejected, disabled or deleted since the upload: no more screening for them
                 logger.warning("Batch %s stopped: its owner is no longer approved", batch_id)
                 status = "cancelled"
                 break

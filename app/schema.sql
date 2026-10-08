@@ -13,13 +13,30 @@
 CREATE TABLE IF NOT EXISTS profiles (
     id          uuid PRIMARY KEY,
     email       text NOT NULL DEFAULT '',
-    status      text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+    status      text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'disabled')),
     role        text NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'admin')),
     created_at  timestamptz NOT NULL DEFAULT now(),
     decided_at  timestamptz,
     decided_by  uuid REFERENCES profiles (id) ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS idx_profiles_decided_by ON profiles (decided_by);
+-- "disabled" was added after the first release: widen the check on databases created before it
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'profiles_status_check' AND conrelid = 'profiles'::regclass
+               AND pg_get_constraintdef(oid) NOT LIKE '%disabled%') THEN
+        ALTER TABLE profiles DROP CONSTRAINT profiles_status_check;
+        ALTER TABLE profiles ADD CONSTRAINT profiles_status_check
+            CHECK (status IN ('pending', 'approved', 'rejected', 'disabled'));
+    END IF;
+END $$;
+
+-- People an admin deleted. A deleted person's sign in token stays valid until it expires, and without this note
+-- the backend would see an unknown id and create a fresh pending profile for it. Only the id is kept.
+CREATE TABLE IF NOT EXISTS deleted_users (
+    id          uuid PRIMARY KEY,
+    deleted_at  timestamptz NOT NULL DEFAULT now()
+);
 
 -- One row per screening request. user_id is the analyst who ran it; if that account is ever
 -- deleted the screening stays (user_id becomes NULL and only admins can see it).
@@ -197,5 +214,6 @@ ALTER TABLE nacta_list        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_log         ENABLE ROW LEVEL SECURITY;
 ALTER TABLE monitoring_alerts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE monitoring_state  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE deleted_users     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE batches           ENABLE ROW LEVEL SECURITY;
 ALTER TABLE batch_rows        ENABLE ROW LEVEL SECURITY;
