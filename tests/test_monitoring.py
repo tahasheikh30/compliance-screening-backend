@@ -218,17 +218,27 @@ def test_the_fingerprint_changes_only_when_the_list_does(fake_sources):
 
 # ---- who can see and decide ---------------------------------------------------------------------------------
 
-def test_alerts_are_private_to_the_analyst_who_screened_and_visible_to_admins(client, fake_sources):
+def test_alerts_are_private_to_the_analyst_who_screened_even_from_admins(client, fake_sources):
     _screen(client, monitor=True, headers=USER_HEADERS)
     monitoring.run_once()
     _list_person(fake_sources)
     monitoring.run_once()
     assert len(_alerts(client, USER_HEADERS).json()) == 1
     assert _alerts(client, USER2_HEADERS).json() == []
-    assert len(_alerts(client, API_HEADERS).json()) == 1          # admin sees everyone's
+    assert _alerts(client, API_HEADERS).json() == []              # an admin sees only their own, like everyone
     alert_id = _alerts(client, USER_HEADERS).json()[0]["id"]
     assert client.post(f"/api/monitoring/alerts/{alert_id}/decision", json={"status": "dismissed"},
                        headers=USER2_HEADERS).status_code == 404
+    assert client.post(f"/api/monitoring/alerts/{alert_id}/decision", json={"status": "dismissed"},
+                       headers=API_HEADERS).status_code == 404
+    status = client.get("/api/monitoring/status", headers=API_HEADERS).json()
+    assert status["monitored_applicants"] == 0 and status["open_alerts"] == 0
+
+
+def test_an_admin_cannot_enrol_or_stop_someone_elses_screening(client):
+    a = _screen(client, headers=USER_HEADERS)
+    r = client.post(f"/api/applicants/{a['applicant_id']}/monitoring", json={"enabled": True}, headers=API_HEADERS)
+    assert r.status_code == 404
 
 
 def test_one_user_cannot_enrol_anothers_screening(client):
@@ -362,3 +372,24 @@ def test_the_background_loop_keeps_running_after_a_failed_pass(monkeypatch):
     assert len(calls) >= 3                                # kept going after the exception on the first pass
     assert not monitoring._thread.is_alive()
     assert not [t for t in threading.enumerate() if t.name == "monitoring"]
+
+
+# ---- an administrator reads one person's history from the People tab ----------------------------------------
+
+def test_admin_reads_one_users_history_and_nobody_else_can(client):
+    from tests.conftest import USER_ID, USER2_ID
+    _screen(client, name="Ana Screened This", headers=USER_HEADERS)
+    _screen(client, name="Bilal Screened That", headers=USER2_HEADERS)
+    r = client.get(f"/api/admin/users/{USER_ID}/applicants", headers=API_HEADERS)
+    assert r.status_code == 200
+    assert [x["full_name"] for x in r.json()] == ["Ana Screened This"]
+    assert r.headers["X-Total-Count"] == "1"
+    # a user (even asking about themselves) cannot use the admin route
+    assert client.get(f"/api/admin/users/{USER_ID}/applicants", headers=USER_HEADERS).status_code == 403
+    assert client.get(f"/api/admin/users/{USER2_ID}/applicants", headers=USER_HEADERS).status_code == 403
+    # an unknown account is reported as such
+    assert client.get("/api/admin/users/00000000-0000-4000-8000-0000000000ff/applicants",
+                      headers=API_HEADERS).status_code == 404
+    assert client.get("/api/admin/users/not-a-uuid/applicants", headers=API_HEADERS).status_code == 422
+    entries = client.get("/api/admin/audit?limit=200", headers=API_HEADERS).json()["entries"]
+    assert any(e["action"] == "user.history.view" and e["target_id"] == USER_ID for e in entries)

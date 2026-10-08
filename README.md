@@ -235,9 +235,10 @@ A screening is a photograph of one day. Someone who is clear today can be listed
 
 | | |
 |---|---|
-| `GET /api/monitoring/alerts` | New potential matches, newest first. `?status=open` (default), `confirmed` or `dismissed`; `?limit=`, `?offset=`; `X-Total-Count` has the total. Analysts see alerts on their own screenings, admins see all |
+| `GET /api/monitoring/alerts` | New potential matches, newest first. `?status=open` (default), `confirmed` or `dismissed`; `?limit=`, `?offset=`; `X-Total-Count` has the total. Only the alerts on your own screenings, for admins too: monitoring is private to the person who ran the screening |
 | `POST /api/monitoring/alerts/{id}/decision` | `{"status": "confirmed" or "dismissed" or "open", "note": "..."}`: a person's decision, with who and when |
 | `GET /api/monitoring/status` | Whether monitoring is on, how many people are watched, how many alerts are open, when each list was last checked |
+| `GET /api/admin/users/{id}/applicants` | Admin: one person's screening history, newest first (`?limit=`, `?offset=`, `X-Total-Count`). Used by the People tab |
 | `POST /api/admin/monitoring/run` | Admin: run the check now. `?force=true` re-screens everyone against every list |
 
 **Safe by construction.**

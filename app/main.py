@@ -35,6 +35,8 @@ Endpoints:
     POST /api/applicants/{id}/monitoring  enrol a screened person in continuous monitoring (or stop)
     GET  /api/monitoring/alerts           new potential matches found by re-screening; /decision records the outcome
     GET  /api/monitoring/status           monitoring state: people watched, open alerts, last check per list
+                                          (monitoring is private to the analyst who ran the screening, admins included)
+    GET  /api/admin/users/{id}/applicants (admin) one user's screening history
     POST /api/admin/monitoring/run        (admin) run the check now (?force=true re-screens everyone)
     GET  /api/admin/audit                 (admin) who did what, paged; /api/admin/audit/verify checks the hash chain
     GET  /api/health                      unauthenticated liveness check (?deep=true also checks the database)
@@ -467,6 +469,20 @@ def list_users(request: Request, status: Literal["pending", "approved", "rejecte
     return [_user_out(p) for p in db.list_profiles(status)]
 
 
+@app.get("/api/admin/users/{user_id}/applicants", response_model=list[ApplicantSummary])
+@limiter.limit("60/minute")
+def list_user_applicants(request: Request, response: Response, user_id: uuid.UUID,
+                         limit: int = Query(100, ge=1, le=200), offset: int = Query(0, ge=0, le=1_000_000),
+                         user: AuthUser = Depends(require_admin)):
+    """One person's screening history, newest first (the People tab). X-Total-Count is how many there are in all."""
+    if db.get_profile(str(user_id)) is None:
+        raise AppError(404, "USER_NOT_FOUND", "No user with that ID.")
+    rows, total = db.search_applicants(user_id=str(user_id), limit=limit, offset=offset)
+    response.headers["X-Total-Count"] = str(total)
+    _audit(request, user, "user.history.view", "user", user_id)
+    return rows
+
+
 @app.post("/api/admin/users/{user_id}/status", response_model=UserOut)
 @limiter.limit("60/minute")
 def set_user_status(request: Request, user_id: uuid.UUID, body: UserStatusIn, user: AuthUser = Depends(require_admin)):
@@ -494,7 +510,7 @@ def set_applicant_monitoring(request: Request, applicant_id: int, body: Monitori
     watch list changes, and any NEW potential match becomes an alert. Enrolling also checks them against the
     current lists straight away, so someone screened weeks ago is not left unchecked until the next list update.
     """
-    applicant = db.get_applicant(applicant_id, _scope(user))
+    applicant = db.get_applicant(applicant_id, _scope(user, mine=True))
     if not applicant:
         raise HTTPException(404, "Applicant not found")
     if body.enabled:
@@ -502,7 +518,7 @@ def set_applicant_monitoring(request: Request, applicant_id: int, body: Monitori
             engine.check_screenable(applicant["full_name"])
         except engine.UnscreenableName as exc:
             raise AppError(422, "NAME_NOT_SCREENABLE", str(exc), "Screen the person again with the name in Latin letters.") from None
-    db.set_monitoring(applicant_id, body.enabled, _scope(user))
+    db.set_monitoring(applicant_id, body.enabled, _scope(user, mine=True))
     new_alerts = len(monitoring.check_applicant(applicant_id)) if body.enabled else 0
     _audit(request, user, "monitoring.enrol" if body.enabled else "monitoring.stop", "applicant", applicant_id,
            {"new_alerts": new_alerts} if body.enabled else None)
@@ -519,7 +535,7 @@ def monitoring_alerts(request: Request, response: Response,
                       limit: int = Query(100, ge=1, le=200), offset: int = Query(0, ge=0, le=1_000_000),
                       user: AuthUser = Depends(require_approved)):
     """New potential matches found by re-screening, newest first (default: the open ones). X-Total-Count has the total."""
-    rows, total = db.list_alerts(_scope(user), status, limit, offset)
+    rows, total = db.list_alerts(_scope(user, mine=True), status, limit, offset)
     response.headers["X-Total-Count"] = str(total)
     return rows
 
@@ -529,11 +545,11 @@ def monitoring_alerts(request: Request, response: Response,
 def decide_monitoring_alert(request: Request, alert_id: int, body: AlertDecisionIn,
                             user: AuthUser = Depends(require_approved)):
     """Record a person's decision on an alert: confirmed (a real match) or dismissed (someone else with the same name)."""
-    if not db.get_alert(alert_id, _scope(user)):
+    if not db.get_alert(alert_id, _scope(user, mine=True)):
         raise AppError(404, "ALERT_NOT_FOUND", "No alert with that ID.")
     db.decide_alert(alert_id, body.status, body.note, user.id)
     _audit(request, user, "monitoring.decision", "alert", alert_id, {"status": body.status})
-    return db.get_alert(alert_id, _scope(user))
+    return db.get_alert(alert_id, _scope(user, mine=True))
 
 
 @app.get("/api/monitoring/status", response_model=MonitoringStatusOut)
@@ -543,7 +559,7 @@ def monitoring_status(request: Request, user: AuthUser = Depends(require_approve
     state = db.monitoring_state()
     return MonitoringStatusOut(
         enabled=app_config.MONITORING_ENABLED, interval_seconds=app_config.MONITOR_INTERVAL_SECONDS,
-        **db.monitoring_counts(_scope(user)),
+        **db.monitoring_counts(_scope(user, mine=True)),
         sources=[SourceMonitoringOut(source=k, last_checked_at=(state.get(k) or {}).get("checked_at"),
                                      applicants_checked=(state.get(k) or {}).get("rescreened"),
                                      new_alerts=(state.get(k) or {}).get("new_alerts")) for k in loader.SOURCE_KEYS])
