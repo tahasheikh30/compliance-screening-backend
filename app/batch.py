@@ -13,7 +13,6 @@ What this deliberately does not do:
 """
 
 import threading
-import time
 
 from pydantic import ValidationError
 
