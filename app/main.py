@@ -97,6 +97,7 @@ async def lifespan(_app: FastAPI):
     try:
         yield
     finally:
+        batch_runner.shutdown()
         monitoring.stop()
         loader.stop_background_refresh()
         db.close_pool()
@@ -173,12 +174,8 @@ def _startup():
                        "who opens the app could replace the NACTA list. Give them different values.")
     if not auth.API_KEY:
         logger.info("API_KEY is not set: the scheduled NACTA upload by access key is disabled.")
-    try:
-        n = db.batch_interrupt_running()
-        if n:
-            logger.warning("%d batch(es) were still running when the server stopped and are marked interrupted", n)
-    except Exception:
-        logger.exception("Could not mark interrupted batches")
+    batch_runner.startup()
+    _reap_batches()
     if PRELOAD_LISTS and loader.start_background_refresh():
         logger.info("Loading the screening lists in the background and keeping them fresh")
     if monitoring.start():
@@ -303,6 +300,20 @@ def _screen_one(req: ScreenRequest, user: AuthUser, request: Request | None = No
 # Batch screening: upload a file of applicants, screen it in the background, poll for progress
 # --------------------------------------------------------------------------
 
+def _reap_batches() -> None:
+    """
+    Mark as interrupted any batch whose server stopped reporting (it died). Safe with several servers: a batch
+    that a healthy server is running keeps its heartbeat fresh and is left alone. Called at start-up and
+    whenever batches are looked at or started, so a dead server's batch never stays 'running' for ever.
+    """
+    try:
+        n = db.batch_interrupt_stale(app_config.BATCH_STALE_SECONDS)
+        if n:
+            logger.warning("%d batch(es) lost their server and are marked interrupted", n)
+    except Exception:
+        logger.exception("Could not mark interrupted batches")
+
+
 def _batch_out(user_batch: dict, with_rows: bool = True) -> BatchOut:
     rows = db.batch_rows(user_batch["id"])
     out_rows = []
@@ -357,6 +368,7 @@ async def start_batch(request: Request, filename: str = Query("applicants.xlsx",
     if len(data) > app_config.BATCH_MAX_FILE_BYTES:
         raise AppError(413, "BATCH_FILE_TOO_LARGE", "That file is too large.",
                        f"The limit is {app_config.BATCH_MAX_FILE_BYTES // (1024 * 1024)} MB. Split it into smaller files.")
+    _reap_batches()               # a batch whose server died must not block this person from starting another
     if db.batch_running_count(user.id):
         raise AppError(409, "BATCH_ALREADY_RUNNING", "You already have a batch running.",
                        "Wait for it to finish, or cancel it, before starting another.")
@@ -376,7 +388,7 @@ async def start_batch(request: Request, filename: str = Query("applicants.xlsx",
                        f"First problem: {first}" if first else None)
 
     try:
-        batch_id = db.batch_create(user.id, name[:200], thr, monitor, [row for row, _ in prepared])
+        batch_id = db.batch_create(user.id, name[:200], thr, monitor, [row for row, _ in prepared], batch_runner.OWNER)
     except db.BatchAlreadyRunning:
         raise AppError(409, "BATCH_ALREADY_RUNNING", "You already have a batch running.",
                        "Wait for it to finish, or cancel it, before starting another.") from None
@@ -399,6 +411,7 @@ async def start_batch(request: Request, filename: str = Query("applicants.xlsx",
 @limiter.limit("120/minute")
 def get_batch(request: Request, batch_id: int, user: AuthUser = Depends(require_approved)):
     """Progress and per-row results of a batch. Poll this while status is 'running'."""
+    _reap_batches()
     return _batch_out(_own_batch(user, batch_id))
 
 
@@ -407,7 +420,8 @@ def get_batch(request: Request, batch_id: int, user: AuthUser = Depends(require_
 def cancel_batch(request: Request, batch_id: int, user: AuthUser = Depends(require_approved)):
     """Stop after the row being screened. Rows already screened are kept; the rest are reported as not screened."""
     b = _own_batch(user, batch_id)
-    if b["status"] == "running" and batch_runner.cancel(batch_id):
+    # the request goes in the database, so it works whichever server is running the batch
+    if b["status"] == "running" and db.batch_request_cancel(batch_id, user.id):
         _audit(request, user, "batch.cancel", "batch", batch_id)
     return _batch_out(b)
 

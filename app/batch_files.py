@@ -13,6 +13,7 @@ become a formula in the spreadsheet someone opens later.
 
 import csv
 import io
+import math
 import re
 import zipfile
 from dataclasses import dataclass, field
@@ -79,6 +80,8 @@ def _cell_text(value) -> str:
     if isinstance(value, date):
         return value.isoformat()
     if isinstance(value, float):
+        if not math.isfinite(value):
+            return ""               # NaN or infinity (a damaged or odd cell): treat as empty instead of crashing
         # a CNIC or an id stored as a number: 4210112345671.0 must not become "4.210112345671e+12"
         return str(int(value)) if value == int(value) else repr(value)
     return re.sub(r"[ \t\r\n]+", " ", str(value)).strip()

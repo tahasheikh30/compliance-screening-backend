@@ -5,14 +5,21 @@ Each row is a normal screening (the same function the single screening route use
 person's history, has a case and an evidence PDF, and can be put under monitoring. The browser starts the
 batch, then polls GET /api/batches/{id} for progress.
 
+Several servers can run batches side by side. Everything they must agree on lives in the database, not in
+memory: before each row the running server records a heartbeat and reads the batch's cancel flag (so Cancel
+works whichever server receives it), and a batch whose heartbeat has gone stale because its server died is
+marked "interrupted" by any server. A server that shuts down on purpose interrupts its own batches at once.
+
 What this deliberately does not do:
-  * Survive a restart. The rows are held in memory while the batch runs. If the server restarts, the batch is
-    marked "interrupted" on the next start; rows already screened are kept and the rest are reported as not
+  * Survive losing its server. The rows are held in memory while the batch runs, so a batch cut off by a
+    restart or crash is marked "interrupted"; rows already screened are kept and the rest are reported as not
     screened. It is never treated as clear.
-  * Run in parallel. Rows go one at a time; at most BATCH_MAX_RUNNING batches run at once on a server.
+  * Run in parallel. Rows go one at a time; at most BATCH_MAX_RUNNING batches run at once on each server, so
+    adding servers adds capacity.
 """
 
 import threading
+import uuid
 
 from pydantic import ValidationError
 
@@ -21,8 +28,10 @@ from app import database as db
 from app.errors import AppError, logger
 from app.schemas import ScreenRequest
 
+OWNER = uuid.uuid4().hex[:12]                  # names this server process in batches.owner
 _lock = threading.Lock()
-_cancel: dict[int, threading.Event] = {}      # batch id -> set when the person pressed Cancel
+_active: set[int] = set()                      # batches running in this process (the capacity limit is per server)
+_stop = threading.Event()                      # set when this server is shutting down
 
 
 _LABELS = {"full_name": "Full name", "dob": "Date of birth", "nationality": "Nationality", "cnic": "CNIC",
@@ -62,7 +71,7 @@ def prepare_rows(parsed: list, threshold: float, monitor: bool) -> list:
 
 def capacity_left() -> bool:
     with _lock:
-        return len(_cancel) < config.BATCH_MAX_RUNNING
+        return len(_active) < config.BATCH_MAX_RUNNING
 
 
 def start(batch_id: int, items: list, screen_one, finished=None) -> None:
@@ -70,30 +79,54 @@ def start(batch_id: int, items: list, screen_one, finished=None) -> None:
     Begin screening `items` (the (row, ScreenRequest) pairs from prepare_rows) in a background thread.
     `screen_one(req)` screens one row and returns its ScreenResponse; `finished(status)` is told the outcome.
     """
-    event = threading.Event()
     with _lock:
-        _cancel[batch_id] = event
-    t = threading.Thread(target=_run, args=(batch_id, items, screen_one, finished, event),
-                         name=f"batch-{batch_id}", daemon=True)
+        _active.add(batch_id)
+    t = threading.Thread(target=_run, args=(batch_id, items, screen_one, finished), name=f"batch-{batch_id}", daemon=True)
     t.start()
 
 
-def cancel(batch_id: int) -> bool:
-    """Ask a running batch to stop after the row it is on. False if it is not running here."""
-    with _lock:
-        event = _cancel.get(batch_id)
-    if event is None:
-        return False
-    event.set()
-    return True
+def startup() -> None:
+    """The server is (re)starting in this process: batches may run again."""
+    _stop.clear()
 
 
-def _run(batch_id: int, items: list, screen_one, finished, event: threading.Event) -> None:
+def shutdown() -> None:
+    """This server is stopping: tell its batches to stop after the row they are on, and mark them interrupted now."""
+    _stop.set()
+    try:
+        n = db.batch_interrupt_owned(OWNER)
+        if n:
+            logger.warning("%d running batch(es) interrupted by this server shutting down", n)
+    except Exception:
+        logger.exception("Could not mark this server's batches interrupted")
+
+
+def _checkpoint(batch_id: int) -> dict | None:
+    """Heartbeat plus 'should I go on?'. A database hiccup here must not end the batch: carry on and retry."""
+    try:
+        return db.batch_checkpoint(batch_id)
+    except Exception:
+        logger.exception("Batch %s: heartbeat failed", batch_id)
+        return {"cancel_requested": False, "user_status": "approved"}
+
+
+def _run(batch_id: int, items: list, screen_one, finished) -> None:
     status = "done"
     try:
         todo = [(row, req) for row, req in items if req is not None]
         for n, (row, req) in enumerate(todo):
-            if event.is_set():
+            if _stop.is_set():
+                status = "interrupted"
+                break
+            cp = _checkpoint(batch_id)
+            if cp is None:                       # another server gave this batch up as stale: do not carry on
+                status = "interrupted"
+                break
+            if cp["cancel_requested"]:
+                status = "cancelled"
+                break
+            if cp["user_status"] != "approved":  # rejected or removed since the upload: no more screening for them
+                logger.warning("Batch %s stopped: its owner is no longer approved", batch_id)
                 status = "cancelled"
                 break
             try:
@@ -106,7 +139,7 @@ def _run(batch_id: int, items: list, screen_one, finished, event: threading.Even
                 logger.exception("Batch %s: row %s could not be screened", batch_id, row["row_no"])
                 db.batch_row_failed(batch_id, row["row_no"], "This row could not be screened. Try it again on its own.")
             if config.BATCH_ROW_DELAY_SECONDS and n < len(todo) - 1:
-                event.wait(config.BATCH_ROW_DELAY_SECONDS)
+                _stop.wait(config.BATCH_ROW_DELAY_SECONDS)
     except Exception:
         logger.exception("Batch %s stopped unexpectedly", batch_id)
         status = "interrupted"
@@ -118,4 +151,4 @@ def _run(batch_id: int, items: list, screen_one, finished, event: threading.Even
         except Exception:
             logger.exception("Batch %s: could not record how it ended", batch_id)
         with _lock:
-            _cancel.pop(batch_id, None)
+            _active.discard(batch_id)

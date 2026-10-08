@@ -289,16 +289,65 @@ def test_server_capacity_is_limited(client, monkeypatch):
     wait(client, first.json()["id"])
 
 
-def test_a_batch_cut_off_by_a_restart_is_marked_interrupted_not_clear(client, storage):
-    gate = threading.Event()
+def _insert_running_batch(storage, heartbeat_age="0 seconds", owner="other-server"):
     with storage.pool().connection() as conn:
-        conn.execute("INSERT INTO batches (user_id, filename, threshold, total) VALUES (%s, 'x.xlsx', 85, 2)",
-                     ("00000000-0000-4000-8000-0000000000b1",))
+        conn.execute("INSERT INTO batches (user_id, filename, threshold, total, owner, heartbeat_at) "
+                     "VALUES (%s, 'x.xlsx', 85, 2, %s, now() - %s::interval)",
+                     ("00000000-0000-4000-8000-0000000000b1", owner, heartbeat_age))
         conn.execute("INSERT INTO batch_rows (batch_id, row_no, full_name) VALUES (1, 2, 'Sara Noor'), (1, 3, 'Ali Raza')")
-    assert storage.batch_interrupt_running() == 1
+
+
+def test_a_batch_whose_server_died_is_marked_interrupted_not_clear(client, storage):
+    _insert_running_batch(storage, heartbeat_age="1 hour")
+    assert storage.batch_interrupt_stale(300) == 1
     body = client.get("/api/batches/1", headers=USER_HEADERS).json()
     assert body["status"] == "interrupted" and body["counts"]["pending"] == 2 and body["finished_at"]
+
+
+def test_a_batch_on_another_healthy_server_is_left_alone(client, storage):
+    _insert_running_batch(storage, heartbeat_age="5 seconds")          # a second server, still reporting
+    assert storage.batch_interrupt_stale(300) == 0
+    assert client.get("/api/batches/1", headers=USER_HEADERS).json()["status"] == "running"
+
+
+def test_looking_at_or_starting_batches_clears_a_dead_servers_batch(client, storage):
+    _insert_running_batch(storage, heartbeat_age="1 hour")
+    # starting a new batch is not blocked by the dead one
+    assert post(client, make_xlsx(ROWS)).status_code == 202
+
+
+def test_cancel_works_for_a_batch_running_on_another_server(client, storage):
+    _insert_running_batch(storage)
+    assert client.post("/api/batches/1/cancel", headers=USER_HEADERS).status_code == 200
+    with storage.pool().connection() as conn:
+        assert conn.execute("SELECT cancel_requested FROM batches WHERE id = 1").fetchone()["cancel_requested"] is True
+    assert client.post("/api/batches/1/cancel", headers=USER2_HEADERS).status_code == 404     # not theirs
+
+
+def test_a_stopping_server_interrupts_only_its_own_batches(storage):
+    _insert_running_batch(storage, owner="server-a")
+    assert storage.batch_interrupt_owned("server-b") == 0
+    assert storage.batch_interrupt_owned("server-a") == 1
+
+
+def test_a_batch_stops_when_its_owner_is_rejected_mid_run(client, storage, monkeypatch):
+    gate, started = _slow_screening(monkeypatch)
+    bid = post(client, make_xlsx(ROWS)).json()["id"]
+    assert started.wait(5)
+    with storage.pool().connection() as conn:
+        conn.execute("UPDATE profiles SET status = 'rejected' WHERE id = %s", ("00000000-0000-4000-8000-0000000000b1",))
     gate.set()
+    with storage.pool().connection() as conn:                     # wait() polls through the API, which now refuses them
+        for _ in range(100):
+            row = conn.execute("SELECT status FROM batches WHERE id = %s", (bid,)).fetchone()
+            if row["status"] != "running":
+                break
+            time.sleep(0.1)
+    assert row["status"] == "cancelled"
+    with storage.pool().connection() as conn:
+        screened = conn.execute("SELECT count(*) AS n FROM batch_rows WHERE batch_id = %s AND state = 'screened'",
+                                (bid,)).fetchone()["n"]
+    assert screened == 1                                          # the row in progress finished, nothing after it
 
 
 # ---- downloads and audit ----------------------------------------------------
@@ -360,3 +409,10 @@ def test_a_name_in_urdu_is_flagged_on_its_row_and_never_looks_clear(client):
     bad = body["rows"][1]
     assert bad["state"] == "invalid" and bad["overall_status"] is None and "Latin letters" in bad["error"]
     assert body["counts"]["AUTO_CLEAR"] == 1
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_number_cells_read_as_empty(value):
+    # NaN or infinity in a cell must not crash the upload (it used to raise ValueError / OverflowError)
+    assert batch_files._cell_text(value) == ""
+    assert batch_files._cell_text(4210112345671.0) == "4210112345671"

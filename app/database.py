@@ -584,7 +584,7 @@ def monitoring_counts(user_id=None) -> dict:
 # Batch screening
 # --------------------------------------------------------------------------
 
-def batch_create(user_id, filename: str, threshold: float, monitor: bool, rows: list) -> int:
+def batch_create(user_id, filename: str, threshold: float, monitor: bool, rows: list, owner: str | None = None) -> int:
     """
     Record an uploaded file and every row in it, in one transaction. `rows` is a list of dicts with row_no,
     full_name, and either state 'pending' (will be screened) or state 'invalid' with an error message.
@@ -592,8 +592,8 @@ def batch_create(user_id, filename: str, threshold: float, monitor: bool, rows: 
     with pool().connection() as conn:
         try:
             b = conn.execute(
-                "INSERT INTO batches (user_id, filename, threshold, monitor, total) VALUES (%s, %s, %s, %s, %s) "
-                "RETURNING id", (user_id, filename, threshold, monitor, len(rows))).fetchone()
+                "INSERT INTO batches (user_id, filename, threshold, monitor, total, owner) VALUES (%s, %s, %s, %s, %s, %s) "
+                "RETURNING id", (user_id, filename, threshold, monitor, len(rows), owner)).fetchone()
         except psycopg.errors.UniqueViolation:
             raise BatchAlreadyRunning() from None
         with conn.cursor() as cur:
@@ -621,10 +621,45 @@ def batch_finish(batch_id: int, status: str) -> None:
                      (status, batch_id))
 
 
-def batch_interrupt_running() -> int:
-    """A batch still marked running when the server starts was cut off by a restart: say so. Returns how many."""
+def batch_checkpoint(batch_id: int) -> dict | None:
+    """
+    Called by the server running a batch before each row: records that it is alive and says whether to go on.
+    Returns {"cancel_requested": bool, "user_status": str|None}, or None when the batch is no longer 'running'
+    (another server gave it up as stale, or it was interrupted): the caller must stop.
+    """
     with pool().connection() as conn:
-        cur = conn.execute("UPDATE batches SET status = 'interrupted', finished_at = now() WHERE status = 'running'")
+        return conn.execute(
+            "UPDATE batches b SET heartbeat_at = now() WHERE b.id = %s AND b.status = 'running' "
+            "RETURNING b.cancel_requested, (SELECT p.status FROM profiles p WHERE p.id = b.user_id) AS user_status",
+            (batch_id,)).fetchone()
+
+
+def batch_request_cancel(batch_id: int, user_id) -> bool:
+    """Ask a running batch to stop after its current row, whichever server runs it. True if newly requested."""
+    with pool().connection() as conn:
+        return conn.execute(
+            "UPDATE batches SET cancel_requested = true WHERE id = %s AND user_id = %s AND status = 'running' "
+            "AND NOT cancel_requested RETURNING id", (batch_id, user_id)).fetchone() is not None
+
+
+def batch_interrupt_stale(stale_seconds: float) -> int:
+    """
+    Mark as interrupted every batch that says 'running' but whose server has stopped reporting (no heartbeat
+    for `stale_seconds`): its server died. A batch that another, healthy server is running is left alone.
+    Returns how many.
+    """
+    with pool().connection() as conn:
+        cur = conn.execute(
+            "UPDATE batches SET status = 'interrupted', finished_at = now() WHERE status = 'running' "
+            "AND heartbeat_at < now() - make_interval(secs => %s)", (stale_seconds,))
+        return cur.rowcount
+
+
+def batch_interrupt_owned(owner: str) -> int:
+    """A server shutting down on purpose gives up its own running batches at once, without waiting to go stale."""
+    with pool().connection() as conn:
+        cur = conn.execute("UPDATE batches SET status = 'interrupted', finished_at = now() "
+                           "WHERE status = 'running' AND owner = %s", (owner,))
         return cur.rowcount
 
 

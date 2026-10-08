@@ -127,3 +127,7 @@ BATCH_MAX_FILE_BYTES = int(_float_env("BATCH_MAX_FILE_MB", 10) * 1024 * 1024)
 BATCH_MAX_RUNNING = max(1, int(_float_env("BATCH_MAX_RUNNING", 2)))
 # A short pause between rows, so a long file does not hammer the news search.
 BATCH_ROW_DELAY_SECONDS = max(0.0, _float_env("BATCH_ROW_DELAY_SECONDS", 0.5))
+# A running batch records a heartbeat in the database after every row. One whose heartbeat is older than this
+# is taken to have lost its server (crash, kill, scale-in) and is marked interrupted. It must be longer than
+# the slowest single row (the news search is the slow part). Several servers can run batches side by side.
+BATCH_STALE_SECONDS = max(30.0, _float_env("BATCH_STALE_SECONDS", 300))

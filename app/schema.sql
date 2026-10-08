@@ -168,6 +168,12 @@ CREATE TABLE IF NOT EXISTS batches (
     created_at   timestamptz NOT NULL DEFAULT now(),
     finished_at  timestamptz
 );
+-- Several servers may run batches at once, so the state they need to agree on lives here, not in memory:
+-- heartbeat_at (the running server is alive: a stale one means its server died), cancel_requested (Cancel can
+-- arrive at a different server from the one running the batch) and owner (which server process runs it).
+ALTER TABLE batches ADD COLUMN IF NOT EXISTS heartbeat_at      timestamptz NOT NULL DEFAULT now();
+ALTER TABLE batches ADD COLUMN IF NOT EXISTS cancel_requested  boolean NOT NULL DEFAULT false;
+ALTER TABLE batches ADD COLUMN IF NOT EXISTS owner             text;
 CREATE INDEX IF NOT EXISTS idx_batches_user ON batches (user_id, id DESC);
 -- one running batch per person, enforced by the database so two quick clicks cannot start two
 CREATE UNIQUE INDEX IF NOT EXISTS idx_batches_one_running ON batches (user_id) WHERE status = 'running';
