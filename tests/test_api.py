@@ -208,6 +208,19 @@ def test_name_match_on_nacta_with_a_different_cnic_is_flagged_as_differing(clien
     assert m["cnic_match"] is False and m["father_match"] is True and m["score"] == 100.0
 
 
+def test_province_is_stored_and_shown_against_the_nacta_record(client):
+    from app import database as db
+    r = _screen(client, full_name="Muhammad Shakir", province="  punjab ")
+    m = _by_source(r)["NACTA"]["matches"][0]
+    assert m["province"] == "Punjab" and m["province_match"] is True
+    assert db.get_applicant(r.json()["applicant_id"])["province"] == "punjab"
+    other = _by_source(_screen(client, full_name="Muhammad Shakir", province="Sindh"))["NACTA"]["matches"][0]
+    assert other["province_match"] is False and other["score"] == 100.0
+    assert _by_source(_screen(client, full_name="Muhammad Shakir"))["NACTA"]["matches"][0]["province_match"] is None
+    too_long = client.post("/api/screen", json={"full_name": "Muhammad Shakir", "province": "x" * 101}, headers=API_HEADERS)
+    assert too_long.status_code == 422
+
+
 def test_no_cnic_given_means_cnic_match_is_unknown_not_false(client):
     m = _by_source(_screen(client, full_name="Muhammad Shakir"))["NACTA"]["matches"][0]
     assert m["cnic_match"] is None and m["father_match"] is None

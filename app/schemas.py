@@ -24,6 +24,8 @@ class ScreenRequest(BaseModel):
     threshold: Optional[float] = None
     cnic: Optional[str] = Field(default=None, max_length=20)
     father_name: Optional[str] = Field(default=None, max_length=200)
+    # Province or territory (Punjab, Sindh, KPK, ...). NACTA lists one, so a match can show whether it agrees.
+    province: Optional[str] = Field(default=None, max_length=100)
     # Enrol this person in continuous monitoring: they are screened again whenever a watch list changes.
     monitor: bool = False
 
@@ -39,7 +41,7 @@ class ScreenRequest(BaseModel):
             raise ValueError(str(exc)) from None
         return v
 
-    @field_validator("dob", "nationality", "cnic", "father_name")
+    @field_validator("dob", "nationality", "cnic", "father_name", "province")
     @classmethod
     def strip_optional(cls, v):
         if v is None:
@@ -66,6 +68,8 @@ class MatchOut(BaseModel):
     father_name: str = ""
     cnic_match: Optional[bool] = None    # None: the applicant gave no CNIC, or the list has none for this person
     father_match: Optional[bool] = None
+    province: str = ""
+    province_match: Optional[bool] = None   # None: the applicant gave no province, or the list has none for this person
 
 
 class ArticleOut(BaseModel):

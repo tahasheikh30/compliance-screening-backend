@@ -393,3 +393,10 @@ def test_admin_reads_one_users_history_and_nobody_else_can(client):
     assert client.get("/api/admin/users/not-a-uuid/applicants", headers=API_HEADERS).status_code == 422
     entries = client.get("/api/admin/audit?limit=200", headers=API_HEADERS).json()["entries"]
     assert any(e["action"] == "user.history.view" and e["target_id"] == USER_ID for e in entries)
+
+
+def test_a_monitored_persons_province_is_kept_for_the_rechecks(client):
+    a = _screen(client, monitor=True, province="Sindh")
+    from app import database as db
+    batch = db.monitored_batch(0, 10)
+    assert [b["province"] for b in batch if b["id"] == a["applicant_id"]] == ["Sindh"]

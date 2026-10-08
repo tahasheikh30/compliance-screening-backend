@@ -214,11 +214,12 @@ def screen_applicant(request: Request, req: ScreenRequest, user: AuthUser = Depe
         raise AppError(422, "NAME_NOT_SCREENABLE", str(exc), "Retype the name in Latin letters.") from None
     applicant_id = db.insert_applicant(req.full_name, req.cnic, req.father_name, now.isoformat(), "PENDING",
                                        dob=req.dob, nationality=req.nationality, threshold=threshold,
-                                       user_id=user.id)
+                                       user_id=user.id, province=req.province)
     case_ref = _case_ref(applicant_id, now)
 
     result = engine.screen(req.full_name, req.dob or "", req.nationality or "", threshold,
-                           cnic=req.cnic or "", father_name=req.father_name or "")
+                           cnic=req.cnic or "", father_name=req.father_name or "",
+                           province=req.province or "")
 
     statuses: dict = {}
     rows: list = []
@@ -414,6 +415,8 @@ def _ingest_nacta(data: bytes, filename: str) -> dict:
         warnings.append("No usable CNIC numbers were found, so matching will rely on names alone.")
     if not info["has_father"]:
         warnings.append("No father's name column was found.")
+    if not info["has_province"]:
+        warnings.append("No province column was found, so a match cannot show whether the province agrees.")
     logger.info("NACTA list uploaded: %s records from %s", len(records), meta["filename"])
     return {**_nacta_status(), "records": len(records), "rows_read": info["rows"], "rows_skipped": info["skipped"],
             "with_cnic": info["with_cnic"], "warnings": warnings}

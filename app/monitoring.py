@@ -9,7 +9,7 @@ How it works
 * Every list has a fingerprint (loader.GroupData.fingerprint): a hash of its records' ids, names, dates of birth
   and CNICs. The last fingerprint at which everyone was checked is stored per source (monitoring_state).
 * run_once() compares the current fingerprints with the stored ones. For each source that changed it screens every
-  monitored applicant against that source only, using the same matcher, threshold, CNIC and father's name as the
+  monitored applicant against that source only, using the same matcher, threshold, CNIC, father's name and province as the
   original screening.
 * A match is an ALERT only if it is new: not among the matches the applicant already had when first screened, and
   not already alerted (a unique key per applicant, list and record). So a hit is raised once, never repeatedly,
@@ -39,7 +39,7 @@ from app.config import MAX_MATCHES
 from app.errors import logger
 from app.screening import engine, loader
 from app.screening.names import NameScorer
-from app.screening.parsers import normalize_cnic
+from app.screening.parsers import normalize_cnic, normalize_province
 
 BATCH = 500
 INITIAL_DELAY_SECONDS = 60.0     # let the lists load at start-up before the first check
@@ -77,6 +77,7 @@ def _check_one(applicant: dict, sources: list, groups: dict, baseline: set) -> l
     thr = engine.resolve_threshold(applicant.get("threshold"))
     scorer = NameScorer(applicant["full_name"])
     father = NameScorer(applicant["father_name"]) if applicant.get("father_name") else None
+    province = normalize_province(applicant.get("province"))
     year = re.search(r"(\d{4})", applicant.get("dob") or "")
     dob_year = year.group(1) if year else ""
     cnic = normalize_cnic(applicant.get("cnic") or "")
@@ -85,7 +86,7 @@ def _check_one(applicant: dict, sources: list, groups: dict, baseline: set) -> l
     for key in sources:
         g = groups[key]
         matches, _total = engine.match_records(scorer, g.records, thr, dob_year, cnic, father, limit=MAX_MATCHES,
-                                               index=g.index)
+                                               index=g.index, province=province)
         for m in matches:
             ident = (key, m["list"] or "", str(m["id"]))
             if ident in baseline:

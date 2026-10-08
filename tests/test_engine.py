@@ -264,6 +264,24 @@ def test_cnic_matches_rank_above_better_name_scores(fake_sources):
     assert any(m["source"] == "fia" and not m["cnic_match"] for m in r["matches"])
 
 
+def test_province_is_supporting_evidence_only(fake_sources):
+    def first(**kw):
+        return engine.screen("Muhammad Shakir", **kw)["sources"]["NACTA"]["matches"][0]
+    same, other, none = first(province="Punjab"), first(province="Sindh"), first()
+    assert same["province"] == "Punjab" and same["province_match"] is True
+    assert other["province_match"] is False and other["score"] == 100.0    # a different province never removes the match
+    assert none["province_match"] is None                                  # nothing to compare is not "different"
+    assert first(province="PB")["province_match"] is True                  # spelled another way
+    kp = engine.screen("Akhtar Muhammad Khalil", province="Khyber Pakhtunkhwa")["sources"]["NACTA"]["matches"][0]
+    assert kp["province"] == "Khyber Pakhtunkhwa" and kp["province_match"] is True   # the list says "KP"
+    assert engine.screen("Muhammad Shakir", province="kpk")["applicant"]["province"] == "Khyber Pakhtunkhwa"
+
+
+def test_a_list_with_no_province_gives_no_province_verdict(fake_sources):
+    un = engine.screen("Muhammad Shakir", province="Punjab", threshold=50)["sources"]["UNSC"]["matches"]
+    assert all(m["province"] == "" and m["province_match"] is None for m in un)
+
+
 def test_father_name_is_supporting_evidence_only(fake_sources):
     same = engine.screen("Muhammad Shakir", father_name="Qabil Khan")["sources"]["NACTA"]["matches"][0]
     other = engine.screen("Muhammad Shakir", father_name="Somebody Else")["sources"]["NACTA"]["matches"][0]

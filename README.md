@@ -125,7 +125,7 @@ layout the reader does not understand), it also returns a sample of the text rea
 layout can be diagnosed from the screen without server access. The server log carries the same detail,
 one line per Red Book.
 
-## CNIC and father's name
+## CNIC, father's name and province
 
 The FIA Red Book and NACTA both publish a CNIC and a father's or husband's name, so the form can take
 both (optional):
@@ -134,6 +134,7 @@ both (optional):
   The CNIC must be 13 digits; anything else is ignored. Placeholder numbers such as `1111111111166` in
   the published data are never used.
 - A **matching father's name** is shown as supporting evidence. A different father never removes a match.
+- A **matching province** is shown the same way (`province`, `province_match` on each match, and in the evidence PDF). Only NACTA publishes one, so a match from another list shows none. Spellings are normalised on both sides (`KPK`, `NWFP` and `Khyber Pakhtunkhwa` are one province; `Baluchistan` is `Balochistan`; `FATA` counts as Khyber Pakhtunkhwa since the 2018 merger). A province is a coarse clue shared by millions of people and people move, so it never adds or removes a match; it helps the reviewer tell two people with the same name apart. A province that is not recognised is compared as written.
 - Without a CNIC, matching is by name as before. Common names produce many false matches on a list this
   size, so enter the CNIC whenever you have it.
 
@@ -198,7 +199,7 @@ Problems come back with a stable `error.code`: `AUTH_MISSING_KEY` and `AUTH_INVA
 { "full_name": "Muhammad Ali Khan", "dob": "1975-03-04", "nationality": "Pakistan", "threshold": 85 }
 ```
 
-Only `full_name` is required. `cnic` and `father_name` are optional and are used for the FIA Red Book and NACTA (see above).
+Only `full_name` is required. `cnic`, `father_name` and `province` are optional and are used for the FIA Red Book and NACTA (see above).
 
 The response has one result row per source (`UNSC`, `OFAC`, `UKSL`, `FIA_REDBOOK`, `NACTA`, `ADVERSE_MEDIA`), each with `status`, `score`, `matched_entry`, `detail`, `list_version`, `records_screened`, and the full `matches` or `articles`. It also carries `case_ref`, `threshold`, `records_screened`, `sanctions_hit_count`, `media_hit_count`.
 
@@ -229,7 +230,7 @@ A screening is a photograph of one day. Someone who is clear today can be listed
 
 **Enrol** a person when you screen them (`"monitor": true` in `POST /api/screen`) or later with `POST /api/applicants/{id}/monitoring` and `{"enabled": true}`. Enrolling later also checks them against the current lists straight away, so someone screened weeks ago is not left unchecked until the next list update. Monitoring is opt-in on purpose: it keeps personal data and re-checks it, so it is a decision for each person. `{"enabled": false}` stops it.
 
-**How it decides to re-screen.** Every list has a fingerprint, a hash of its records' ids, names, dates of birth and CNICs. The fingerprint each list had when everyone was last checked is stored in the database. Every `MONITOR_INTERVAL_SECONDS` (default 900) the current fingerprints are compared; for each list that changed, every monitored person is screened against that list only, with the same matcher, threshold, CNIC and father's name as their original screening.
+**How it decides to re-screen.** Every list has a fingerprint, a hash of its records' ids, names, dates of birth and CNICs. The fingerprint each list had when everyone was last checked is stored in the database. Every `MONITOR_INTERVAL_SECONDS` (default 900) the current fingerprints are compared; for each list that changed, every monitored person is screened against that list only, with the same matcher, threshold, CNIC, father's name and province as their original screening.
 
 **What becomes an alert.** Only a **new** potential match: not one the person already had when first screened, and not one already alerted. A match is therefore raised once, however many times a list changes, and the original screening is never rewritten.
 

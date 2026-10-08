@@ -303,6 +303,8 @@ def generate_evidence_pdf(r: dict, case_ref: str) -> tuple:
         d.kv("CNIC", app["cnic"])
     if app.get("father_name"):
         d.kv("Father / husband name", app["father_name"])
+    if app.get("province"):
+        d.kv("Province", app["province"])
 
     d.section("Screening details")
     d.kv("Screened at", fmt_date(r["screened_at"]))
@@ -382,6 +384,10 @@ def generate_evidence_pdf(r: dict, case_ref: str) -> tuple:
             rows.append(("Father / husband", m["father_name"]))
         if m.get("father_match") is not None:
             rows.append(("Father's name matches applicant", "Yes" if m["father_match"] else "No"))
+        if m.get("province"):
+            rows.append(("Province", m["province"]))
+        if m.get("province_match") is not None:
+            rows.append(("Province matches applicant", "Yes" if m["province_match"] else "No"))
         if m.get("aliases"):
             rows.append(("Other names", "; ".join(m["aliases"])))
         if m.get("remarks"):

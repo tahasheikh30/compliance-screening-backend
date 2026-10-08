@@ -114,7 +114,7 @@ def test_normalize_cnic_accepts_real_numbers_and_rejects_junk():
 
 def test_nacta_csv_in_the_portal_layout():
     recs, info = p.parse_nacta_persons(fx.NACTA_CSV)
-    assert info == {"rows": 4, "skipped": 0, "with_cnic": 3, "has_father": True}
+    assert info == {"rows": 4, "skipped": 0, "with_cnic": 3, "has_father": True, "has_province": True}
     a, b, c, d = recs
     assert a.primary == "Muhammad Shakir" and a.father == "Qabil Khan" and a.cnic == "3740565359881"
     assert a.id == "NACTA-1" and a.list == p.NACTA_LABEL and a.source_key == "nacta" and a.type == "Individual"
@@ -122,6 +122,8 @@ def test_nacta_csv_in_the_portal_layout():
     assert b.names == ["Aamir Bilal", "Babu Jhangvee"]          # "alias" split into separate names
     assert c.father == "" and "Father" not in c.remarks          # "nill" is not a father's name
     assert d.cnic == "" and "CNIC: 1111111111166" in d.remarks   # shown, but never used for matching
+    # the province is a field of its own, written one standard way ("KP" is Khyber Pakhtunkhwa)
+    assert [x.province for x in recs] == ["Punjab", "Punjab", "Balochistan", "Khyber Pakhtunkhwa"]
 
 
 def test_nacta_csv_in_the_other_column_order_and_with_other_delimiters():
@@ -196,3 +198,21 @@ def test_nacta_bad_xml_is_refused_with_a_message(xml, fragment):
     with pytest.raises(ValueError) as e:
         p.parse_nacta_persons(xml)
     assert fragment in str(e.value).lower()
+
+
+def test_provinces_are_written_one_standard_way():
+    n = p.normalize_province
+    assert n("PUNJAB") == n("punjab") == n(" Punjab ") == "Punjab"
+    assert n("KPK") == n("K.P.K.") == n("NWFP") == n("Khyber-Pakhtunkhwa") == n("KP") == "Khyber Pakhtunkhwa"
+    assert n("FATA") == "Khyber Pakhtunkhwa"                  # merged into it in 2018
+    assert n("Baluchistan") == n("BALOCHISTAN") == "Balochistan"
+    assert n("Islamabad") == n("ICT") == "Islamabad Capital Territory"
+    assert n("Gilgit Baltistan") == n("GB") == n("Northern Areas") == "Gilgit-Baltistan"
+    assert n("AJK") == n("Azad Kashmir") == n("Azad Jammu & Kashmir") == "Azad Jammu and Kashmir"
+    assert n("") == n(None) == n("nill") == n("N/A") == ""      # missing, not a province
+    assert n("some other place") == "Some Other Place"        # an unknown spelling is kept, not guessed at
+
+
+def test_nacta_file_without_a_province_column_says_so():
+    _, info = p.parse_nacta_persons("ID,Name,Father Name,CNIC\n1,A One,F One,3810481580749\n")
+    assert info["has_province"] is False

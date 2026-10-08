@@ -40,6 +40,7 @@ class Record:
     toks: list = field(default_factory=list)  # tokenised names, filled by prepare()
     cnic: str = ""    # 13 digit national ID, digits only, when the list publishes one
     father: str = ""  # father's or husband's name, when the list publishes one
+    province: str = ""  # province or territory, when the list publishes one (NACTA does)
 
 
 def prepare(records: list) -> list:
@@ -448,6 +449,34 @@ def normalize_cnic(v) -> str:
     return digits
 
 
+# Provinces and territories, by the spellings seen in lists and forms. Both sides of a comparison go through the
+# same table, so "KPK", "Khyber Pakhtunkhwa" and "NWFP" are one province, and "Baluchistan" is "Balochistan".
+# FATA was merged into Khyber Pakhtunkhwa in 2018, so older records that say FATA are compared as Khyber Pakhtunkhwa.
+_PROVINCES = {
+    "Punjab": {"punjab", "panjab", "pb"},
+    "Sindh": {"sindh", "sind"},
+    "Khyber Pakhtunkhwa": {"khyber pakhtunkhwa", "khyber pukhtunkhwa", "khyber pakhtoonkhwa", "khyber pakhtunkhawa",
+                           "pakhtunkhwa", "kpk", "k p k", "kp", "nwfp", "north west frontier province",
+                           "north west frontier", "fata", "federally administered tribal areas", "tribal areas"},
+    "Balochistan": {"balochistan", "baluchistan", "blochistan", "balouchistan"},
+    "Islamabad Capital Territory": {"islamabad", "ict", "islamabad capital territory", "federal capital"},
+    "Gilgit-Baltistan": {"gilgit baltistan", "gilgit", "baltistan", "gb", "northern areas"},
+    "Azad Jammu and Kashmir": {"azad jammu and kashmir", "azad jammu kashmir", "azad kashmir", "ajk", "a j k"},
+}
+_PROVINCE_LOOKUP = {alias: canon for canon, aliases in _PROVINCES.items() for alias in aliases}
+
+
+def normalize_province(v) -> str:
+    """
+    The province written one standard way, or '' when it is missing. A spelling that is not recognised is kept
+    (tidied up) rather than guessed at, so it can still be compared with an identical spelling.
+    """
+    plain = re.sub(r"\s+", " ", re.sub(r"[^a-z]+", " ", str(v or "").lower())).strip()
+    if not plain or plain in _NACTA_PLACEHOLDERS or str(v).strip().lower() in _NACTA_PLACEHOLDERS:
+        return ""
+    return _PROVINCE_LOOKUP.get(plain) or re.sub(r"\s+", " ", str(v).strip()).title()
+
+
 def _hkey(h) -> str:
     return re.sub(r"[^a-z0-9]", "", str(h or "").lower())
 
@@ -609,7 +638,8 @@ def parse_nacta_persons(text: str) -> tuple:
             source_key="nacta",
             cnic=cnic,
             father=f["father"],
+            province=normalize_province(f["province"]),
         ))
     info = {"rows": len(rows), "skipped": skipped, "with_cnic": with_cnic,
-            "has_father": any(r.father for r in records)}
+            "has_father": any(r.father for r in records), "has_province": any(r.province for r in records)}
     return records, info

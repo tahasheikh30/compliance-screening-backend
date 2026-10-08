@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from app.config import MATCH_THRESHOLD, MAX_MATCHES, MAX_THRESHOLD, MIN_THRESHOLD
 from app.errors import logger
 from app.screening import loader, names, parsers
-from app.screening.parsers import normalize_cnic
+from app.screening.parsers import normalize_cnic, normalize_province
 from app.screening.names import NameScorer
 from concurrent.futures import ThreadPoolExecutor
 
@@ -56,7 +56,7 @@ def resolve_threshold(value) -> float:
     return t
 
 
-def _match_dict(r, best: float, best_name: str, dob_year: str, cnic: str, father_scorer) -> dict:
+def _match_dict(r, best: float, best_name: str, dob_year: str, cnic: str, father_scorer, province: str = "") -> dict:
     if dob_year and r.dob:
         year_match = "Yes" if dob_year in r.dob else "No"
     else:
@@ -66,6 +66,10 @@ def _match_dict(r, best: float, best_name: str, dob_year: str, cnic: str, father
     father_match = None
     if father_scorer is not None and r.father:
         father_match = father_scorer.score(r.father) >= FATHER_MATCH_SCORE
+    # Province is a coarse clue (a handful of values shared by millions of people) and people move, so like the
+    # father's name it is shown next to the match as supporting evidence and never removes one. None: the
+    # applicant gave none, or the list has none for this person.
+    province_match = (normalize_province(r.province) == province) if (province and r.province) else None
     return {
         "source": r.source_key,
         "list": r.list,
@@ -85,6 +89,8 @@ def _match_dict(r, best: float, best_name: str, dob_year: str, cnic: str, father
         "father_name": r.father,
         "cnic_match": cnic_match,
         "father_match": father_match,
+        "province": r.province,
+        "province_match": province_match,
     }
 
 
@@ -98,7 +104,8 @@ def _rank(m: dict):
 
 
 def match_records(scorer: NameScorer, records: list, threshold: float, dob_year: str,
-                  cnic: str = "", father_scorer=None, limit: int | None = None, index=None) -> tuple:
+                  cnic: str = "", father_scorer=None, limit: int | None = None, index=None,
+                  province: str = "") -> tuple:
     """
     Returns (matches, total): the best `limit` potential matches (all of them when limit is None),
     ranked CNIC matches first and then by score, and how many records matched in all.
@@ -129,11 +136,11 @@ def match_records(scorer: NameScorer, records: list, threshold: float, dob_year:
             cands.append(((0 if by_cnic else 1, -best), r, best, best_i))
     cands.sort(key=lambda c: c[0])   # stable: equal ranks stay in list order
     kept = cands if limit is None else cands[:limit]
-    return [_match_dict(r, best, r.names[i], dob_year, cnic, father_scorer) for _, r, best, i in kept], len(cands)
+    return [_match_dict(r, best, r.names[i], dob_year, cnic, father_scorer, province) for _, r, best, i in kept], len(cands)
 
 
 def screen(name: str, dob: str = "", nationality: str = "", threshold=None,
-           cnic: str = "", father_name: str = "") -> dict:
+           cnic: str = "", father_name: str = "", province: str = "") -> dict:
     """
     Run one screening. Returns a dict with the overall result and one entry per
     source under "sources". A source that could not be loaded is reported with
@@ -147,6 +154,7 @@ def screen(name: str, dob: str = "", nationality: str = "", threshold=None,
     cnic = normalize_cnic(cnic)          # an invalid CNIC is ignored, never matched
     father_name = str(father_name or "").strip()
     father_scorer = NameScorer(father_name) if father_name else None
+    province = normalize_province(province)      # "KPK" and "Khyber Pakhtunkhwa" are the same province
     m = re.search(r"(\d{4})", dob)
     dob_year = m.group(1) if m else ""
 
@@ -168,7 +176,7 @@ def screen(name: str, dob: str = "", nationality: str = "", threshold=None,
         lists_meta.extend(g.meta)
         # a low threshold on a common name must not produce a huge response: keep the best MAX_MATCHES
         matches, found_count = (match_records(scorer, g.records, thr, dob_year, cnic, father_scorer, limit=MAX_MATCHES,
-                                           index=g.index)
+                                           index=g.index, province=province)
                                 if g.available else ([], 0))
         total_records += len(g.records)
         sanctions_hits += found_count
@@ -205,7 +213,8 @@ def screen(name: str, dob: str = "", nationality: str = "", threshold=None,
 
     media_hits = len(news["hits"])
     return {
-        "applicant": {"name": name, "dob": dob, "nationality": nationality, "cnic": cnic, "father_name": father_name},
+        "applicant": {"name": name, "dob": dob, "nationality": nationality, "cnic": cnic, "father_name": father_name,
+                      "province": province},
         "threshold": thr,
         "screened_at": datetime.now(timezone.utc).isoformat(),
         "lists": lists_meta,

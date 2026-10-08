@@ -149,12 +149,13 @@ def _result_row(row: dict | None) -> dict | None:
 # --------------------------------------------------------------------------
 
 def insert_applicant(full_name, cnic, father_name, submitted_at, overall_status,
-                     dob=None, nationality=None, threshold=None, user_id=None) -> int:
+                     dob=None, nationality=None, threshold=None, user_id=None, province=None) -> int:
     with pool().connection() as conn:
         row = conn.execute(
             "INSERT INTO applicants (user_id, full_name, cnic, father_name, submitted_at, overall_status, "
-            "dob, nationality, threshold) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
-            (user_id, full_name, cnic, father_name, _when(submitted_at), overall_status, dob, nationality, threshold),
+            "dob, nationality, threshold, province) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+            (user_id, full_name, cnic, father_name, _when(submitted_at), overall_status, dob, nationality, threshold,
+             province),
         ).fetchone()
         return row["id"]
 
@@ -461,7 +462,7 @@ def monitored_batch(after_id: int, limit: int = 500) -> list:
     """The next monitored applicants after `after_id`, with what is needed to screen them again."""
     with pool().connection() as conn:
         return [_clean(r) for r in conn.execute(
-            "SELECT id, user_id, full_name, cnic, father_name, dob, nationality, threshold FROM applicants "
+            "SELECT id, user_id, full_name, cnic, father_name, province, dob, nationality, threshold FROM applicants "
             "WHERE monitored AND id > %s ORDER BY id LIMIT %s", (after_id, limit)).fetchall()]
 
 

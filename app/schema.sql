@@ -117,6 +117,7 @@ CREATE TRIGGER audit_log_no_change BEFORE UPDATE OR DELETE ON audit_log
 -- Continuous monitoring. An applicant is only re-screened when someone enrolled them (monitored); keeping
 -- someone under watch is a decision, not a default. monitoring_alerts holds each NEW potential match found
 -- by a re-screen: the unique key means a match is raised once, however many times a list changes.
+ALTER TABLE applicants ADD COLUMN IF NOT EXISTS province           text;
 ALTER TABLE applicants ADD COLUMN IF NOT EXISTS monitored          boolean NOT NULL DEFAULT false;
 ALTER TABLE applicants ADD COLUMN IF NOT EXISTS monitored_since    timestamptz;
 ALTER TABLE applicants ADD COLUMN IF NOT EXISTS last_monitored_at  timestamptz;
