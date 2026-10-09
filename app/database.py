@@ -17,6 +17,8 @@ dashboard's Connect dialog (it also works from hosts without IPv6, like Render's
 import hashlib
 import json
 import threading
+import time
+import weakref
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,6 +58,24 @@ class BatchAlreadyRunning(Exception):
 # Connections
 # --------------------------------------------------------------------------
 
+_last_used: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _check_connection(conn) -> None:
+    """
+    psycopg_pool's own check sends a query on EVERY checkout, which is a full network round trip
+    added to every request. A connection used a moment ago is not stale, so only test the ones that
+    sat idle for a while (the case the check exists for: the server or a proxy closed them).
+    A connection that breaks anyway surfaces as an OperationalError, which the API turns into a 503.
+    """
+    now = time.monotonic()
+    seen = _last_used.get(conn)
+    _last_used[conn] = now
+    if seen is not None and now - seen < config.DB_CHECK_IDLE_SECONDS:
+        return
+    ConnectionPool.check_connection(conn)
+
+
 def _new_pool() -> ConnectionPool:
     if not config.DATABASE_URL:
         raise DatabaseNotConfigured("DATABASE_URL is not set. Set it to the Supabase connection string (see README).")
@@ -66,7 +86,7 @@ def _new_pool() -> ConnectionPool:
         # prepare_threshold=None: no server side prepared statements, so this also works through
         # Supabase's transaction mode pooler (port 6543)
         kwargs={"row_factory": dict_row, "prepare_threshold": None, "connect_timeout": 10},
-        check=ConnectionPool.check_connection,   # replace a connection the server closed while it sat idle
+        check=_check_connection,   # replace a connection the server closed while it sat idle (only if it sat long)
         timeout=15,          # how long a request waits for a free connection before it fails with a 503
         max_lifetime=1800,
         max_idle=300,
@@ -422,16 +442,22 @@ def audit(action: str, actor_id=None, actor_email=None, via="token", target_type
     actor_id = str(uuid.UUID(str(actor_id))) if actor_id else None   # one spelling, so the hash re-computes
     detail = _plain(detail)
     with pool().connection() as conn:
-        conn.execute("SELECT pg_advisory_xact_lock(%s)", (AUDIT_LOCK,))
-        last = conn.execute("SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
+        # two round trips instead of four: the lock and the read of the last hash go out together
+        # (the server runs them in order), then the insert and the commit go out together
+        with conn.pipeline():
+            conn.execute("SELECT pg_advisory_xact_lock(%s)", (AUDIT_LOCK,))
+            cur = conn.execute("SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1")
+        last = cur.fetchone()
         prev = last["row_hash"] if last else AUDIT_GENESIS
         row_hash = _audit_hash(prev, at, actor_id, actor_email, via, action, target_type, target_id,
                                detail, request_id, ip)
-        conn.execute(
-            "INSERT INTO audit_log (at, actor_id, actor_email, via, action, target_type, target_id, detail, "
-            "request_id, ip, prev_hash, row_hash) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-            (at, actor_id, actor_email, via, action, target_type, target_id,
-             Jsonb(detail) if detail is not None else None, request_id, ip, prev, row_hash))
+        with conn.pipeline():
+            conn.execute(
+                "INSERT INTO audit_log (at, actor_id, actor_email, via, action, target_type, target_id, detail, "
+                "request_id, ip, prev_hash, row_hash) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (at, actor_id, actor_email, via, action, target_type, target_id,
+                 Jsonb(detail) if detail is not None else None, request_id, ip, prev, row_hash))
+            conn.commit()
 
 
 def audit_list(limit=100, offset=0, action=None, actor_id=None) -> tuple:
