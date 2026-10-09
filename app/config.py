@@ -135,3 +135,12 @@ BATCH_ROW_DELAY_SECONDS = max(0.0, _float_env("BATCH_ROW_DELAY_SECONDS", 0.5))
 # is taken to have lost its server (crash, kill, scale-in) and is marked interrupted. It must be longer than
 # the slowest single row (the news search is the slow part). Several servers can run batches side by side.
 BATCH_STALE_SECONDS = max(30.0, _float_env("BATCH_STALE_SECONDS", 300))
+
+# --- Load protection -----------------------------------------------------
+# Screenings run on their own small thread pool so a burst of them can never use up the threads that
+# /api/me and /api/health need. Work beyond SCREEN_WORKERS waits in a short queue; beyond that the
+# request is refused at once with a 503 and Retry-After, instead of hanging until a timeout.
+SCREEN_WORKERS = max(1, int(_float_env("SCREEN_WORKERS", DB_POOL_MAX)))
+SCREEN_MAX_QUEUE = max(0, int(_float_env("SCREEN_MAX_QUEUE", SCREEN_WORKERS * 4)))
+# A pooled connection used within this many seconds is trusted without a test query.
+DB_CHECK_IDLE_SECONDS = _float_env("DB_CHECK_IDLE_SECONDS", 20)

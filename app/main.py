@@ -62,6 +62,7 @@ from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
 
 from app import database as db
+from app.loadshed import screen_lane
 from app import evidence
 from app import config as app_config
 from app import auth
@@ -217,8 +218,9 @@ def me(request: Request, user: AuthUser = Depends(auth.authenticate)):
 
 @app.post("/api/screen", response_model=ScreenResponse)
 @limiter.limit("10/minute")
-def screen_applicant(request: Request, req: ScreenRequest, user: AuthUser = Depends(require_approved)):
-    return _screen_one(req, user, request)
+async def screen_applicant(request: Request, req: ScreenRequest, user: AuthUser = Depends(require_approved)):
+    # a dedicated, bounded lane (see loadshed.py): a burst of screenings cannot starve the rest of the API
+    return await screen_lane.run(_screen_one, req, user, request)
 
 
 def _screen_one(req: ScreenRequest, user: AuthUser, request: Request | None = None,
@@ -832,11 +834,11 @@ def audit_verify(request: Request, user: AuthUser = Depends(require_admin)):
 
 
 @app.get("/api/health")
-def health(deep: bool = False):
+async def health(deep: bool = False):
     # unauthenticated on purpose: uptime monitors need to reach it. ?deep=true also checks the database.
     if deep:
         try:
-            db.ping()
+            await run_in_threadpool(db.ping)
         except Exception:
             logger.exception("Health check: the database is not reachable")
             raise AppError(503, "DATABASE_UNAVAILABLE", "The database cannot be reached right now.") from None
