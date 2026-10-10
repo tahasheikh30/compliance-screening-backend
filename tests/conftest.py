@@ -192,3 +192,13 @@ def client(storage, fake_sources, monkeypatch):
     main.limiter.reset()  # slowapi counters are process global
     with TestClient(main.app, raise_server_exceptions=False) as c:
         yield c
+        # A batch a test started and did not wait for would carry on after the test, once the fake sources are
+        # gone: it would screen against the real internet and keep a slot of the server's batch capacity, which
+        # made the next test that checks the capacity fail now and then. Let every batch finish first.
+        from app import batch as batch_runner
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            with batch_runner._lock:
+                if not batch_runner._active:
+                    break
+            time.sleep(0.05)
