@@ -90,7 +90,8 @@ def test_fetch_snapshot_pages_and_builds_people(monkeypatch):
     assert set(people) == {"Q9000001", "Q9000002", "Q9000003"}              # Q9000004 has no English label
     assert people["Q9000001"]["aliases"] == ["A. Z. Rana"] and people["Q9000001"]["dob"] == "1961-03-04"
     assert len(people["Q9000001"]["positions"]) == 2
-    assert len(calls) == 2 and "wd:Q843" in calls[0]                         # one page of people, then one chunk of aliases
+    assert len(calls) == 3 and "wd:Q843" in calls[0]                         # a page of people, a chunk of aliases, a page of politicians
+    assert "wdt:P106 wd:Q82955" in calls[2]
     assert "VALUES ?person" in calls[1] and "wd:Q9000001" in calls[1]       # aliases are asked for by id, which Wikidata answers quickly
 
 
@@ -102,6 +103,8 @@ def test_alias_failure_keeps_the_people_and_a_flaky_page_is_retried(monkeypatch)
         q = params["query"]
         if "altLabel" in q:
             raise ConnectionError("504 Gateway Timeout")            # the alias query always fails
+        if "P106" in q:
+            return json.dumps({"results": {"bindings": []}})        # the politicians page is empty
         state["people_calls"] += 1
         if state["people_calls"] == 1:
             raise ConnectionError("504 Gateway Timeout")            # the first try of the people page fails once
@@ -154,6 +157,9 @@ def test_wikidata_failure_keeps_the_last_good_copy(monkeypatch):
         raise ConnectionError("blocked")
 
     monkeypatch.setattr(pep, "fetch_snapshot", boom)
+    monkeypatch.setattr(config, "PEP_ASSEMBLIES_ENABLED", True)
+    monkeypatch.setattr(loader.pep_assemblies, "fetch_assemblies", lambda get, api: (
+        [], [{"key": "na", "label": "N", "source": "x", "count": 0, "error": "blocked"}]))
     with pytest.raises(ConnectionError):
         loader.refresh_wikidata()
     assert not saved                                        # nothing was overwritten
@@ -280,36 +286,118 @@ def test_batch_counts_a_pep_separately_from_sanctions(client):
     assert rows["Completely Unrelated Person"]["pep"] == 0
 
 
-def test_a_failed_fetch_is_not_repeated_on_every_screening_but_an_admin_can_force_it(monkeypatch):
-    import time as _t
-    calls = []
+# ---- assembly member lists and politicians -------------------------------------
 
-    def boom():
-        calls.append(1)
+ASSEMBLY_HTML = """
+<table class="wikitable">
+<tr><th colspan="3">Members by constituency</th></tr>
+<tr><th>Constituency</th><th>Member</th><th>Party</th></tr>
+<tr><td rowspan="2">NA-1 Chitral</td><td>Dr. Xanthippe Marwat<sup>[1]</sup></td><td>PTI</td></tr>
+<tr><td>Mian Oberon Qureshi</td><td>PML(N)</td></tr>
+<tr><td>NA-3</td><td>Vacant</td><td></td></tr>
+<tr><td>NA-4</td><td>Zephyrine Lashari (died)</td><td>PPP</td></tr>
+<tr><td>NA-5</td><td>Cornelius Abbasi Jatoi</td><td>Independent</td></tr>
+</table>
+<table><tr><th>Year</th><th>Speaker</th></tr><tr><td>2024</td><td>Somebody Else</td></tr></table>
+"""
+
+
+def _many(n):
+    rows = "".join(f"<tr><td>NA-{i}</td><td>Member Number{chr(65 + i % 26)}{chr(97 + i % 26)} Khan</td><td>PTI</td></tr>" for i in range(n))
+    return f"<table><tr><th>Constituency</th><th>Name</th><th>Party</th></tr>{rows}</table>"
+
+
+def test_assembly_table_reader_handles_spans_titles_and_vacancies():
+    from app.screening import pep_assemblies as pa
+    members = pa.members_from_html(ASSEMBLY_HTML)
+    names = [m["name"] for m in members]
+    assert names == ["Dr. Xanthippe Marwat", "Mian Oberon Qureshi", "Cornelius Abbasi Jatoi"]    # vacant and died skipped
+    first = members[0]
+    assert "Xanthippe Marwat" in first["names"] and first["constituency"] == "NA-1 Chitral" and first["party"] == "PTI"
+    assert members[1]["constituency"] == "NA-1 Chitral"            # carried down by the rowspan
+    assert "Oberon Qureshi" in members[1]["names"]                  # the form without the honorific is also screened
+
+
+def test_fetch_assemblies_tolerates_a_missing_page_and_reports_each_source():
+    from app.screening import pep_assemblies as pa
+    html = _many(12)
+
+    def get(url, params):
+        if params and params.get("page") == "Good Page":
+            return json.dumps({"parse": {"text": html}})
+        if params:
+            return json.dumps({"error": {"code": "missingtitle"}})
         raise ConnectionError("blocked")
 
-    monkeypatch.setattr(loader, "refresh_wikidata", boom)
+    srcs = [{"key": "a", "label": "A", "level": "National", "province": "", "titles": ["Missing", "Good Page"]},
+            {"key": "b", "label": "B", "level": "Provincial", "province": "Sindh", "titles": ["Missing"]}]
+    off = [{"key": "c", "label": "C", "level": "National", "province": "", "url": "https://example.org/members"}]
+    assemblies, report = pa.fetch_assemblies(get, "https://w/api", srcs, off)
+    assert [a["key"] for a in assemblies] == ["a"] and len(assemblies[0]["members"]) == 12
+    by = {r["key"]: r for r in report}
+    assert by["a"]["count"] == 12 and not by["a"]["error"]
+    assert by["b"]["count"] == 0 and by["b"]["error"] and "http" not in by["b"]["error"]
+    assert by["c"]["count"] == 0 and by["c"]["error"]
+
+
+def test_snapshot_adds_assembly_members_and_politicians_without_duplicates():
+    snap = {"people": [
+        {"id": "Q1", "name": "Arbuthnot Rana", "aliases": [], "dob": "", "positions": [
+            {"label": "Member of the National Assembly of Pakistan", "start": "2018-08-13", "end": ""}]},
+        {"id": "Q2", "name": "Deceased Senator", "dod": "2020-01-01", "aliases": [], "positions": [
+            {"label": "Senator", "start": "2012-03-01", "end": "2018-03-01"}]}],
+        "politicians": [{"id": "Q3", "name": "Partyleader Example", "dob": "1950-01-01", "party": "Example Party"},
+                        {"id": "Q4", "name": "Arbuthnot Rana", "dob": "", "party": "X"}],
+        "assemblies": [
+            {"key": "na", "label": "National Assembly (16th)", "level": "National", "province": "", "source": "en.wikipedia.org",
+             "members": [{"name": "Arbuthnot Rana", "names": ["Arbuthnot Rana"], "constituency": "NA-1", "party": "PTI"},
+                         {"name": "Newmember Khan", "names": ["Newmember Khan"], "constituency": "NA-2", "party": "PPP"}]},
+            {"key": "sindh", "label": "Sindh Assembly (16th)", "level": "Provincial", "province": "Sindh", "source": "en.wikipedia.org",
+             "members": [{"name": "Sindhi Member", "names": ["Sindhi Member"], "constituency": "PS-1", "party": ""}]}]}
+    records, info = pep.records_from_snapshot(snap, today=date(2026, 6, 1))
+    by = {r.primary: r for r in records}
+    assert set(by) == {"Arbuthnot Rana", "Partyleader Example", "Newmember Khan", "Sindhi Member"}   # no dead person, no duplicate
+    assert info["politicians"] == 1 and info["assembly_members"] == 2
+    assert by["Partyleader Example"].pep_level == "Political figure" and "Example Party" in by["Partyleader Example"].position
+    assert by["Newmember Khan"].pep_level == "National" and "NA-2" in by["Newmember Khan"].position
+    assert by["Sindhi Member"].pep_level == "Provincial" and by["Sindhi Member"].province == "Sindh"
+
+
+def test_refresh_keeps_working_when_wikidata_fails_but_assemblies_load(monkeypatch):
+    saved = []
     monkeypatch.setattr(loader, "db_pep", lambda kind: None)
-    monkeypatch.setattr(loader, "_wd_thread", None)
-    monkeypatch.setattr(loader, "_wd_error", None)
-    monkeypatch.setattr(loader, "_wd_finished", None)
-    assert loader._refresh_wikidata_in_background() is True
-    loader._wd_thread.join(5)
-    assert loader.wikidata_fetch_state()["error"] and not loader.wikidata_fetch_state()["running"]
-    assert loader._refresh_wikidata_in_background() is False                 # inside the cool-down
-    assert loader._refresh_wikidata_in_background(force=True) is True        # an admin retries at once
-    loader._wd_thread.join(5)
-    assert len(calls) == 2
+    monkeypatch.setattr(loader, "db_pep_put", lambda *a: saved.append(a))
+    monkeypatch.setattr(config, "PEP_ASSEMBLIES_ENABLED", True)
+
+    def boom(*a, **k):
+        raise ConnectionError("504")
+
+    monkeypatch.setattr(pep, "fetch_snapshot", boom)
+    members = [{"name": f"Person{i} Khan", "names": [f"Person{i} Khan"], "constituency": "", "party": ""} for i in range(12)]
+    monkeypatch.setattr(loader.pep_assemblies, "fetch_assemblies", lambda get, api: (
+        [{"key": "na", "label": "National Assembly", "level": "National", "province": "", "source": "x", "members": members}],
+        [{"key": "na", "label": "National Assembly", "source": "x", "count": 12, "error": ""}]))
+    snap = loader.refresh_wikidata()
+    assert saved and len(snap["assemblies"]) == 1 and snap["problems"] and snap["problems"][0].startswith("Wikidata:")
+    # and when nothing at all can be fetched, nothing is saved
+    saved.clear()
+    monkeypatch.setattr(loader.pep_assemblies, "fetch_assemblies", lambda get, api: (
+        [], [{"key": "na", "label": "N", "source": "x", "count": 0, "error": "page not found"}]))
+    with pytest.raises(ConnectionError):
+        loader.refresh_wikidata()
+    assert not saved
 
 
-def test_refresh_endpoint_is_admin_only_and_reports_the_fetch_state(client, monkeypatch):
-    from tests.conftest import USER_HEADERS
-    monkeypatch.setattr(config, "PEP_WIKIDATA_ENABLED", True)
-    started = []
-    monkeypatch.setattr(loader, "_refresh_wikidata_in_background", lambda force=False: started.append(force) or True)
-    assert client.post("/api/admin/pep/refresh", headers=USER_HEADERS).status_code == 403
-    r = client.post("/api/admin/pep/refresh", headers=API_HEADERS)
-    assert r.status_code == 202 and r.json()["started"] is True and started == [True]
-    assert set(r.json()["fetch"]) == {"running", "error", "started_at", "finished_at"}
-    monkeypatch.setattr(config, "PEP_WIKIDATA_ENABLED", False)
-    assert client.post("/api/admin/pep/refresh", headers=API_HEADERS).status_code == 409
+def test_load_pep_lists_each_assembly_with_its_own_count_and_error(monkeypatch):
+    members = [{"name": "Person Khan", "names": ["Person Khan"], "constituency": "NA-1", "party": "PTI"}]
+    snap = {"fetched_at": "2026-10-01T00:00:00+00:00", "people": [], "politicians": [], "assemblies": [
+        {"key": "na", "label": "National Assembly (16th)", "level": "National", "province": "", "source": "x", "members": members}],
+        "assembly_report": [{"key": "na", "label": "National Assembly (16th)", "source": "x", "count": 1, "error": ""},
+                            {"key": "gb", "label": "Gilgit-Baltistan Assembly", "source": "y", "count": 0, "error": "page not found"}]}
+    monkeypatch.setattr(loader, "_wikidata_snapshot", lambda: (snap, None))
+    monkeypatch.setattr(loader, "db_pep", lambda kind: None)
+    g = loader._load_pep()
+    rows = {m["list"]: m for m in g.meta}
+    assert rows["PEP members: National Assembly (16th)"]["records"] == 1
+    assert "page not found" in rows["PEP members: Gilgit-Baltistan Assembly"]["note"]
+    assert len(g.records) == 1

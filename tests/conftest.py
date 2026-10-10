@@ -42,6 +42,7 @@ os.environ["LIST_CACHE_TTL_SECONDS"] = "0"
 os.environ["PRELOAD_LISTS"] = "false"
 os.environ["MONITORING"] = "false"          # tests run the check themselves, never in the background
 os.environ["PEP_WIKIDATA"] = "false"         # no test touches the network; PEP tests feed the loader their own data
+os.environ["PEP_ASSEMBLIES"] = "false"       # same for the assembly member lists
 os.environ["BATCH_ROW_DELAY_SECONDS"] = "0"      # no pause between batch rows in tests
 os.environ.pop("REQUIRE_APP_KEY", None)
 

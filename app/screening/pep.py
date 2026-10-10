@@ -25,6 +25,7 @@ from app.screening.parsers import Record, _clean_cell, _hkey, normalize_cnic, no
 
 PEP_LABEL = "Politically Exposed Persons (national and provincial)"
 NATIONAL, PROVINCIAL = "National", "Provincial"
+POLITICAL = "Political figure"     # a politician with no recorded national or provincial office
 
 # --------------------------------------------------------------------------
 # Which positions make someone a PEP
@@ -172,6 +173,8 @@ def records_from_snapshot(snapshot: dict, today: date | None = None,
     records, unclassified, expired = [], 0, 0
     unknown: dict = {}
     for person in snapshot.get("people", []):
+        if person.get("dod"):
+            continue            # died: not a living customer
         quals = []
         for pos in person.get("positions", []):
             c = classify_position(pos.get("label"))
@@ -190,7 +193,43 @@ def records_from_snapshot(snapshot: dict, today: date | None = None,
                            quals, dob=str(person.get("dob") or "")[:10], source="Wikidata " + str(person.get("id", "")))
         if rec:
             records.append(rec)
-    return records, {"people": len(snapshot.get("people", [])), "unclassified_positions": unclassified,
+    # people Wikidata knows as politicians but with no office on record
+    have = {_key(r.primary, r.dob) for r in records}
+    have_names = {_key(r.primary, "") for r in records}
+    politicians = 0
+    for pol in snapshot.get("politicians", []):
+        k = _key(pol.get("name", ""), "")
+        if k in have_names or _key(pol.get("name", ""), str(pol.get("dob") or "")) in have:
+            continue
+        party = str(pol.get("party") or "")
+        rec = _make_record("PEP-WD-" + str(pol.get("id", "")), [pol.get("name", "")],
+                           [("Politician" + (f" ({party})" if party else ""), POLITICAL, "", "")],
+                           dob=str(pol.get("dob") or "")[:10], source="Wikidata " + str(pol.get("id", "")))
+        if rec:
+            records.append(rec)
+            have_names.add(k)
+            politicians += 1
+    # members of the assemblies, read from the member lists
+    members = 0
+    for asm in snapshot.get("assemblies", []):
+        for m in asm.get("members", []):
+            names = m.get("names") or [m.get("name", "")]
+            k = _key(names[0], "")
+            if k in have_names:
+                continue
+            seat = str(m.get("constituency") or "")
+            party = str(m.get("party") or "")
+            label = f"Member, {asm.get('label', 'assembly')}" + (
+                f" ({', '.join(x for x in (seat, party) if x)})" if seat or party else "")
+            rec = _make_record("PEP-ASM-" + asm.get("key", "") + "-" + re.sub(r"\W+", "", names[0])[:30], names,
+                               [(label, asm.get("level", ""), asm.get("province", ""), "")],
+                               source=str(asm.get("source", "")))
+            if rec:
+                records.append(rec)
+                have_names.add(k)
+                members += 1
+    return records, {"people": len(snapshot.get("people", [])), "politicians": politicians, "assembly_members": members,
+                     "unclassified_positions": unclassified,
                      "expired_positions": expired,
                      "top_unclassified": sorted(unknown, key=lambda k: -unknown[k])[:15]}
 
@@ -247,6 +286,11 @@ def parse_pep_persons(text: str) -> tuple:
                      "provincial": sum(r.pep_level == PROVINCIAL for r in records)}
 
 
+def _key(name: str, dob: str) -> tuple:
+    from app.screening import names as nm
+    return (" ".join(sorted(nm.tokens(name))), (dob or "")[:4])
+
+
 def merge(*groups: list) -> list:
     """Records from several sources, one per person: the first source to name someone wins (put the admin's list first)."""
     from app.screening import names as nm
@@ -271,12 +315,24 @@ _QID = re.compile(r"^Q\d+$")
 
 
 def _query_people(country: str, limit: int, offset: int) -> str:
-    return f"""SELECT ?person ?personLabel ?dob ?posLabel ?start ?end WHERE {{
+    return f"""SELECT ?person ?personLabel ?dob ?dod ?posLabel ?start ?end WHERE {{
   {{ SELECT DISTINCT ?person WHERE {{ ?person wdt:P27 wd:{country} ; wdt:P39 [] . }} ORDER BY ?person LIMIT {limit} OFFSET {offset} }}
   ?person p:P39 ?st . ?st ps:P39 ?pos .
   OPTIONAL {{ ?st pq:P580 ?start }}
   OPTIONAL {{ ?st pq:P582 ?end }}
   OPTIONAL {{ ?person wdt:P569 ?dob }}
+  OPTIONAL {{ ?person wdt:P570 ?dod }}
+  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
+}}"""
+
+
+def _query_politicians(country: str, limit: int, offset: int) -> str:
+    """Living Pakistani politicians (occupation politician), whether or not Wikidata records an office for them.
+    Party leaders and former members are often listed only this way."""
+    return f"""SELECT ?person ?personLabel ?dob ?partyLabel WHERE {{
+  {{ SELECT DISTINCT ?person WHERE {{ ?person wdt:P27 wd:{country} ; wdt:P106 wd:Q82955 . FILTER NOT EXISTS {{ ?person wdt:P570 [] }} }} ORDER BY ?person LIMIT {limit} OFFSET {offset} }}
+  OPTIONAL {{ ?person wdt:P569 ?dob }}
+  OPTIONAL {{ ?person wdt:P102 ?party }}
   SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
 }}"""
 
@@ -289,6 +345,28 @@ def _query_aliases(country: str, ids: list) -> str:
   VALUES ?person {{ {values} }}
   ?person skos:altLabel ?alias . FILTER(LANG(?alias) = "en")
 }}"""
+
+
+def fetch_politicians(get, country: str = "Q843", page: int = PAGE_PEOPLE, pause: float = 1.0) -> list:
+    """Living politicians as [{id, name, dob, party}]. An extra source: the caller keeps going if it fails."""
+    out: dict = {}
+    for n in range(MAX_PAGES):
+        rows = _ask(get, _query_politicians(country, page, n * page), pause)
+        for r in rows:
+            pid = _qid(r["person"]["value"])
+            name = r.get("personLabel", {}).get("value", "")
+            if not name or _QID.match(name):
+                continue
+            p = out.setdefault(pid, {"id": pid, "name": name, "dob": "", "party": ""})
+            if r.get("dob") and not p["dob"]:
+                p["dob"] = r["dob"]["value"][:10]
+            party = r.get("partyLabel", {}).get("value", "")
+            if party and not _QID.match(party) and not p["party"]:
+                p["party"] = party
+        if len({_qid(r["person"]["value"]) for r in rows}) < page:
+            break
+        time.sleep(pause)
+    return sorted(out.values(), key=lambda p: p["id"])
 
 
 def _qid(uri: str) -> str:
@@ -334,6 +412,8 @@ def fetch_snapshot(get, country: str = "Q843", page: int = PAGE_PEOPLE, pause: f
             p = people.setdefault(pid, {"id": pid, "name": name, "aliases": [], "dob": "", "positions": []})
             if r.get("dob") and not p["dob"]:
                 p["dob"] = r["dob"]["value"][:10]
+            if r.get("dod") and not p.get("dod"):
+                p["dod"] = r["dod"]["value"][:10]
             label = r.get("posLabel", {}).get("value", "")
             if label and not _QID.match(label):
                 p["positions"].append({"label": label, "start": r.get("start", {}).get("value", "")[:10],
@@ -355,5 +435,11 @@ def fetch_snapshot(get, country: str = "Q843", page: int = PAGE_PEOPLE, pause: f
                     p["aliases"].append(r["alias"]["value"])
         except Exception:      # noqa: BLE001
             break              # the rest of the aliases are skipped; every name is still there
-    return {"fetched_at": datetime.now(timezone.utc).isoformat(), "country": country,
+    snap = {"fetched_at": datetime.now(timezone.utc).isoformat(), "country": country,
             "people": sorted(people.values(), key=lambda p: p["id"])}
+    try:
+        time.sleep(pause)
+        snap["politicians"] = fetch_politicians(get, country, page, pause)
+    except Exception:      # noqa: BLE001
+        snap["politicians"] = []    # an extra: the office holders above are still complete
+    return snap
