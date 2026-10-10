@@ -181,7 +181,14 @@ def fetch_text(url: str, read_timeout: float = READ_TIMEOUT) -> str:
 
 
 def _short(exc: BaseException) -> str:
-    return f"{type(exc).__name__}: {str(exc)[:160]}"
+    # An HTTP error carries the whole request address in its text: for Wikidata that is a long query. Say what
+    # happened and who answered, nothing else.
+    resp = getattr(exc, "response", None)
+    if resp is not None and getattr(resp, "status_code", None):
+        host = urlparse(getattr(resp, "url", "") or "").hostname or "the server"
+        return f"HTTP {resp.status_code} from {host}"
+    text = re.sub(r"https?://\S+", "<address>", str(exc))
+    return f"{type(exc).__name__}: {text[:160]}"
 
 
 def list_info(meta: dict, debug: bool = False) -> dict:
