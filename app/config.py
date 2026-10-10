@@ -112,6 +112,10 @@ PEP_WIKIDATA_URL = os.environ.get("PEP_WIKIDATA_URL", "https://query.wikidata.or
 # The Wikidata item of the country whose office holders are fetched (Pakistan).
 PEP_WIKIDATA_COUNTRY = os.environ.get("PEP_WIKIDATA_COUNTRY", "Q843").strip()
 PEP_REFRESH_DAYS = _float_env("PEP_REFRESH_DAYS", 7)
+# Members of the National Assembly, the Senate and the provincial assemblies, read from the public member lists
+# (Wikipedia and na.gov.pk). They fill the gaps in Wikidata and are refreshed with it. PEP_ASSEMBLIES=false skips them.
+PEP_ASSEMBLIES_ENABLED = os.environ.get("PEP_ASSEMBLIES", "true").strip().lower() not in ("0", "false", "no")
+PEP_WIKIPEDIA_API = os.environ.get("PEP_WIKIPEDIA_API", "https://en.wikipedia.org/w/api.php").strip()
 # How long after leaving office a person still counts as a PEP. 0 means current office holders only,
 # a negative number means never drop anyone.
 PEP_LOOKBACK_YEARS = _float_env("PEP_LOOKBACK_YEARS", 5)
