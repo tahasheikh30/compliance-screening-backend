@@ -329,6 +329,7 @@ def _batch_out(user_batch: dict, with_rows: bool = True) -> BatchOut:
             applicant_id=r["applicant_id"], overall_status=r.get("overall_status"),
             sanctions=r["sanctions"] if r["state"] == "screened" else None,
             news=r["news"] if r["state"] == "screened" else None,
+            pep=r["pep"] if r["state"] == "screened" else None,
             case_ref=_case_ref(r["applicant_id"], when) if r["state"] == "screened" and when else None,
             dob=r.get("dob"), nationality=r.get("nationality")))
     counts = {"screened": 0, "invalid": 0, "failed": 0, "pending": 0,

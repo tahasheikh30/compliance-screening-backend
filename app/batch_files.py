@@ -268,7 +268,7 @@ _OUTCOME = {"ESCALATE_TO_COMPLIANCE": "Escalate to compliance", "MANUAL_REVIEW":
             "AUTO_CLEAR": "Clear"}
 _STATE_NOTE = {"pending": "Not screened (the batch did not finish)"}
 HEADERS = ["Row", "Full name", "Date of birth", "Nationality", "CNIC", "Father or husband", "Province", "Outcome",
-           "Sanctions matches", "News articles", "Case reference", "Note"]
+           "Sanctions matches", "News articles", "PEP matches", "Case reference", "Note"]
 
 
 def results_workbook(batch: dict, rows: list, case_ref) -> bytes:
@@ -296,13 +296,14 @@ def results_workbook(batch: dict, rows: list, case_ref) -> bytes:
         ws.append([r["row_no"], r["full_name"], r.get("dob") or "", r.get("nationality") or "", r.get("cnic") or "",
                    r.get("father_name") or "", r.get("province") or "", outcome,
                    r["sanctions"] if r["state"] == "screened" else "", r["news"] if r["state"] == "screened" else "",
+                   r["pep"] if r["state"] == "screened" else "",
                    case_ref(r) if r["state"] == "screened" else "", note])
     # text stays text: a name that starts with = + - or @ must not turn into a formula when the file is opened
     for row in ws.iter_rows(min_row=2):
         for c in row:
             if isinstance(c.value, str):
                 c.data_type = "s"
-    for i, width in enumerate([6, 32, 14, 16, 18, 28, 14, 24, 10, 10, 22, 48], start=1):
+    for i, width in enumerate([6, 32, 14, 16, 18, 28, 14, 24, 10, 10, 10, 22, 48], start=1):
         ws.column_dimensions[get_column_letter(i)].width = width
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions

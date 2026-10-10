@@ -260,6 +260,7 @@ class BatchRowOut(BaseModel):
     overall_status: Optional[str] = None
     sanctions: Optional[int] = None       # potential matches across the sanctions and watch lists
     news: Optional[int] = None            # adverse news articles found
+    pep: Optional[int] = None             # potential politically exposed person matches (not sanctions)
     case_ref: Optional[str] = None
     dob: Optional[str] = None             # what the file said, for the case view (as in the history list)
     nationality: Optional[str] = None

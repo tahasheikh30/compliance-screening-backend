@@ -229,3 +229,13 @@ def test_merge_keeps_one_record_per_person_and_prefers_the_first_source():
         {"label": "Member of the National Assembly of Pakistan"}]}]}, date(2026, 10, 10))
     merged = pep.merge(a, b)
     assert len(merged) == 1 and merged[0].id.startswith("PEP-UP-")
+
+
+def test_batch_counts_a_pep_separately_from_sanctions(client):
+    from tests.test_batch import make_xlsx, post, wait
+    bid = post(client, make_xlsx([["Zorawar Khanzada Mehtab", "", "", "", "", ""],
+                                  ["Completely Unrelated Person", "", "", "", "", ""]])).json()["id"]
+    rows = {x["full_name"]: x for x in wait(client, bid)["rows"]}
+    pep_row = rows["Zorawar Khanzada Mehtab"]
+    assert pep_row["pep"] == 1 and pep_row["sanctions"] == 0 and pep_row["overall_status"] == "MANUAL_REVIEW"
+    assert rows["Completely Unrelated Person"]["pep"] == 0
