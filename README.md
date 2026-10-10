@@ -99,7 +99,7 @@ web address that returns the list**. The list therefore reaches the screening as
 2. **Scheduled, with a browser (recommended).** `scripts/fetch_nacta.py` opens the site in a headless
    browser, clicks the JSON button, checks the file (at least 1,000 people, within 10 percent of the count
    the page shows, readable by the same parser the backend uses), and uploads it. A refused or partial
-   download never replaces a good list. `.github/workflows/refresh-nacta.yml` runs it twice a week on GitHub
+   download never replaces a good list. `.github/workflows/refresh-nacta.yml` runs it once a week, on Monday, on GitHub
    Actions with two repository secrets, `SCREENING_API_URL` and `SCREENING_API_KEY`. If NACTA does not answer
    GitHub's servers (government sites sometimes only answer inside Pakistan), run the same script on a
    computer in Pakistan on a schedule instead.
@@ -252,7 +252,7 @@ A screening is a photograph of one day. Someone who is clear today can be listed
 
 **Enrol** a person when you screen them (`"monitor": true` in `POST /api/screen`) or later with `POST /api/applicants/{id}/monitoring` and `{"enabled": true}`. Enrolling later also checks them against the current lists straight away, so someone screened weeks ago is not left unchecked until the next list update. Monitoring is opt-in on purpose: it keeps personal data and re-checks it, so it is a decision for each person. `{"enabled": false}` stops it.
 
-**How it decides to re-screen.** Every list has a fingerprint, a hash of its records' ids, names, dates of birth and CNICs. The fingerprint each list had when everyone was last checked is stored in the database. Every `MONITOR_INTERVAL_SECONDS` (default 900) the current fingerprints are compared; for each list that changed, every monitored person is screened against that list only, with the same matcher, threshold, CNIC, father's name and province as their original screening.
+**How it decides to re-screen.** Every list has a fingerprint, a hash of its records' ids, names, dates of birth and CNICs. The fingerprint each list had when everyone was last checked is stored in the database. Every `MONITOR_INTERVAL_SECONDS` (default 86400, once a day) the current fingerprints are compared; for each list that changed, every monitored person is screened against that list only, with the same matcher, threshold, CNIC, father's name and province as their original screening.
 
 **What becomes an alert.** Only a **new** potential match: not one the person already had when first screened, and not one already alerted. A match is therefore raised once, however many times a list changes, and the original screening is never rewritten.
 
