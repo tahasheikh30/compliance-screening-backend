@@ -400,3 +400,22 @@ def test_a_monitored_persons_province_is_kept_for_the_rechecks(client):
     from app import database as db
     batch = db.monitored_batch(0, 10)
     assert [b["province"] for b in batch if b["id"] == a["applicant_id"]] == ["Sindh"]
+
+
+# ---- clearing your own history ---------------------------------------------------
+
+def test_clear_history_deletes_only_your_own_unmonitored_screenings(client, fake_sources):
+    mine = _screen(client, "Plain Person One", headers=USER_HEADERS)
+    watched = _screen(client, "Watched Person Two", headers=USER_HEADERS, monitor=True)
+    theirs = _screen(client, "Someone Elses Person", headers=USER2_HEADERS)
+    r = client.delete("/api/account/history", headers=USER_HEADERS)
+    assert r.status_code == 200 and r.json() == {"deleted": 1, "kept_monitored": 1}
+    assert client.get(f"/api/applicants/{mine['applicant_id']}", headers=USER_HEADERS).status_code == 404
+    assert client.get(f"/api/applicants/{watched['applicant_id']}", headers=USER_HEADERS).status_code == 200
+    assert client.get(f"/api/applicants/{theirs['applicant_id']}", headers=USER2_HEADERS).status_code == 200
+    assert [a["id"] for a in client.get("/api/applicants?mine=true", headers=USER_HEADERS).json()] == [watched["applicant_id"]]
+    assert client.delete("/api/account/history").status_code in (401, 403)           # not signed in
+    # the action is on the audit log, count only
+    log = client.get("/api/admin/audit?limit=50", headers=API_HEADERS).json()
+    entries = log["entries"] if isinstance(log, dict) else log
+    assert any(e["action"] == "history.clear" for e in entries)
