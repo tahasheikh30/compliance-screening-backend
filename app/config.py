@@ -99,6 +99,27 @@ NACTA_MAX_AGE_DAYS = _float_env("NACTA_MAX_AGE_DAYS", 30)
 NACTA_REQUIRED = os.environ.get("NACTA_REQUIRED", "true").strip().lower() not in ("0", "false", "no")
 
 
+# --- Politically exposed persons (PEPs), national and provincial ---------
+# Pakistan publishes no official PEP list, so this source has two parts that are combined at screening time:
+#   1. Wikidata (public domain, CC0): current and recent holders of national and provincial office, fetched with
+#      one query and saved in the database, then refreshed every PEP_REFRESH_DAYS. Set PEP_WIKIDATA=false to
+#      switch it off (for example on a host that cannot reach query.wikidata.org).
+#   2. Your own list, uploaded by an admin on the Lists page (POST /api/admin/pep): add people Wikidata misses
+#      (ECP notifications, assembly members, party office holders) or correct it.
+# A PEP match is not a sanctions hit. It sends the applicant to MANUAL_REVIEW for enhanced due diligence.
+PEP_WIKIDATA_ENABLED = os.environ.get("PEP_WIKIDATA", "true").strip().lower() not in ("0", "false", "no")
+PEP_WIKIDATA_URL = os.environ.get("PEP_WIKIDATA_URL", "https://query.wikidata.org/sparql").strip()
+# The Wikidata item of the country whose office holders are fetched (Pakistan).
+PEP_WIKIDATA_COUNTRY = os.environ.get("PEP_WIKIDATA_COUNTRY", "Q843").strip()
+PEP_REFRESH_DAYS = _float_env("PEP_REFRESH_DAYS", 7)
+# How long after leaving office a person still counts as a PEP. 0 means current office holders only,
+# a negative number means never drop anyone.
+PEP_LOOKBACK_YEARS = _float_env("PEP_LOOKBACK_YEARS", 5)
+# When true, a screening with no PEP data at all (nothing fetched and nothing uploaded) goes to manual review.
+# The default is false so the first deploy does not send every applicant to review before any data is loaded.
+PEP_REQUIRED = os.environ.get("PEP_REQUIRED", "false").strip().lower() in ("1", "true", "yes")
+
+
 # --- Network safety ------------------------------------------------------
 # Largest single download accepted from a list publisher. The biggest real files are a few tens of megabytes;
 # the cap stops a compromised or misconfigured source from exhausting the server's memory.

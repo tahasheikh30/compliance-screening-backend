@@ -8,7 +8,7 @@ def test_clear_applicant_has_no_hits_and_every_source_clear(fake_sources):
     r = engine.screen("Completely Unrelated Person")
     assert r["hit"] is False and r["hit_count"] == 0
     assert {k: engine.source_status(v) for k, v in r["sources"].items()} == {
-        "UNSC": "CLEAR", "OFAC": "CLEAR", "UKSL": "CLEAR", "FIA_REDBOOK": "CLEAR", "NACTA": "CLEAR",
+        "UNSC": "CLEAR", "OFAC": "CLEAR", "UKSL": "CLEAR", "FIA_REDBOOK": "CLEAR", "NACTA": "CLEAR", "PEP": "CLEAR",
         "ADVERSE_MEDIA": "CLEAR"}
     assert engine.overall_status({k: "CLEAR" for k in r["sources"]}) == "AUTO_CLEAR"
     assert r["total_records"] == 3 + 4 + 1 + 2 or r["total_records"] > 0

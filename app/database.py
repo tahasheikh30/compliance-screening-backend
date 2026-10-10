@@ -409,6 +409,41 @@ def nacta_get() -> tuple | None:
 
 
 # --------------------------------------------------------------------------
+# PEP data (kind 'upload' = the admin's list, 'wikidata' = the last good fetch)
+# --------------------------------------------------------------------------
+
+_PEP_META = "kind, filename, uploaded_at, records, size, sha256"
+
+
+def pep_put(kind: str, data: bytes, filename: str, records: int) -> dict:
+    with pool().connection() as conn:
+        row = conn.execute(
+            "INSERT INTO pep_files (kind, content, filename, uploaded_at, records, size, sha256) "
+            "VALUES (%s, %s, %s, now(), %s, %s, %s) "
+            "ON CONFLICT (kind) DO UPDATE SET content = EXCLUDED.content, filename = EXCLUDED.filename, "
+            "uploaded_at = EXCLUDED.uploaded_at, records = EXCLUDED.records, size = EXCLUDED.size, "
+            f"sha256 = EXCLUDED.sha256 RETURNING {_PEP_META}",
+            (kind, data, filename, int(records), len(data), hashlib.sha256(data).hexdigest()),
+        ).fetchone()
+        return _clean(row)
+
+
+def pep_meta(kind: str) -> dict | None:
+    with pool().connection() as conn:
+        return _clean(conn.execute(f"SELECT {_PEP_META} FROM pep_files WHERE kind = %s", (kind,)).fetchone())
+
+
+def pep_get(kind: str) -> tuple | None:
+    """(bytes, metadata) or None."""
+    with pool().connection() as conn:
+        row = conn.execute(f"SELECT content, {_PEP_META} FROM pep_files WHERE kind = %s", (kind,)).fetchone()
+    if not row:
+        return None
+    content = bytes(row.pop("content"))
+    return content, _clean(row)
+
+
+# --------------------------------------------------------------------------
 # Audit log (append only, hash chained)
 # --------------------------------------------------------------------------
 

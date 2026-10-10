@@ -41,6 +41,8 @@ class Record:
     cnic: str = ""    # 13 digit national ID, digits only, when the list publishes one
     father: str = ""  # father's or husband's name, when the list publishes one
     province: str = ""  # province or territory, when the list publishes one (NACTA does)
+    pep_level: str = ""  # "National" or "Provincial" for a politically exposed person
+    position: str = ""   # the office held, for a politically exposed person
 
 
 def prepare(records: list) -> list:

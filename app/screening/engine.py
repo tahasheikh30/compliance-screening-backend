@@ -26,9 +26,10 @@ SOURCE_LABELS = {
     "UKSL": "UK Sanctions List (FCDO)",
     "FIA_REDBOOK": "FIA Red Book",
     "NACTA": "NACTA Proscribed Persons (Fourth Schedule)",
+    "PEP": "Politically Exposed Persons (national and provincial)",
     "ADVERSE_MEDIA": "Adverse media (open news search)",
 }
-SOURCE_ORDER = ("UNSC", "OFAC", "UKSL", "FIA_REDBOOK", "NACTA", "ADVERSE_MEDIA")
+SOURCE_ORDER = ("UNSC", "OFAC", "UKSL", "FIA_REDBOOK", "NACTA", "PEP", "ADVERSE_MEDIA")
 
 
 class UnscreenableName(ValueError):
@@ -91,6 +92,8 @@ def _match_dict(r, best: float, best_name: str, dob_year: str, cnic: str, father
         "father_match": father_match,
         "province": r.province,
         "province_match": province_match,
+        "pep_level": r.pep_level,
+        "position": r.position,
     }
 
 
@@ -170,6 +173,7 @@ def screen(name: str, dob: str = "", nationality: str = "", threshold=None,
     lists_meta: list = []
     total_records = 0
     sanctions_hits = 0
+    pep_hits = 0       # being a PEP is not a sanction: counted on its own and never as a sanctions hit
 
     for key in loader.SOURCE_KEYS:
         g = groups[key]
@@ -179,7 +183,10 @@ def screen(name: str, dob: str = "", nationality: str = "", threshold=None,
                                            index=g.index, province=province)
                                 if g.available else ([], 0))
         total_records += len(g.records)
-        sanctions_hits += found_count
+        if key == "PEP":
+            pep_hits += found_count
+        else:
+            sanctions_hits += found_count
         all_matches.extend(matches)
         published = "; ".join(sorted({str(x.get("published")) for x in g.meta if x.get("published") and x.get("records")}))
         lists = [loader.list_info(x) for x in g.meta]
@@ -221,6 +228,7 @@ def screen(name: str, dob: str = "", nationality: str = "", threshold=None,
         "total_records": total_records,
         "sanctions_hit_count": sanctions_hits,
         "media_hit_count": media_hits,
+        "pep_hit_count": pep_hits,
         "hit_count": sanctions_hits + media_hits,
         "hit": sanctions_hits + media_hits > 0,
         "adverse_media": news,
@@ -253,11 +261,11 @@ def _news(name: str) -> dict:
 def source_status(src: dict, fia_required: bool = True) -> str:
     """HIT / PARTIAL / REVIEW / CLEAR / NOT_CONFIGURED / ERROR for one source."""
     if not src["available"]:
-        if src["key"] in ("FIA_REDBOOK", "NACTA"):
+        if src["key"] in ("FIA_REDBOOK", "NACTA", "PEP"):
             return "NOT_CONFIGURED"
         return "ERROR"
     if src["matches"]:
-        return "HIT"
+        return "REVIEW" if src["key"] == "PEP" else "HIT"   # a PEP match needs enhanced due diligence, it is not a sanction
     if src.get("partial"):
         return "PARTIAL"  # nothing found, but part of this source could not be read
     if src["articles"]:
@@ -265,7 +273,8 @@ def source_status(src: dict, fia_required: bool = True) -> str:
     return "CLEAR"
 
 
-def overall_status(statuses: dict, fia_required: bool = True, nacta_required: bool = True) -> str:
+def overall_status(statuses: dict, fia_required: bool = True, nacta_required: bool = True,
+                   pep_required: bool = False) -> str:
     """
     A source that did not run must never resolve to AUTO_CLEAR. The only
     exceptions are the FIA Red Book (FIA_REQUIRED=false, which mirrors the workflow where
@@ -281,6 +290,8 @@ def overall_status(statuses: dict, fia_required: bool = True, nacta_required: bo
             if k == "FIA_REDBOOK" and not fia_required:
                 continue
             if k == "NACTA" and not nacta_required:
+                continue
+            if k == "PEP" and not pep_required:
                 continue
             return "MANUAL_REVIEW"
     return "AUTO_CLEAR"
@@ -302,6 +313,15 @@ def describe_source(src: dict, status: str, threshold: float) -> str:
         return ("Incomplete screening. Not fully screened: " + "; ".join(unread)
                 + ". Treat this applicant as not yet cleared by this source.")
     n = src.get("match_count", len(src["matches"]))
+    if src["key"] == "PEP" and n:
+        top = src["matches"][0]
+        level = (top.get("pep_level") or "").lower()
+        where = f", {top['province']}" if top.get("province") else ""
+        more = f" and {n - 1} more" if n > 1 else ""
+        return (f"{n} potential PEP match(es) at or above {threshold:g}%. Top: {top['primary_name']} "
+                f"({top['score']:g}%, {level + ' ' if level else ''}PEP{where}; {top.get('position') or 'office not stated'}){more}. "
+                "A PEP is not a sanctions hit: apply enhanced due diligence (source of funds and wealth, senior approval) "
+                "and verify identity before any decision.")
     if n and unread:
         extra = " Note: some lists of this source were not fully screened. " + "; ".join(unread) + "."
     else:
