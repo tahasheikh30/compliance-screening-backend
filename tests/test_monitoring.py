@@ -103,7 +103,7 @@ def test_each_applicants_own_threshold_is_used(client, fake_sources):
     strict = _screen(client, "Zebediah Quillfeather", monitor=True, threshold=99)
     loose = _screen(client, "Zebediah Quillfeather", monitor=True, threshold=85)
     monitoring.run_once()
-    _list_person(fake_sources, "ZEBEDIAH", "QUILFEATHERS", 903)       # scores 98.3 against the applicant
+    _list_person(fake_sources, "ZEBEDIAH", "KUILFEATHERS", 903)       # scores 95.7 against the applicant
     assert monitoring.run_once()["new_alerts"] == 1
     assert [a["applicant_id"] for a in _alerts(client).json()] == [loose["applicant_id"]]
     assert strict["applicant_id"] != loose["applicant_id"]

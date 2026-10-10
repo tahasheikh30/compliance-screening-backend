@@ -13,8 +13,9 @@ def test_norm_strips_accents_punctuation_and_case():
 
 
 def test_honorifics_and_particles_removed_but_common_surnames_kept():
-    assert tokens("Dr. Haji Muhammad Ali Sheikh") == ("MUHAMMAD", "ALI", "SHEIKH")
-    assert tokens("Abdul Rahman bin Al Sayed") == ("ABDUL", "RAHMAN", "SAYED")
+    # parts are also sound-folded (double letters and oo/ee/ai spellings collapse), the same way on both sides
+    assert tokens("Dr. Haji Muhammad Ali Sheikh") == ("MUHAMAD", "ALI", "SHEIKH")
+    assert tokens("Abdul Rahman bin Al Sayed") == ("ABDUL", "RAHMAN", "SED")
     # a name made only of honorifics is kept rather than emptied
     assert tokens("Dr") == ("DR",)
 

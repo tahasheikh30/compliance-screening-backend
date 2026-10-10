@@ -26,8 +26,8 @@ def test_known_spelling_variants_are_the_same_name(a, b):
 
 
 def test_abdullah_is_never_cut_into_pieces():
-    assert tokens("Abdullah") == ("ABDULLAH",)
-    assert tokens("Abdalla") == ("ABDULLAH",)
+    # one part, spelled the same however it was typed (the sound folding turns the double L into one)
+    assert len(tokens("Abdullah")) == 1 and tokens("Abdullah") == tokens("Abdalla") == tokens("Abdulla")
     assert tokens("Abdulaziz") == ("ABDUL", "AZIZ")
 
 
