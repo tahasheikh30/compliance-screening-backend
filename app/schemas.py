@@ -123,6 +123,9 @@ class ScreenResponse(BaseModel):
     media_hit_count: Optional[int] = None
     pep_hit_count: Optional[int] = None
     monitored: bool = False
+    review_decision: Optional[str] = None     # cleared, confirmed or escalated; None until a person reviews it
+    review_note: Optional[str] = None
+    reviewed_at: Optional[str] = None
 
 
 class ApplicantSummary(BaseModel):
@@ -136,6 +139,7 @@ class ApplicantSummary(BaseModel):
     screened_by: Optional[str] = None   # email of the analyst who ran it (shown to admins, who see everyone's)
     monitored: bool = False
     last_monitored_at: Optional[str] = None
+    review_decision: Optional[str] = None
 
 
 class MeOut(BaseModel):
@@ -283,3 +287,37 @@ class BatchOut(BaseModel):
     finished_at: Optional[str] = None
     counts: dict
     rows: List[BatchRowOut] = []
+
+
+class CoverageIn(BaseModel):
+    names: list[str] = Field(..., min_length=1, max_length=200)
+    threshold: Optional[float] = None
+
+
+class CoverageRowOut(BaseModel):
+    name: str
+    found: bool
+    source: Optional[str] = None
+    score: float = 0.0
+    matched_name: Optional[str] = None
+    list: Optional[str] = None
+    error: Optional[str] = None
+
+
+class CoverageOut(BaseModel):
+    checked: int
+    found: int
+    rows: list[CoverageRowOut]
+
+
+class ReviewIn(BaseModel):
+    """A reviewer's decision: cleared (a false alarm), confirmed (a true match), escalated, or none to undo."""
+    decision: Optional[Literal["cleared", "confirmed", "escalated"]] = None
+    note: Optional[str] = Field(default=None, max_length=1000)
+
+
+class ReviewOut(BaseModel):
+    applicant_id: int
+    review_decision: Optional[str] = None
+    review_note: Optional[str] = None
+    reviewed_at: Optional[str] = None

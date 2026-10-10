@@ -1,7 +1,7 @@
 """API contract: auth, error envelope, screening flow, failure isolation, evidence download."""
 from app.screening import loader
 from tests import fixtures as fx
-from tests.conftest import API_HEADERS
+from tests.conftest import API_HEADERS, USER2_ID, USER_HEADERS, bearer
 
 
 def _screen(client, **body):
@@ -324,3 +324,49 @@ def test_stale_uploaded_file_is_reported_by_the_status_endpoint(client, fake_sou
     assert client.get("/api/admin/nacta", headers=API_HEADERS).json()["stale"] is True
     r = _screen(client)
     assert _by_source(r)["NACTA"]["status"] == "PARTIAL" and r.json()["overall_status"] == "MANUAL_REVIEW"
+
+
+def test_coverage_check_reports_found_and_missing_names_and_is_admin_only(client, fake_sources):
+    body = {"names": ["Muhammad Ali Khan", "Nobody Atall Listed", "علی خان"]}
+    r = client.post("/api/admin/coverage", json=body, headers=API_HEADERS)
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["checked"] == 3 and out["found"] == 1
+    by = {row["name"]: row for row in out["rows"]}
+    assert by["Muhammad Ali Khan"]["found"] and by["Muhammad Ali Khan"]["source"] == "UNSC"
+    assert not by["Nobody Atall Listed"]["found"] and by["Nobody Atall Listed"]["error"] is None
+    assert by["علی خان"]["error"]                                    # not Latin letters: reported, never "not found"
+    assert client.post("/api/admin/coverage", json=body, headers=USER_HEADERS).status_code == 403
+    assert client.get("/api/applicants?mine=true", headers=API_HEADERS).json() == []     # nothing was saved
+
+
+def test_review_decision_is_recorded_shown_and_scoped(client, fake_sources):
+    a = client.post("/api/screen", json={"full_name": "Muhammad Ali Khan"}, headers=USER_HEADERS).json()
+    aid = a["applicant_id"]
+    r = client.post(f"/api/applicants/{aid}/review", json={"decision": "cleared", "note": "  Different person, DOB 1990  "},
+                    headers=USER_HEADERS)
+    assert r.status_code == 200 and r.json()["review_decision"] == "cleared" and r.json()["review_note"] == "Different person, DOB 1990"
+    got = client.get(f"/api/applicants/{aid}", headers=USER_HEADERS).json()
+    assert got["review_decision"] == "cleared" and got["reviewed_at"]
+    assert client.get("/api/applicants?mine=true", headers=USER_HEADERS).json()[0]["review_decision"] == "cleared"
+    # someone else's screening looks like it does not exist; an administrator may review anyone's
+    other = bearer(USER2_ID)
+    assert client.post(f"/api/applicants/{aid}/review", json={"decision": "confirmed"}, headers=other).status_code == 404
+    assert client.post(f"/api/applicants/{aid}/review", json={"decision": "escalated"}, headers=API_HEADERS).status_code == 200
+    assert client.post(f"/api/applicants/{aid}/review", json={"decision": "nonsense"}, headers=USER_HEADERS).status_code == 422
+    undone = client.post(f"/api/applicants/{aid}/review", json={"decision": None, "note": "ignored"}, headers=USER_HEADERS).json()
+    assert undone["review_decision"] is None and undone["review_note"] is None
+
+
+def test_history_csv_export_is_scoped_and_cannot_run_as_a_formula(client, fake_sources):
+    client.post("/api/screen", json={"full_name": "Zed Mine Person"}, headers=USER_HEADERS)
+    client.post("/api/screen", json={"full_name": "=HYPERLINK(1) Evil"}, headers=USER_HEADERS)
+    client.post("/api/screen", json={"full_name": "Bilal Other Person"}, headers=bearer(USER2_ID))
+    r = client.get("/api/export/history.csv", headers=USER_HEADERS)
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/csv")
+    text = r.content.decode("utf-8-sig")
+    assert "Zed Mine Person" in text and "Bilal Other Person" not in text
+    assert "'=HYPERLINK(1) Evil" in text and ",=HYPERLINK" not in text and '"=HYPERLINK' not in text
+    everyone = client.get("/api/export/history.csv?mine=false", headers=API_HEADERS).content.decode("utf-8-sig")
+    assert "Bilal Other Person" in everyone and "Zed Mine Person" in everyone
+    assert "Bilal Other Person" not in client.get("/api/export/history.csv?mine=false", headers=USER_HEADERS).content.decode("utf-8-sig")

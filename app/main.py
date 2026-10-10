@@ -27,6 +27,9 @@ Endpoints:
     GET  /api/applicants                  your past screenings (admins: everyone's; ?mine=true for their own)
     GET  /api/applicants/{id}             full result for one screening
     GET  /api/applicants/{id}/evidence    evidence PDF of a screening that found something
+    POST /api/admin/coverage              (admin) which of these names are found on the lists, and where
+    POST /api/applicants/{id}/review      record a decision (cleared, confirmed, escalated) and a note on a screening
+    GET  /api/export/history.csv          your screening history as a CSV
     DELETE /api/account/history           delete your own screening history (monitored screenings are kept)
     GET  /api/evidence/{result_id}        same PDF, addressed by a result row id
     GET  /api/admin/lists                 which lists are cached in memory right now
@@ -79,7 +82,7 @@ from app.config import FIA_REQUIRED, NACTA_REQUIRED, PEP_REQUIRED, PRELOAD_LISTS
 from app.errors import AppError, configure_logging, install as install_error_handlers, request_context, logger
 from app.schemas import (AlertDecisionIn, AlertOut, ApplicantSummary, AuditEntryOut, AuditPageOut, AuditVerifyOut,
                          BatchOut, BatchRowOut, MeOut,
-                         HistoryClearedOut, MonitoringIn, MonitoringOut, MonitoringStatusOut, SourceMonitoringOut, ScreenRequest, ScreenResponse, ScreeningResultOut, UserDeletedOut, UserOut,
+                         CoverageIn, CoverageOut, CoverageRowOut, HistoryClearedOut, ReviewIn, ReviewOut, MonitoringIn, MonitoringOut, MonitoringStatusOut, SourceMonitoringOut, ScreenRequest, ScreenResponse, ScreeningResultOut, UserDeletedOut, UserOut,
                          UserRoleIn, UserStatusIn)
 from app.screening import engine, loader, nacta_store, parsers, pep
 
@@ -484,6 +487,18 @@ def list_applicants(request: Request, response: Response, mine: bool = False,
     return rows
 
 
+@app.post("/api/admin/coverage", response_model=CoverageOut)
+@limiter.limit("10/minute")
+async def check_coverage(request: Request, body: CoverageIn, user: AuthUser = Depends(require_admin)):
+    """
+    Administrators: paste names you know should be on the lists (sanctioned persons, politicians) and see which
+    are found and from which list. Nothing is saved to anyone's history. Use it after a deploy to check the lists.
+    """
+    rows = await run_in_threadpool(engine.coverage, body.names, body.threshold)
+    _audit(request, user, "coverage.check", None, None, {"names": len(rows), "found": sum(r["found"] for r in rows)})
+    return CoverageOut(checked=len(rows), found=sum(r["found"] for r in rows), rows=[CoverageRowOut(**r) for r in rows])
+
+
 @app.delete("/api/account/history", response_model=HistoryClearedOut)
 @limiter.limit("5/minute")
 def clear_my_history(request: Request, user: AuthUser = Depends(require_approved)):
@@ -497,6 +512,56 @@ def clear_my_history(request: Request, user: AuthUser = Depends(require_approved
     out = db.clear_history(user.id)
     _audit(request, user, "history.clear", "user", user.id, out)
     return HistoryClearedOut(**out)
+
+
+def _csv_cell(v) -> str:
+    """A text cell that a spreadsheet will not run as a formula (a name starting with = + - or @)."""
+    t = "" if v is None else str(v)
+    return "'" + t if t[:1] in ("=", "+", "-", "@", "\t", "\r") else t
+
+
+@app.get("/api/export/history.csv")
+@limiter.limit("6/minute")
+def export_history(request: Request, mine: bool = True, user: AuthUser = Depends(require_approved)):
+    """
+    Your screening history as a CSV (up to 5000 newest rows): case reference, name, date, outcome, reviewer decision.
+    Administrators can pass mine=false for everyone's, with who ran each one.
+    """
+    import csv
+    import io
+    rows, _total = db.search_applicants(user_id=_scope(user, mine), limit=5000, offset=0)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["Case reference", "Applicant", "Date of birth", "Nationality", "Screened at", "Outcome", "Review decision",
+                "Review note", "Under monitoring", "Screened by"])
+    for r in rows:
+        try:
+            when = datetime.fromisoformat(r["submitted_at"])
+        except (TypeError, ValueError):
+            when = datetime.now(timezone.utc)
+        w.writerow([_csv_cell(x) for x in (_case_ref(r["id"], when), r["full_name"], r.get("dob"), r.get("nationality"),
+                                           r["submitted_at"], r["overall_status"], r.get("review_decision"),
+                                           r.get("review_note"), "yes" if r.get("monitored") else "", r.get("screened_by"))])
+    _audit(request, user, "history.export", "user", user.id, {"rows": len(rows), "scope": "mine" if _scope(user, mine) else "all"})
+    return Response(content="\ufeff" + buf.getvalue(), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": 'attachment; filename="screening-history.csv"'})
+
+
+@app.post("/api/applicants/{applicant_id}/review", response_model=ReviewOut)
+@limiter.limit("60/minute")
+def review_applicant(request: Request, applicant_id: int, body: ReviewIn, user: AuthUser = Depends(require_approved)):
+    """
+    Record what a person concluded about a screening: cleared (a false alarm), confirmed (a true match) or
+    escalated, with a note. It does not change the screening result. Send decision null to undo. You can review
+    your own screenings; administrators can review anyone's. The change is in the audit log.
+    """
+    note = (body.note or "").strip() or None
+    row = db.set_review(applicant_id, body.decision, note if body.decision else None, user.id, _scope(user))
+    if not row:
+        raise HTTPException(404, "Applicant not found")
+    _audit(request, user, "screening.review", "applicant", applicant_id, {"decision": body.decision, "has_note": bool(note)})
+    return ReviewOut(applicant_id=applicant_id, review_decision=row.get("review_decision"),
+                     review_note=row.get("review_note"), reviewed_at=row.get("reviewed_at"))
 
 
 @app.get("/api/applicants/{applicant_id}", response_model=ScreenResponse)
@@ -517,6 +582,8 @@ def get_applicant(request: Request, applicant_id: int, user: AuthUser = Depends(
         results=[ScreeningResultOut(**r) for r in results],
         case_ref=_case_ref(applicant_id, when), threshold=applicant.get("threshold"),
         records_screened=applicant.get("records_screened"), monitored=bool(applicant.get("monitored")),
+        review_decision=applicant.get("review_decision"), review_note=applicant.get("review_note"),
+        reviewed_at=applicant.get("reviewed_at"),
     )
 
 
