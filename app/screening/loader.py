@@ -26,13 +26,14 @@ import time
 from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 import requests
 
 from app import config
 from app.config import HTTP_USER_AGENT, LIST_CACHE_TTL_SECONDS
 from app.errors import logger
-from app.screening import names, nacta_store, parsers, pep
+from app.screening import names, nacta_store, parsers, pep, pep_assemblies
 
 # Same endpoints as the workflow's "List Sources" node.
 UN_URL = "https://unsolprodfiles.blob.core.windows.net/publiclegacyxmlfiles/EN/consolidatedLegacyByNAME.xml"
@@ -370,11 +371,55 @@ _wd_error: str | None = None      # why the last background fetch failed, shown 
 
 
 def refresh_wikidata() -> dict:
-    """Fetch the Wikidata snapshot now and save it (blocking, a minute or so). Raises on any failure: a partial or
-    failed fetch never replaces the saved copy."""
-    fresh = pep.fetch_snapshot(lambda url, params: _text(_get(
-        url, READ_TIMEOUT, params=params, headers={"Accept": "application/sparql-results+json"})),
-        country=config.PEP_WIKIDATA_COUNTRY)
+    """
+    Fetch the PEP snapshot now and save it (blocking, a minute or so): Wikidata office holders and politicians, plus
+    the assembly member lists. Each part is tried on its own, so one failing part keeps the last saved version of
+    that part. Raises only when nothing new could be fetched at all: a failed fetch never replaces a good copy.
+    """
+    def wd_get(url, params):
+        return _text(_get(url, READ_TIMEOUT, params=params, headers={"Accept": "application/sparql-results+json"}))
+
+    def page_get(url, params):
+        kw = {"params": params} if params else {}
+        return _text(_get(url, READ_TIMEOUT, **kw))
+
+    previous = None
+    stored = db_pep("wikidata")
+    if stored:
+        try:
+            previous = json.loads(decode_bytes(stored[0]))
+        except ValueError:
+            previous = None
+    fresh, problems, wd_failure = {}, [], None
+    try:
+        fresh = pep.fetch_snapshot(wd_get, country=config.PEP_WIKIDATA_COUNTRY)
+    except Exception as exc:
+        wd_failure = exc
+        problems.append("Wikidata: " + _short(exc))
+        if previous:
+            fresh = {k: previous[k] for k in ("fetched_at", "country", "people", "politicians") if k in previous}
+    if config.PEP_ASSEMBLIES_ENABLED:
+        assemblies, report = pep_assemblies.fetch_assemblies(page_get, config.PEP_WIKIPEDIA_API)
+        # an assembly that could not be read this time keeps its last saved members
+        old = {a.get("key"): a for a in (previous or {}).get("assemblies", [])}
+        for row in report:
+            if not row["count"] and row["key"] in old:
+                assemblies.append(old[row["key"]])
+                row["kept"] = len(old[row["key"]].get("members", []))
+        fresh["assemblies"] = assemblies
+        fresh["assembly_report"] = report
+        if wd_failure is not None and not any(row["count"] for row in report):
+            raise wd_failure          # nothing new from anywhere: keep the saved copy as it is
+    elif previous:
+        fresh.setdefault("assemblies", previous.get("assemblies", []))
+        fresh.setdefault("assembly_report", previous.get("assembly_report", []))
+    if wd_failure is not None and not config.PEP_ASSEMBLIES_ENABLED:
+        raise wd_failure
+    if not fresh.get("people") and not fresh.get("assemblies"):
+        raise ValueError("; ".join(problems) or "nothing could be fetched")
+    fresh.setdefault("fetched_at", datetime.now(timezone.utc).isoformat())
+    if problems:
+        fresh["problems"] = problems
     records, _info = pep.records_from_snapshot(fresh)
     db_pep_put("wikidata", json.dumps(fresh, separators=(",", ":")).encode("utf-8"), "wikidata.json", len(records))
     return fresh
@@ -418,7 +463,8 @@ def _wikidata_snapshot() -> tuple:
             snapshot = None
     if not config.PEP_WIKIDATA_ENABLED:
         return snapshot, ("Wikidata is switched off (PEP_WIKIDATA=false); using the last saved copy." if snapshot else None)
-    if snapshot is None or age is None or age > config.PEP_REFRESH_DAYS:
+    outdated = config.PEP_ASSEMBLIES_ENABLED and snapshot is not None and "assemblies" not in snapshot   # saved before assemblies existed
+    if snapshot is None or age is None or age > config.PEP_REFRESH_DAYS or outdated:
         _refresh_wikidata_in_background()
         if snapshot is None:
             return None, (f"Wikidata could not be reached ({_wd_error})." if _wd_error
@@ -443,13 +489,23 @@ def _load_pep() -> GroupData:
     if snapshot is not None:
         wd_records, info = pep.records_from_snapshot(snapshot)
         groups.append(wd_records)
-        entry = {"list": "PEP list from Wikidata (national and provincial office holders)", "source": config.PEP_WIKIDATA_URL,
-                 "published": str(snapshot.get("fetched_at") or "n/a")[:10], "records": len(wd_records)}
+        published = str(snapshot.get("fetched_at") or "n/a")[:10]
+        from_lists = info.get("assembly_members", 0)
+        entry = {"list": "PEP list from Wikidata (office holders and politicians)", "source": config.PEP_WIKIDATA_URL,
+                 "published": published, "records": len(wd_records) - from_lists}
         if info.get("top_unclassified"):
             entry["note"] = ("Positions not counted as PEP offices (most common): " + "; ".join(info["top_unclassified"][:8]))
-        if wd_note:
-            entry["note"] = (entry.get("note", "") + " " + wd_note).strip()
+        extra = " ".join(x for x in [wd_note] + [p for p in snapshot.get("problems", [])] if x)
+        if extra:
+            entry["note"] = (entry.get("note", "") + " " + extra).strip()
         lists.append(entry)
+        for row in snapshot.get("assembly_report", []):
+            item = {"list": "PEP members: " + row.get("label", row.get("key", "")), "source": row.get("source", ""),
+                    "published": published, "records": row.get("count") or row.get("kept") or 0}
+            if row.get("error"):
+                item["note"] = ("Could not be read this time (" + row["error"] + ")" +
+                                (f"; the last saved {row['kept']} members are used." if row.get("kept") else "."))
+            lists.append(item)
     records = pep.merge(*groups)
     if not records:
         why = "; ".join(notes) if notes else "nothing has been fetched or uploaded"
