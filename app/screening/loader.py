@@ -367,6 +367,8 @@ def _load_nacta() -> GroupData:
 _wd_lock = threading.Lock()
 _wd_thread: threading.Thread | None = None
 _wd_error: str | None = None      # why the last background fetch failed, shown on the Lists page
+_wd_started: float | None = None
+_wd_finished: float | None = None
 
 
 def refresh_wikidata() -> dict:
@@ -380,26 +382,51 @@ def refresh_wikidata() -> dict:
     return fresh
 
 
-def _refresh_wikidata_in_background() -> None:
-    """Start one background fetch (never from the request that is waiting: Wikidata can take a minute)."""
-    global _wd_thread
+WD_RETRY_SECONDS = 600     # after a failed fetch, wait this long before trying again by itself (an admin can retry at once)
+
+
+def wikidata_fetch_state() -> dict:
+    """What the background Wikidata fetch is doing, for the Lists page."""
+    with _wd_lock:
+        return {"running": bool(_wd_thread and _wd_thread.is_alive()), "error": _wd_error,
+                "started_at": _wd_started, "finished_at": _wd_finished}
+
+
+def _refresh_wikidata_in_background(force: bool = False) -> bool:
+    """
+    Start one background fetch (never from the request that is waiting: Wikidata can take a minute or more).
+    Returns whether one was started. It does not start another while one is running, nor, unless `force`, within
+    WD_RETRY_SECONDS of a failure, so an unreachable Wikidata is not asked again on every screening.
+    """
+    global _wd_thread, _wd_started
 
     def run():
-        global _wd_error
+        global _wd_error, _wd_finished
         try:
             refresh_wikidata()
             _wd_error = None
-            clear_cache("PEP")
             logger.info("PEP data fetched from Wikidata")
         except Exception as exc:
             _wd_error = _short(exc)
             logger.warning("PEP data could not be fetched from Wikidata: %s", _wd_error)
+        finally:
+            _wd_finished = time.time()
+        # reload the source now, so the Lists page and the next screening see the new copy straight away
+        clear_cache("PEP")
+        try:
+            load_group("PEP")
+        except Exception:
+            logger.exception("PEP could not be reloaded after the Wikidata fetch")
 
     with _wd_lock:
         if _wd_thread and _wd_thread.is_alive():
-            return
+            return False
+        if not force and _wd_error and _wd_finished and time.time() - _wd_finished < WD_RETRY_SECONDS:
+            return False
+        _wd_started = time.time()
         _wd_thread = threading.Thread(target=run, name="pep-wikidata", daemon=True)
         _wd_thread.start()
+        return True
 
 
 def _wikidata_snapshot() -> tuple:

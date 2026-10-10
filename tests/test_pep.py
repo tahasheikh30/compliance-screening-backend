@@ -278,3 +278,38 @@ def test_batch_counts_a_pep_separately_from_sanctions(client):
     pep_row = rows["Zorawar Khanzada Mehtab"]
     assert pep_row["pep"] == 1 and pep_row["sanctions"] == 0 and pep_row["overall_status"] == "MANUAL_REVIEW"
     assert rows["Completely Unrelated Person"]["pep"] == 0
+
+
+def test_a_failed_fetch_is_not_repeated_on_every_screening_but_an_admin_can_force_it(monkeypatch):
+    import time as _t
+    calls = []
+
+    def boom():
+        calls.append(1)
+        raise ConnectionError("blocked")
+
+    monkeypatch.setattr(loader, "refresh_wikidata", boom)
+    monkeypatch.setattr(loader, "db_pep", lambda kind: None)
+    monkeypatch.setattr(loader, "_wd_thread", None)
+    monkeypatch.setattr(loader, "_wd_error", None)
+    monkeypatch.setattr(loader, "_wd_finished", None)
+    assert loader._refresh_wikidata_in_background() is True
+    loader._wd_thread.join(5)
+    assert loader.wikidata_fetch_state()["error"] and not loader.wikidata_fetch_state()["running"]
+    assert loader._refresh_wikidata_in_background() is False                 # inside the cool-down
+    assert loader._refresh_wikidata_in_background(force=True) is True        # an admin retries at once
+    loader._wd_thread.join(5)
+    assert len(calls) == 2
+
+
+def test_refresh_endpoint_is_admin_only_and_reports_the_fetch_state(client, monkeypatch):
+    from tests.conftest import USER_HEADERS
+    monkeypatch.setattr(config, "PEP_WIKIDATA_ENABLED", True)
+    started = []
+    monkeypatch.setattr(loader, "_refresh_wikidata_in_background", lambda force=False: started.append(force) or True)
+    assert client.post("/api/admin/pep/refresh", headers=USER_HEADERS).status_code == 403
+    r = client.post("/api/admin/pep/refresh", headers=API_HEADERS)
+    assert r.status_code == 202 and r.json()["started"] is True and started == [True]
+    assert set(r.json()["fetch"]) == {"running", "error", "started_at", "finished_at"}
+    monkeypatch.setattr(config, "PEP_WIKIDATA_ENABLED", False)
+    assert client.post("/api/admin/pep/refresh", headers=API_HEADERS).status_code == 409
