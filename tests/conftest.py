@@ -41,6 +41,7 @@ os.environ["ALLOWED_ORIGINS"] = "http://localhost:5173"
 os.environ["LIST_CACHE_TTL_SECONDS"] = "0"
 os.environ["PRELOAD_LISTS"] = "false"
 os.environ["MONITORING"] = "false"          # tests run the check themselves, never in the background
+os.environ["PEP_WIKIDATA"] = "false"         # no test touches the network; PEP tests feed the loader their own data
 os.environ["BATCH_ROW_DELAY_SECONDS"] = "0"      # no pause between batch rows in tests
 os.environ.pop("REQUIRE_APP_KEY", None)
 
@@ -97,7 +98,7 @@ def storage():
         db.init_db()
         _schema_ready = True
     with db.pool().connection() as conn:
-        conn.execute("TRUNCATE deleted_users, batch_rows, batches, evidence_files, nacta_list, screening_results, applicants, profiles, audit_log, monitoring_state RESTART IDENTITY CASCADE")
+        conn.execute("TRUNCATE deleted_users, batch_rows, batches, evidence_files, nacta_list, pep_files, screening_results, applicants, profiles, audit_log, monitoring_state RESTART IDENTITY CASCADE")
         for uid, role, status in ((ADMIN_ID, "admin", "approved"), (USER_ID, "user", "approved"),
                                   (USER2_ID, "user", "approved"), (PENDING_ID, "user", "pending"),
                                   (REJECTED_ID, "user", "rejected")):
@@ -130,6 +131,7 @@ def fake_sources(monkeypatch):
         "news_fail": False,
         "nacta": fx.NACTA_CSV,          # None = nothing uploaded
         "nacta_age_days": 1.0,
+        "pep": fx.PEP_CSV,              # the administrator's PEP list; None = nothing loaded
     }
 
     def fake_fetch_text(url, read_timeout=0):
@@ -166,6 +168,14 @@ def fake_sources(monkeypatch):
         when = datetime.now(timezone.utc) - timedelta(days=state["nacta_age_days"])
         return state["nacta"], {"filename": "nacta.csv", "uploaded_at": when.isoformat(), "live": False}
 
+    def fake_db_pep(kind):
+        from datetime import datetime, timezone
+        if kind != "upload" or state["pep"] is None:
+            return None
+        return state["pep"].encode("utf-8"), {"kind": "upload", "filename": "pep.csv", "records": 4,
+                                              "uploaded_at": datetime.now(timezone.utc).isoformat()}
+
+    monkeypatch.setattr(loader, "db_pep", fake_db_pep)
     monkeypatch.setattr(loader, "_read_nacta", fake_read_nacta)
     monkeypatch.setattr(loader, "fetch_text", fake_fetch_text)
     monkeypatch.setattr(loader, "_get", fake_get)

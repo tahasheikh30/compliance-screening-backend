@@ -18,6 +18,7 @@ Nothing is written to disk and no API key is needed.
 """
 
 import hashlib
+import json
 import ipaddress
 import re
 import threading
@@ -31,7 +32,7 @@ import requests
 from app import config
 from app.config import HTTP_USER_AGENT, LIST_CACHE_TTL_SECONDS
 from app.errors import logger
-from app.screening import names, nacta_store, parsers
+from app.screening import names, nacta_store, parsers, pep
 
 # Same endpoints as the workflow's "List Sources" node.
 UN_URL = "https://unsolprodfiles.blob.core.windows.net/publiclegacyxmlfiles/EN/consolidatedLegacyByNAME.xml"
@@ -50,7 +51,7 @@ CONNECT_TIMEOUT = 15
 READ_TIMEOUT = 180  # the workflow allowed 180 s per list download
 PAGE_READ_TIMEOUT = 60
 
-SOURCE_KEYS = ("UNSC", "OFAC", "UKSL", "FIA_REDBOOK", "NACTA")
+SOURCE_KEYS = ("UNSC", "OFAC", "UKSL", "FIA_REDBOOK", "NACTA", "PEP")
 
 
 class SourceUnavailable(Exception):
@@ -356,7 +357,112 @@ def _load_nacta() -> GroupData:
     return GroupData("NACTA", parsers.prepare(records), [entry])
 
 
-_LOADERS = {"UNSC": _load_unsc, "OFAC": _load_ofac, "UKSL": _load_uksl, "FIA_REDBOOK": _load_fia, "NACTA": _load_nacta}
+_wd_lock = threading.Lock()
+_wd_thread: threading.Thread | None = None
+_wd_error: str | None = None      # why the last background fetch failed, shown on the Lists page
+
+
+def refresh_wikidata() -> dict:
+    """Fetch the Wikidata snapshot now and save it (blocking, a minute or so). Raises on any failure: a partial or
+    failed fetch never replaces the saved copy."""
+    fresh = pep.fetch_snapshot(lambda url, params: _text(_get(
+        url, READ_TIMEOUT, params=params, headers={"Accept": "application/sparql-results+json"})),
+        country=config.PEP_WIKIDATA_COUNTRY)
+    records, _info = pep.records_from_snapshot(fresh)
+    db_pep_put("wikidata", json.dumps(fresh, separators=(",", ":")).encode("utf-8"), "wikidata.json", len(records))
+    return fresh
+
+
+def _refresh_wikidata_in_background() -> None:
+    """Start one background fetch (never from the request that is waiting: Wikidata can take a minute)."""
+    global _wd_thread
+
+    def run():
+        global _wd_error
+        try:
+            refresh_wikidata()
+            _wd_error = None
+            clear_cache("PEP")
+            logger.info("PEP data fetched from Wikidata")
+        except Exception as exc:
+            _wd_error = _short(exc)
+            logger.warning("PEP data could not be fetched from Wikidata: %s", _wd_error)
+
+    with _wd_lock:
+        if _wd_thread and _wd_thread.is_alive():
+            return
+        _wd_thread = threading.Thread(target=run, name="pep-wikidata", daemon=True)
+        _wd_thread.start()
+
+
+def _wikidata_snapshot() -> tuple:
+    """
+    (snapshot dict or None, note or None): the saved Wikidata copy. A copy older than PEP_REFRESH_DAYS, or none
+    at all, starts a background fetch and screening carries on with what it has, so a slow Wikidata never holds up a
+    screening. A failed fetch keeps the old copy, with a note.
+    """
+    stored = db_pep("wikidata")
+    snapshot, age = None, None
+    if stored:
+        try:
+            snapshot = json.loads(decode_bytes(stored[0]))
+            age = nacta_store.age_days(stored[1])
+        except ValueError:
+            snapshot = None
+    if not config.PEP_WIKIDATA_ENABLED:
+        return snapshot, ("Wikidata is switched off (PEP_WIKIDATA=false); using the last saved copy." if snapshot else None)
+    if snapshot is None or age is None or age > config.PEP_REFRESH_DAYS:
+        _refresh_wikidata_in_background()
+        if snapshot is None:
+            return None, (f"Wikidata could not be reached ({_wd_error})." if _wd_error
+                          else "The Wikidata copy is being fetched for the first time and will be used from the next check.")
+        if _wd_error:
+            return snapshot, f"Wikidata could not be reached ({_wd_error}). Using the last saved copy, {int(age or 0)} days old."
+    return snapshot, None
+
+
+def _load_pep() -> GroupData:
+    snapshot, wd_note = _wikidata_snapshot()
+    up = db_pep("upload")
+    lists, groups, notes = [], [], [n for n in [wd_note] if n]
+    if up:
+        try:
+            up_records, up_info = pep.parse_pep_persons(decode_bytes(up[0]))
+        except ValueError as exc:
+            raise SourceUnavailable(f"The uploaded PEP file could not be read: {exc}") from None
+        groups.append(up_records)
+        lists.append({"list": "PEP list uploaded by an administrator", "source": up[1].get("filename") or "uploaded file",
+                      "published": (up[1].get("uploaded_at") or "n/a")[:10], "records": len(up_records)})
+    if snapshot is not None:
+        wd_records, info = pep.records_from_snapshot(snapshot)
+        groups.append(wd_records)
+        entry = {"list": "PEP list from Wikidata (national and provincial office holders)", "source": config.PEP_WIKIDATA_URL,
+                 "published": str(snapshot.get("fetched_at") or "n/a")[:10], "records": len(wd_records)}
+        if info.get("top_unclassified"):
+            entry["note"] = ("Positions not counted as PEP offices (most common): " + "; ".join(info["top_unclassified"][:8]))
+        if wd_note:
+            entry["note"] = (entry.get("note", "") + " " + wd_note).strip()
+        lists.append(entry)
+    records = pep.merge(*groups)
+    if not records:
+        why = "; ".join(notes) if notes else "nothing has been fetched or uploaded"
+        raise SourceUnavailable("No PEP data is loaded (" + why + "). Upload a PEP list on the Lists page or enable "
+                                "the Wikidata fetch (PEP_WIKIDATA).")
+    return GroupData("PEP", parsers.prepare(records), lists)
+
+
+def db_pep(kind: str):
+    from app import database as db
+    return db.pep_get(kind)
+
+
+def db_pep_put(kind: str, data: bytes, filename: str, records: int):
+    from app import database as db
+    return db.pep_put(kind, data, filename, records)
+
+
+_LOADERS = {"UNSC": _load_unsc, "OFAC": _load_ofac, "UKSL": _load_uksl, "FIA_REDBOOK": _load_fia, "NACTA": _load_nacta,
+            "PEP": _load_pep}
 
 
 # --------------------------------------------------------------------------

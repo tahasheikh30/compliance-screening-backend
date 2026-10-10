@@ -70,6 +70,8 @@ class MatchOut(BaseModel):
     father_match: Optional[bool] = None
     province: str = ""
     province_match: Optional[bool] = None   # None: the applicant gave no province, or the list has none for this person
+    pep_level: Optional[str] = None     # "National" or "Provincial" for a politically exposed person
+    position: Optional[str] = None      # the office held (PEP)
 
 
 class ArticleOut(BaseModel):
@@ -119,6 +121,7 @@ class ScreenResponse(BaseModel):
     records_screened: Optional[int] = None
     sanctions_hit_count: Optional[int] = None
     media_hit_count: Optional[int] = None
+    pep_hit_count: Optional[int] = None
     monitored: bool = False
 
 
@@ -257,6 +260,7 @@ class BatchRowOut(BaseModel):
     overall_status: Optional[str] = None
     sanctions: Optional[int] = None       # potential matches across the sanctions and watch lists
     news: Optional[int] = None            # adverse news articles found
+    pep: Optional[int] = None             # potential politically exposed person matches (not sanctions)
     case_ref: Optional[str] = None
     dob: Optional[str] = None             # what the file said, for the case view (as in the history list)
     nationality: Optional[str] = None

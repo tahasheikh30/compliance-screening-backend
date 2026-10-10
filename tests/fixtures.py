@@ -114,3 +114,33 @@ NACTA_CSV = (
     "3,Naseebullah,nill,5420396187581,KILLA ABDULLAH,BALOCHISTAN\n"
     "4,Akhtar Muhammad Khalil,Gul Roz,1111111111166,BANNU,KP\n"
 )
+
+
+# An administrator's PEP list (names invented, unlike any real person or the other fixtures)
+PEP_CSV = (
+    "S.No,Name,Position,Level,Province,CNIC,Father Name,Party\n"
+    "1,Zorawar Khanzada Mehtab,Member of the National Assembly of Pakistan,National,,3520212345679,Yar Khanzada,Test Party\n"
+    "2,Quillon Faridani,Member of the Provincial Assembly of the Punjab,,,,,\n"
+    "3,Thessaly Orakzai Bunerwal,,Provincial,KP,,,\n"
+    "4,Mirzada Pelethrone,Chief Minister of Sindh,,,,,\n"
+)
+
+# A recorded-shape Wikidata answer (people query, then alias query), for the fetch and classification tests
+WIKIDATA_PEOPLE = {"results": {"bindings": [
+    {"person": {"value": "http://www.wikidata.org/entity/Q9000001"}, "personLabel": {"value": "Arbuthnot Zelgadis Rana"},
+     "posLabel": {"value": "Member of the National Assembly of Pakistan"}, "start": {"value": "2018-08-13T00:00:00Z"},
+     "dob": {"value": "1961-03-04T00:00:00Z"}},
+    {"person": {"value": "http://www.wikidata.org/entity/Q9000001"}, "personLabel": {"value": "Arbuthnot Zelgadis Rana"},
+     "posLabel": {"value": "Minister of Finance of Pakistan"}, "start": {"value": "2019-01-01T00:00:00Z"},
+     "end": {"value": "2020-06-01T00:00:00Z"}},
+    {"person": {"value": "http://www.wikidata.org/entity/Q9000002"}, "personLabel": {"value": "Wyndham Okonkwo Baig"},
+     "posLabel": {"value": "Member of the Provincial Assembly of Sindh"}, "start": {"value": "2013-06-01T00:00:00Z"},
+     "end": {"value": "2018-05-31T00:00:00Z"}},
+    {"person": {"value": "http://www.wikidata.org/entity/Q9000003"}, "personLabel": {"value": "Cricket Captain Person"},
+     "posLabel": {"value": "captain of Pakistan cricket team"}},
+    {"person": {"value": "http://www.wikidata.org/entity/Q9000004"}, "personLabel": {"value": "Q9000004"},
+     "posLabel": {"value": "Senator"}},
+]}}
+WIKIDATA_ALIASES = {"results": {"bindings": [
+    {"person": {"value": "http://www.wikidata.org/entity/Q9000001"}, "alias": {"value": "A. Z. Rana"}},
+]}}

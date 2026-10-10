@@ -13,6 +13,7 @@ The screening logic is a Python port of the n8n **Applicant Screening Engine** a
 | `UKSL` | UK Sanctions List (FCDO) | UK XML |
 | `FIA_REDBOOK` | FIA Red Books (Pakistan) | PDF editions discovered on fia.gov.pk |
 | `NACTA` | NACTA Proscribed Persons, Fourth Schedule (Pakistan) | A CSV or JSON export you upload (see below) |
+| `PEP` | Politically exposed persons, national and provincial (Pakistan) | Wikidata, plus your own uploaded list (see below) |
 | `ADVERSE_MEDIA` | Open news search | Google News RSS |
 
 Lists are downloaded in parallel and kept in memory for `LIST_CACHE_TTL_SECONDS` (default 1 hour; `0` downloads fresh every time, like the workflow). They are loaded when the server starts and reloaded in the background once they are three quarters of the way to expiring, so a screening normally never waits for a download (`PRELOAD_LISTS=false` turns this off). If a background reload fails the previous copy is kept until it expires; after that the source is reported as unavailable, never as clear. Nothing about the lists is stored on disk.
@@ -138,6 +139,21 @@ the previous list stays in use.
 
 NACTA records have name, father's name, CNIC, district and province, and **no date of birth**.
 
+## Politically exposed persons (PEPs)
+
+Pakistan publishes no official PEP list, so the `PEP` source is built from two parts that are merged into one list (one record per person, your own list winning):
+
+- **Wikidata** (public domain, CC0). One SPARQL query fetches Pakistani people who hold or held a position, and the server decides which positions make someone a PEP: at the **national** level the President, Prime Minister, National Assembly and Senate members, federal ministers, the top judiciary, the military chiefs, the State Bank governor, the Chief Election Commissioner and ambassadors; at the **provincial** level provincial assembly members, chief ministers, governors, provincial ministers and speakers, and the Gilgit-Baltistan and Azad Jammu and Kashmir assemblies and governments. Someone with offices at both levels is shown as National. The copy is saved in the database and refreshed in the background every `PEP_REFRESH_DAYS` (default 7), so a screening never waits for Wikidata. If a refresh fails the last good copy is used and the Lists page says so.
+- **Your own list**, uploaded by an admin with `POST /api/admin/pep?filename=pep.csv` (the file as the request body; CSV, JSON or XML), for people Wikidata misses (ECP notifications, assembly members, party office holders) or to correct it. Columns: `Name` (required), `Position`, `Level` (National or Provincial), `Province`, `CNIC`, `Father Name`, `Date of Birth`, `Aliases`, `Party`. If `Level` is blank it is worked out from `Position`. `DELETE /api/admin/pep` removes the upload (the Wikidata copy stays). `GET /api/admin/pep` shows what is loaded.
+
+**A PEP match is not a sanctions hit.** The PEP row is `REVIEW` and the applicant goes to `MANUAL_REVIEW` for enhanced due diligence (source of funds and wealth, senior approval); it does not count in `sanctions_hit_count` (there is a separate `pep_hit_count`) and does not produce an evidence PDF by itself. A sanctions hit elsewhere still escalates. Each match carries `pep_level`, `position` and, for provincial PEPs, the province.
+
+**After leaving office.** `PEP_LOOKBACK_YEARS` (default 5) keeps people who left office within that many years; `0` keeps current office holders only and a negative number never drops anyone. Set your own policy.
+
+**No PEP data.** If nothing has been fetched or uploaded the source reports as not screened. By default that does not block `AUTO_CLEAR` (so a fresh deploy is not sent wholly to review); set `PEP_REQUIRED=true` to make it block like the other required lists.
+
+**Limits to know about.** Wikidata is volunteer maintained: it is strong on national figures and uneven on provincial assembly members and recent changes, and it can lag an election. The classification works from English position labels, and the Lists page shows the most common positions that were *not* counted, so a missing kind of office can be spotted and the rules extended. Set `PEP_WIKIDATA=false` where `query.wikidata.org` cannot be reached and rely on your own list. Relatives and close associates of PEPs are not covered; add them to your own list if your policy requires it.
+
 ## Seeing which list has a problem
 
 `GET /api/admin/lists` (shown on the Lists page) reports every list behind each source on its own: its
@@ -223,7 +239,7 @@ Problems come back with a stable `error.code`: `AUTH_MISSING_KEY` and `AUTH_INVA
 
 Only `full_name` is required. `cnic`, `father_name` and `province` are optional and are used for the FIA Red Book and NACTA (see above).
 
-The response has one result row per source (`UNSC`, `OFAC`, `UKSL`, `FIA_REDBOOK`, `NACTA`, `ADVERSE_MEDIA`), each with `status`, `score`, `matched_entry`, `detail`, `list_version`, `records_screened`, and the full `matches` or `articles`. It also carries `case_ref`, `threshold`, `records_screened`, `sanctions_hit_count`, `media_hit_count`.
+The response has one result row per source (`UNSC`, `OFAC`, `UKSL`, `FIA_REDBOOK`, `NACTA`, `PEP`, `ADVERSE_MEDIA`), each with `status`, `score`, `matched_entry`, `detail`, `list_version`, `records_screened`, and the full `matches` or `articles`. It also carries `case_ref`, `threshold`, `records_screened`, `sanctions_hit_count`, `media_hit_count`.
 
 | Row `status` | Meaning |
 |---|---|
@@ -312,7 +328,7 @@ Be clear-eyed about these before relying on the service for regulated records:
 
 ## Configuration
 
-See `.env.example`. Required: `DATABASE_URL`, `SUPABASE_URL`. `APP_API_KEY` (the frontend's key; without it every request from the app is refused). Common: `ALLOWED_ORIGINS`, `API_KEY` (the secret for the scheduled NACTA upload), `SUPABASE_JWT_SECRET` (legacy token signing only), `DB_POOL_MAX`, `MATCH_THRESHOLD`, `LIST_CACHE_TTL_SECONDS`, `PRELOAD_LISTS`, `FIA_REQUIRED`, `NACTA_REQUIRED`, `NACTA_MAX_AGE_DAYS`, `NACTA_PERSONS_URL`, `NAME_VARIANTS`, `MAX_DOWNLOAD_MB`, `ENABLE_DOCS`. Without `DATABASE_URL` every request is refused with a 503 that says so; without `SUPABASE_URL` (or the legacy secret) no sign in can be verified, and requests are refused rather than let through.
+See `.env.example`. Required: `DATABASE_URL`, `SUPABASE_URL`. `APP_API_KEY` (the frontend's key; without it every request from the app is refused). Common: `ALLOWED_ORIGINS`, `API_KEY` (the secret for the scheduled NACTA upload), `SUPABASE_JWT_SECRET` (legacy token signing only), `DB_POOL_MAX`, `MATCH_THRESHOLD`, `LIST_CACHE_TTL_SECONDS`, `PRELOAD_LISTS`, `FIA_REQUIRED`, `NACTA_REQUIRED`, `NACTA_MAX_AGE_DAYS`, `NACTA_PERSONS_URL`, `PEP_WIKIDATA`, `PEP_REFRESH_DAYS`, `PEP_LOOKBACK_YEARS`, `PEP_REQUIRED`, `NAME_VARIANTS`, `MAX_DOWNLOAD_MB`, `ENABLE_DOCS`. Without `DATABASE_URL` every request is refused with a 503 that says so; without `SUPABASE_URL` (or the legacy secret) no sign in can be verified, and requests are refused rather than let through.
 
 ## Run and test
 

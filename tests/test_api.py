@@ -71,7 +71,7 @@ def test_clear_applicant_is_auto_clear_with_one_row_per_source(client):
     body = r.json()
     assert body["overall_status"] == "AUTO_CLEAR" and body["case_ref"].startswith("CS-")
     rows = _by_source(r)
-    assert set(rows) == {"UNSC", "OFAC", "UKSL", "FIA_REDBOOK", "NACTA", "ADVERSE_MEDIA"}
+    assert set(rows) == {"UNSC", "OFAC", "UKSL", "FIA_REDBOOK", "NACTA", "PEP", "ADVERSE_MEDIA"}
     assert all(x["status"] == "CLEAR" and x["evidence_file"] is None for x in rows.values())
     assert body["threshold"] == 85 and body["records_screened"] > 0
     assert rows["UNSC"]["list_version"] == "2026-09-30T08:00:00.000Z"

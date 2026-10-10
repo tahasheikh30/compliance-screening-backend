@@ -96,6 +96,18 @@ CREATE TABLE IF NOT EXISTS nacta_list (
     live         boolean NOT NULL DEFAULT false
 );
 
+-- Politically exposed persons: one row per kind of data ('upload' is the admin's own list, 'wikidata' is the last
+-- good copy fetched from Wikidata). Each is replaced in a single statement.
+CREATE TABLE IF NOT EXISTS pep_files (
+    kind         text PRIMARY KEY CHECK (kind IN ('upload', 'wikidata')),
+    content      bytea NOT NULL,
+    filename     text NOT NULL,
+    uploaded_at  timestamptz NOT NULL,
+    records      integer NOT NULL,
+    size         integer NOT NULL,
+    sha256       text NOT NULL
+);
+
 -- Integrity of the evidence: SHA-256 of the PDF, so a copy that was altered after the screening is detectable.
 ALTER TABLE evidence_files ADD COLUMN IF NOT EXISTS sha256 text;
 
@@ -211,6 +223,7 @@ ALTER TABLE applicants        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE screening_results ENABLE ROW LEVEL SECURITY;
 ALTER TABLE evidence_files    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE nacta_list        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE pep_files         ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_log         ENABLE ROW LEVEL SECURITY;
 ALTER TABLE monitoring_alerts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE monitoring_state  ENABLE ROW LEVEL SECURITY;

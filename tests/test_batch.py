@@ -261,7 +261,7 @@ def test_cancel_stops_after_the_current_row_and_unscreened_rows_stay_pending(cli
     pending = [x for x in body["rows"] if x["state"] == "pending"]
     assert all(x["overall_status"] is None for x in pending)             # never shown as clear
     sheet = load_workbook(io.BytesIO(client.get(f"/api/batches/{bid}/results.xlsx", headers=USER_HEADERS).content))
-    notes = [r[11].value for r in sheet["Results"].iter_rows(min_row=2)]
+    notes = [r[12].value for r in sheet["Results"].iter_rows(min_row=2)]
     assert sum("did not finish" in (n or "") for n in notes) == 2
 
 
@@ -364,8 +364,8 @@ def test_results_spreadsheet_has_every_row_and_never_a_formula(client):
     lines = list(ws.iter_rows(values_only=True))
     assert lines[0][:2] == ("Row", "Full name") and len(lines) == 1 + 6
     by_row = {l[0]: l for l in lines[1:]}
-    assert by_row[2][7] == "Escalate to compliance" and by_row[2][10].startswith("CS-")
-    assert by_row[4][7] == "Not screened" and "Full name" in by_row[4][11]
+    assert by_row[2][7] == "Escalate to compliance" and by_row[2][11].startswith("CS-")
+    assert by_row[4][7] == "Not screened" and "Full name" in by_row[4][12]
     for c in ws["B"][1:]:
         assert c.data_type != "f"                                       # never stored as a formula
     assert wb["Batch"]["B1"].value == "applicants.xlsx" and body["total"] == 6

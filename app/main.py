@@ -30,6 +30,8 @@ Endpoints:
     GET  /api/evidence/{result_id}        same PDF, addressed by a result row id
     GET  /api/admin/lists                 which lists are cached in memory right now
     GET  /api/admin/nacta                 which NACTA file is loaded and how old it is
+    GET  /api/admin/pep                   which PEP data is loaded (Wikidata copy and the admin's own list)
+    POST /api/admin/pep                   (admin) upload the PEP list (CSV, JSON or XML); DELETE removes it
     POST /api/admin/refresh               (admin) drop the in-memory list cache and reload every list
     POST /api/admin/nacta                 (admin, or the secret API_KEY) upload the NACTA CSV or JSON export
     GET  /api/admin/users                 (admin) people who signed up, ?status=pending to see who is waiting
@@ -71,13 +73,13 @@ from app import supabase_admin
 from app import batch_files
 from app import monitoring
 from app.auth import AuthUser, require_admin, require_admin_or_service_key, require_approved
-from app.config import FIA_REQUIRED, NACTA_REQUIRED, PRELOAD_LISTS
+from app.config import FIA_REQUIRED, NACTA_REQUIRED, PEP_REQUIRED, PRELOAD_LISTS
 from app.errors import AppError, configure_logging, install as install_error_handlers, request_context, logger
 from app.schemas import (AlertDecisionIn, AlertOut, ApplicantSummary, AuditEntryOut, AuditPageOut, AuditVerifyOut,
                          BatchOut, BatchRowOut, MeOut,
                          MonitoringIn, MonitoringOut, MonitoringStatusOut, SourceMonitoringOut, ScreenRequest, ScreenResponse, ScreeningResultOut, UserDeletedOut, UserOut,
                          UserRoleIn, UserStatusIn)
-from app.screening import engine, loader, nacta_store, parsers
+from app.screening import engine, loader, nacta_store, parsers, pep
 
 configure_logging()
 
@@ -264,7 +266,7 @@ def _screen_one(req: ScreenRequest, user: AuthUser, request: Request | None = No
                         "lists": src["lists"]},
         })
 
-    overall = engine.overall_status(statuses, FIA_REQUIRED, NACTA_REQUIRED)
+    overall = engine.overall_status(statuses, FIA_REQUIRED, NACTA_REQUIRED, PEP_REQUIRED)
 
     # One evidence PDF per screening, kept in the database. If it cannot be made the finding is still saved.
     evidence_pdf, evidence_failed = None, False
@@ -286,7 +288,7 @@ def _screen_one(req: ScreenRequest, user: AuthUser, request: Request | None = No
                {"batch_id": batch_id} if batch_id is not None else None)
     _audit(request, user, "screening.run", "applicant", applicant_id,
            {"overall_status": overall, "threshold": threshold, "sanctions_hits": result["sanctions_hit_count"],
-            "media_hits": result["media_hit_count"], "evidence": bool(evidence_pdf),
+            "media_hits": result["media_hit_count"], "pep_hits": result["pep_hit_count"], "evidence": bool(evidence_pdf),
             **({"batch_id": batch_id} if batch_id is not None else {})})
     results_out = [
         ScreeningResultOut(**r) for r in db.get_results_for_applicant(applicant_id)
@@ -295,7 +297,7 @@ def _screen_one(req: ScreenRequest, user: AuthUser, request: Request | None = No
         applicant_id=applicant_id, full_name=req.full_name, overall_status=overall, results=results_out,
         case_ref=case_ref, threshold=threshold, records_screened=result["total_records"],
         sanctions_hit_count=result["sanctions_hit_count"], media_hit_count=result["media_hit_count"],
-        monitored=req.monitor,
+        pep_hit_count=result["pep_hit_count"], monitored=req.monitor,
     )
 
 
@@ -327,6 +329,7 @@ def _batch_out(user_batch: dict, with_rows: bool = True) -> BatchOut:
             applicant_id=r["applicant_id"], overall_status=r.get("overall_status"),
             sanctions=r["sanctions"] if r["state"] == "screened" else None,
             news=r["news"] if r["state"] == "screened" else None,
+            pep=r["pep"] if r["state"] == "screened" else None,
             case_ref=_case_ref(r["applicant_id"], when) if r["state"] == "screened" and when else None,
             dob=r.get("dob"), nationality=r.get("nationality")))
     counts = {"screened": 0, "invalid": 0, "failed": 0, "pending": 0,
@@ -579,6 +582,83 @@ def _nacta_status() -> dict:
         "max_age_days": app_config.NACTA_MAX_AGE_DAYS,
         "stale": bool(age is not None and not live and age > app_config.NACTA_MAX_AGE_DAYS),
     }
+
+
+MAX_PEP_UPLOAD_BYTES = 10 * 1024 * 1024
+
+
+def _pep_status() -> dict:
+    out = {}
+    for kind in ("upload", "wikidata"):
+        meta = db.pep_meta(kind)
+        age = nacta_store.age_days(meta)
+        out[kind] = {"loaded": bool(meta), "filename": (meta or {}).get("filename"),
+                     "uploaded_at": (meta or {}).get("uploaded_at"), "records": (meta or {}).get("records"),
+                     "age_days": round(age, 1) if age is not None else None}
+    out["wikidata_enabled"] = app_config.PEP_WIKIDATA_ENABLED
+    out["refresh_days"] = app_config.PEP_REFRESH_DAYS
+    out["lookback_years"] = app_config.PEP_LOOKBACK_YEARS
+    out["required"] = app_config.PEP_REQUIRED
+    return out
+
+
+@app.get("/api/admin/pep")
+@limiter.limit("30/minute")
+def pep_status(request: Request, user: AuthUser = Depends(require_approved)):
+    """Which PEP data is loaded: the Wikidata copy and the administrator's own list."""
+    return _pep_status()
+
+
+def _ingest_pep(data: bytes, filename: str) -> dict:
+    try:
+        records, info = pep.parse_pep_persons(loader.decode_bytes(data))
+    except ValueError as exc:
+        raise AppError(422, "PEP_FILE_UNREADABLE", f"The file could not be read: {exc}",
+                       "Upload CSV, JSON or XML with a header row that includes a Name column "
+                       "(and ideally Position, Level, Province and CNIC).") from None
+    if not records:
+        raise AppError(422, "PEP_FILE_NO_RECORDS", "The file has no usable records (no names found).",
+                       "Check that the first row holds the column headers.")
+    db.pep_put("upload", data, os.path.basename(filename or "pep.csv")[:200] or "pep.csv", len(records))
+    loader.clear_cache("PEP")
+    warnings = []
+    if info["no_level"]:
+        warnings.append(f"{info['no_level']} people have no level (National or Provincial) and no position that shows one. "
+                        "They are still screened as PEPs.")
+    if not info["with_cnic"]:
+        warnings.append("No usable CNIC numbers were found, so matching will rely on names alone.")
+    return {**_pep_status(), "records": len(records), "rows_read": info["rows"], "rows_skipped": info["skipped"],
+            "national": info["national"], "provincial": info["provincial"], "warnings": warnings}
+
+
+@app.post("/api/admin/pep")
+@limiter.limit("20/hour")
+async def upload_pep(request: Request, filename: str = "pep.csv", user: AuthUser = Depends(require_admin)):
+    """
+    Load the administrator's own PEP list. Send the file as the request body (not a multipart form), with the
+    name in ?filename=. It replaces the previous upload only if it can be read. Wikidata data is not touched.
+    """
+    data = await request.body()
+    if not data:
+        raise AppError(400, "PEP_FILE_EMPTY", "The upload was empty.", "Choose the CSV, JSON or XML file and try again.")
+    if len(data) > MAX_PEP_UPLOAD_BYTES:
+        raise AppError(413, "PEP_FILE_TOO_LARGE", "That file is too large for the PEP list.")
+    out = await run_in_threadpool(_ingest_pep, data, filename)
+    _audit(request, user, "pep.upload", "pep_list", None,
+           {"filename": os.path.basename(filename)[:200], "records": out["records"], "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest()})
+    return out
+
+
+@app.delete("/api/admin/pep")
+@limiter.limit("20/hour")
+def delete_pep_upload(request: Request, user: AuthUser = Depends(require_admin)):
+    """Remove the administrator's own PEP list (the Wikidata copy stays)."""
+    with db.pool().connection() as conn:
+        conn.execute("DELETE FROM pep_files WHERE kind = 'upload'")
+    loader.clear_cache("PEP")
+    _audit(request, user, "pep.delete", "pep_list", None)
+    return _pep_status()
 
 
 @app.get("/api/admin/nacta")
