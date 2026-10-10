@@ -27,6 +27,7 @@ Endpoints:
     GET  /api/applicants                  your past screenings (admins: everyone's; ?mine=true for their own)
     GET  /api/applicants/{id}             full result for one screening
     GET  /api/applicants/{id}/evidence    evidence PDF of a screening that found something
+    DELETE /api/account/history           delete your own screening history (monitored screenings are kept)
     GET  /api/evidence/{result_id}        same PDF, addressed by a result row id
     GET  /api/admin/lists                 which lists are cached in memory right now
     GET  /api/admin/nacta                 which NACTA file is loaded and how old it is
@@ -78,7 +79,7 @@ from app.config import FIA_REQUIRED, NACTA_REQUIRED, PEP_REQUIRED, PRELOAD_LISTS
 from app.errors import AppError, configure_logging, install as install_error_handlers, request_context, logger
 from app.schemas import (AlertDecisionIn, AlertOut, ApplicantSummary, AuditEntryOut, AuditPageOut, AuditVerifyOut,
                          BatchOut, BatchRowOut, MeOut,
-                         MonitoringIn, MonitoringOut, MonitoringStatusOut, SourceMonitoringOut, ScreenRequest, ScreenResponse, ScreeningResultOut, UserDeletedOut, UserOut,
+                         HistoryClearedOut, MonitoringIn, MonitoringOut, MonitoringStatusOut, SourceMonitoringOut, ScreenRequest, ScreenResponse, ScreeningResultOut, UserDeletedOut, UserOut,
                          UserRoleIn, UserStatusIn)
 from app.screening import engine, loader, nacta_store, parsers, pep
 
@@ -481,6 +482,21 @@ def list_applicants(request: Request, response: Response, mine: bool = False,
     rows, total = db.search_applicants(user_id=_scope(user, mine), status=status, limit=limit, offset=offset)
     response.headers["X-Total-Count"] = str(total)
     return rows
+
+
+@app.delete("/api/account/history", response_model=HistoryClearedOut)
+@limiter.limit("5/minute")
+def clear_my_history(request: Request, user: AuthUser = Depends(require_approved)):
+    """
+    Delete the signed in person's own screening history. Only their own: nobody can clear another person's
+    (administrators included). Screenings under continuous monitoring are kept. The action is recorded in the
+    audit log with the count only.
+    """
+    if not user.id:
+        raise HTTPException(400, "This sign in has no personal history to clear")
+    out = db.clear_history(user.id)
+    _audit(request, user, "history.clear", "user", user.id, out)
+    return HistoryClearedOut(**out)
 
 
 @app.get("/api/applicants/{applicant_id}", response_model=ScreenResponse)

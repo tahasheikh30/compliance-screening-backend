@@ -199,6 +199,11 @@ class MonitoringIn(BaseModel):
     enabled: bool
 
 
+class HistoryClearedOut(BaseModel):
+    deleted: int
+    kept_monitored: int       # screenings under continuous monitoring are not deleted
+
+
 class MonitoringOut(BaseModel):
     applicant_id: int
     monitored: bool

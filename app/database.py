@@ -551,6 +551,19 @@ def set_monitoring(applicant_id: int, enabled: bool, user_id=None) -> dict | Non
         return _clean(conn.execute(sql + scope + " RETURNING *", [applicant_id] + args).fetchone())
 
 
+def clear_history(user_id: str) -> dict:
+    """
+    Delete one person's own screenings (their results, evidence and alerts go with them). Screenings under
+    continuous monitoring are kept: deleting them would silently stop the watch. Returns the counts.
+    """
+    with pool().connection() as conn:
+        deleted = conn.execute("DELETE FROM applicants WHERE user_id = %s AND NOT monitored RETURNING id",
+                               (user_id,)).fetchall()
+        kept = conn.execute("SELECT count(*) AS n FROM applicants WHERE user_id = %s AND monitored",
+                            (user_id,)).fetchone()["n"]
+    return {"deleted": len(deleted), "kept_monitored": kept}
+
+
 def monitored_batch(after_id: int, limit: int = 500) -> list:
     """The next monitored applicants after `after_id`, with what is needed to screen them again."""
     with pool().connection() as conn:
