@@ -265,8 +265,8 @@ def merge(*groups: list) -> list:
 # Wikidata
 # --------------------------------------------------------------------------
 
-PAGE_PEOPLE = 2000
-MAX_PAGES = 40
+PAGE_PEOPLE = 1000
+MAX_PAGES = 80
 _QID = re.compile(r"^Q\d+$")
 
 
@@ -281,9 +281,12 @@ def _query_people(country: str, limit: int, offset: int) -> str:
 }}"""
 
 
-def _query_aliases(country: str, limit: int, offset: int) -> str:
+def _query_aliases(country: str, ids: list) -> str:
+    """English aliases of a small, explicit set of people. Asking for them by id is fast; asking for the aliases
+    of a whole page of people made Wikidata time out."""
+    values = " ".join("wd:" + i for i in ids)
     return f"""SELECT ?person ?alias WHERE {{
-  {{ SELECT DISTINCT ?person WHERE {{ ?person wdt:P27 wd:{country} ; wdt:P39 [] . }} ORDER BY ?person LIMIT {limit} OFFSET {offset} }}
+  VALUES ?person {{ {values} }}
   ?person skos:altLabel ?alias . FILTER(LANG(?alias) = "en")
 }}"""
 
@@ -292,19 +295,35 @@ def _qid(uri: str) -> str:
     return str(uri).rsplit("/", 1)[-1]
 
 
+ALIAS_CHUNK = 100
+ATTEMPTS = 3
+
+
+def _ask(get, query: str, pause: float):
+    """One SPARQL query, tried a few times with a growing pause: the public endpoint answers 429 and 5xx now and then."""
+    last = None
+    for n in range(1, ATTEMPTS + 1):
+        try:
+            return json.loads(get(config.PEP_WIKIDATA_URL, {"query": query, "format": "json"}))["results"]["bindings"]
+        except Exception as exc:       # noqa: BLE001  (network, HTTP status, bad JSON: all worth another try)
+            last = exc
+            if n < ATTEMPTS:
+                time.sleep(pause * n * 3)
+    raise last
+
+
 def fetch_snapshot(get, country: str = "Q843", page: int = PAGE_PEOPLE, pause: float = 1.0) -> dict:
     """
     Everyone Pakistani on Wikidata who holds or held a position, with their positions and English aliases.
-    `get(url, params)` returns the response text of a GET (the loader's safe downloader). Raises on failure:
-    a partial list must never replace a good one.
+    `get(url, params)` returns the response text of a GET (the loader's safe downloader). Raises when the people
+    cannot be fetched: a partial list must never replace a good one. Aliases are an extra, so a failure to get them
+    only costs the aliases (the names themselves are still screened).
     """
     if not _QID.match(country):
         raise ValueError("PEP_WIKIDATA_COUNTRY must look like Q843")
     people: dict = {}
     for n in range(MAX_PAGES):
-        offset = n * page
-        data = json.loads(get(config.PEP_WIKIDATA_URL, {"query": _query_people(country, page, offset), "format": "json"}))
-        rows = data["results"]["bindings"]
+        rows = _ask(get, _query_people(country, page, n * page), pause)
         ids = set()
         for r in rows:
             pid = _qid(r["person"]["value"])
@@ -319,18 +338,22 @@ def fetch_snapshot(get, country: str = "Q843", page: int = PAGE_PEOPLE, pause: f
             if label and not _QID.match(label):
                 p["positions"].append({"label": label, "start": r.get("start", {}).get("value", "")[:10],
                                        "end": r.get("end", {}).get("value", "")[:10]})
-        time.sleep(pause)
-        adata = json.loads(get(config.PEP_WIKIDATA_URL, {"query": _query_aliases(country, page, offset), "format": "json"}))
-        for r in adata["results"]["bindings"]:
-            p = people.get(_qid(r["person"]["value"]))
-            if p and r["alias"]["value"] not in p["aliases"] and len(p["aliases"]) < 12:
-                p["aliases"].append(r["alias"]["value"])
-        if not rows or len({_qid(r["person"]["value"]) for r in rows}) < page:
+        if len({_qid(r["person"]["value"]) for r in rows}) < page:
             break
         time.sleep(pause)
     else:
         raise ValueError(f"More than {MAX_PAGES * page} people returned; stopping")
     if not people:
         raise ValueError("Wikidata returned nobody")
+    ids = sorted(people)
+    for i in range(0, len(ids), ALIAS_CHUNK):
+        try:
+            time.sleep(pause)
+            for r in _ask(get, _query_aliases(country, ids[i:i + ALIAS_CHUNK]), pause):
+                p = people.get(_qid(r["person"]["value"]))
+                if p and r["alias"]["value"] not in p["aliases"] and len(p["aliases"]) < 12:
+                    p["aliases"].append(r["alias"]["value"])
+        except Exception:      # noqa: BLE001
+            break              # the rest of the aliases are skipped; every name is still there
     return {"fetched_at": datetime.now(timezone.utc).isoformat(), "country": country,
             "people": sorted(people.values(), key=lambda p: p["id"])}

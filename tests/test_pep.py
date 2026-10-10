@@ -90,7 +90,46 @@ def test_fetch_snapshot_pages_and_builds_people(monkeypatch):
     assert set(people) == {"Q9000001", "Q9000002", "Q9000003"}              # Q9000004 has no English label
     assert people["Q9000001"]["aliases"] == ["A. Z. Rana"] and people["Q9000001"]["dob"] == "1961-03-04"
     assert len(people["Q9000001"]["positions"]) == 2
-    assert len(calls) == 2 and "wd:Q843" in calls[0]                         # one page: people, then aliases
+    assert len(calls) == 2 and "wd:Q843" in calls[0]                         # one page of people, then one chunk of aliases
+    assert "VALUES ?person" in calls[1] and "wd:Q9000001" in calls[1]       # aliases are asked for by id, which Wikidata answers quickly
+
+
+def test_alias_failure_keeps_the_people_and_a_flaky_page_is_retried(monkeypatch):
+    monkeypatch.setattr(pep.time, "sleep", lambda s: None)
+    state = {"people_calls": 0}
+
+    def get(url, params):
+        q = params["query"]
+        if "altLabel" in q:
+            raise ConnectionError("504 Gateway Timeout")            # the alias query always fails
+        state["people_calls"] += 1
+        if state["people_calls"] == 1:
+            raise ConnectionError("504 Gateway Timeout")            # the first try of the people page fails once
+        return json.dumps(fx.WIKIDATA_PEOPLE)
+
+    snap = pep.fetch_snapshot(get, pause=0)
+    assert {p["id"] for p in snap["people"]} == {"Q9000001", "Q9000002", "Q9000003"}
+    assert all(p["aliases"] == [] for p in snap["people"]) and state["people_calls"] == 2
+
+
+def test_people_that_cannot_be_fetched_raise_so_a_good_copy_is_never_replaced(monkeypatch):
+    monkeypatch.setattr(pep.time, "sleep", lambda s: None)
+
+    def get(url, params):
+        raise ConnectionError("504 Gateway Timeout")
+
+    with pytest.raises(ConnectionError):
+        pep.fetch_snapshot(get, pause=0)
+
+
+def test_error_text_does_not_carry_the_request_address_or_query():
+    import requests
+    resp = requests.Response()
+    resp.status_code = 504
+    resp.url = "https://query.wikidata.org/sparql?query=SELECT+%3Fperson+WHERE+%7B"
+    err = requests.HTTPError("504 Server Error: Gateway Timeout for url: " + resp.url, response=resp)
+    assert loader._short(err) == "HTTP 504 from query.wikidata.org"
+    assert "query=" not in loader._short(ConnectionError("failed for https://x.example/a?query=SELECT+1"))
 
 
 def test_fetch_snapshot_refuses_a_bad_country_id_and_an_empty_answer():
