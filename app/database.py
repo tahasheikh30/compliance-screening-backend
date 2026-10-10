@@ -551,6 +551,24 @@ def set_monitoring(applicant_id: int, enabled: bool, user_id=None) -> dict | Non
         return _clean(conn.execute(sql + scope + " RETURNING *", [applicant_id] + args).fetchone())
 
 
+def set_review(applicant_id: int, decision, note, reviewer_id, user_id=None) -> dict | None:
+    """
+    Record (or clear, with decision None) a reviewer's decision on one screening. With user_id, only on that user's
+    own screenings. Returns the row, or None when there is no such screening for them.
+    """
+    scope, args = ("", []) if user_id is None else (" AND user_id = %s", [user_id])
+    if decision is None:
+        sql = ("UPDATE applicants SET review_decision = NULL, review_note = NULL, reviewed_at = NULL, reviewed_by = NULL "
+               "WHERE id = %s")
+        params = [applicant_id]
+    else:
+        sql = ("UPDATE applicants SET review_decision = %s, review_note = %s, reviewed_at = now(), reviewed_by = %s "
+               "WHERE id = %s")
+        params = [decision, note, reviewer_id, applicant_id]
+    with pool().connection() as conn:
+        return _clean(conn.execute(sql + scope + " RETURNING *", params + args).fetchone())
+
+
 def clear_history(user_id: str) -> dict:
     """
     Delete one person's own screenings (their results, evidence and alerts go with them). Screenings under

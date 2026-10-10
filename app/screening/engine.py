@@ -238,6 +238,39 @@ def screen(name: str, dob: str = "", nationality: str = "", threshold=None,
     }
 
 
+def coverage(names_list: list, threshold=None) -> list:
+    """
+    For each name: is it on any loaded list, and where? Lists only (no news search, nothing stored), so a
+    hundred known names can be checked in a moment. This is how to see whether the lists cover the people you
+    expect them to. One row per name: {name, found, source, score, matched_name, list, error}.
+    """
+    thr = resolve_threshold(threshold)
+    groups = loader.load_groups()
+    rows = []
+    for raw in names_list:
+        name = str(raw or "").strip()
+        row = {"name": name, "found": False, "source": None, "score": 0.0, "matched_name": None, "list": None, "error": None}
+        try:
+            check_screenable(name)
+        except UnscreenableName as exc:
+            row["error"] = str(exc)
+            rows.append(row)
+            continue
+        scorer = NameScorer(name)
+        best = None
+        for key in loader.SOURCE_KEYS:
+            g = groups[key]
+            if not g.available:
+                continue
+            matches, _n = match_records(scorer, g.records, thr, "", limit=1, index=g.index)
+            if matches and (best is None or matches[0]["score"] > best["score"]):
+                best = matches[0]
+        if best:
+            row.update(found=True, source=str(best["source"]).upper(), score=best["score"], matched_name=best["primary_name"], list=best["list"])
+        rows.append(row)
+    return rows
+
+
 def _news(name: str) -> dict:
     media = {"source": "Google News RSS (open web news search)",
              "query": '"' + name + '" + adverse keywords',

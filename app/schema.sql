@@ -152,6 +152,14 @@ ALTER TABLE applicants ADD COLUMN IF NOT EXISTS monitored_since    timestamptz;
 ALTER TABLE applicants ADD COLUMN IF NOT EXISTS last_monitored_at  timestamptz;
 CREATE INDEX IF NOT EXISTS idx_applicants_monitored ON applicants (id) WHERE monitored;
 
+-- A reviewer's decision on a screening (cleared as a false alarm, confirmed as a true match, or escalated), with a
+-- note. NULL means not reviewed yet. The decision does not change the screening result; it records what a person
+-- concluded, and by whom.
+ALTER TABLE applicants ADD COLUMN IF NOT EXISTS review_decision text;
+ALTER TABLE applicants ADD COLUMN IF NOT EXISTS review_note     text;
+ALTER TABLE applicants ADD COLUMN IF NOT EXISTS reviewed_at     timestamptz;
+ALTER TABLE applicants ADD COLUMN IF NOT EXISTS reviewed_by     uuid REFERENCES profiles (id) ON DELETE SET NULL;
+
 CREATE TABLE IF NOT EXISTS monitoring_alerts (
     id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     applicant_id   bigint NOT NULL REFERENCES applicants (id) ON DELETE CASCADE,

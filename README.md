@@ -33,6 +33,15 @@ It is measured, not assumed. `python scripts/benchmark_matching.py` scores label
 
 The second row is optimistic because the rules were shaped by that set's misses. The fourth row is the fair estimate: names the rules were not fitted to. After that run a few more of its misses were fixed (so it is no longer untouched). Known limits that remain: look-alike given names one letter apart (MARIA and MARIO, AHSAN and HASSAN), a gendered ending (IVANOV and IVANOVA), and spellings with no shared letters. These are flagged for a person to check, which is the safe side. These pairs are test data, not claims about real people, and accuracy on your own applicants will differ: add pairs from your own cases to `tests/benchmark/` and rerun.
 
+## Review, export and coverage check
+
+- `POST /api/applicants/{id}/review` records what a person concluded about a screening (`cleared`, `confirmed` or `escalated`, with a note; `decision: null` undoes it). It does not change the screening result. You can review your own screenings, administrators anyone's, and every change is in the audit log. The decision shows in the history list and the case.
+- `GET /api/export/history.csv` downloads your screening history (newest 5000). Administrators can add `?mine=false` for everyone's. Names that start with `=`, `+`, `-` or `@` are written so a spreadsheet will not run them as formulas.
+- `POST /api/admin/coverage` (admin) takes up to 200 names and says which are on the loaded lists and where. Nothing is saved. Use it after a deploy to check that the lists cover the people you expect.
+- `DELETE /api/account/history` deletes your own screenings, except those under continuous monitoring.
+
+The review columns are added to `applicants` by `app/schema.sql` on start (safe to run again).
+
 ## Users, history and storage (Supabase)
 
 Everything the service remembers lives in a Supabase Postgres database, so the web server itself keeps nothing on disk and can be restarted, redeployed or put to sleep (Render's free plan does this) without losing anything:
