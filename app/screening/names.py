@@ -29,19 +29,41 @@ import os
 import re
 import unicodedata
 from collections import Counter
+from functools import lru_cache
 
 from rapidfuzz import process
-from rapidfuzz.distance import JaroWinkler
+from rapidfuzz.distance import OSA, JaroWinkler
 
 # Titles and name particles ignored when comparing.
 HONORIFICS = frozenset({
     "MR", "MRS", "MS", "MISS", "DR", "PROF", "HAJI", "HAJJI", "MAULANA", "MAWLAWI",
     "MULLAH", "MOLVI", "QARI", "ENGR", "ENG", "SIR", "GENERAL", "COLONEL",
-    "AL", "EL", "UL", "BIN", "IBN", "BINT",
+    "AL", "EL", "UL", "UR", "US", "UD", "BIN", "IBN", "BINT",
 })
+
+# Titles that are often dropped or added between documents (Syed Ali Raza and Ali Raza are one man on two forms).
+# When one has no partner on the other side it is left out of the comparison instead of counting against the
+# score, but only while at least two other name parts remain, so "Imran Malik" is never reduced to "Imran".
+SOFT_TITLES = frozenset({"SAYED", "MIAN", "SARDAR", "MALIK", "CHAUDHRY", "KHAWAJA", "SAHIBZADA", "SHEIKH", "NAWAB",
+                         "RAJA", "RANA", "PIR", "MAKHDOOM", "MIR", "BEGUM", "SARDARZADA", "NAWABZADA"})
+
+# The most common name parts. A name whose parts are all from this set ("Muhammad Khan") says too little to be
+# flagged just because it sits inside a longer listed name.
+COMMON_PARTS = frozenset({"MUHAMMAD", "ALI", "KHAN", "AHMAD", "HUSSAIN", "HASSAN", "SAYED", "SHAH", "MALIK", "ABDUL",
+                          "ABDULLAH", "RAHMAN", "DIN", "ULLAH", "MIAN", "SHEIKH", "RAZA", "BIBI", "BEGUM", "KUMAR"})
+
+# A name that is wholly inside a longer one is a likely same person (a middle or family name left off a form).
+SUBSET_SCORE = 88.0
+SUBSET_MAX_EXTRA = 3
+
+# A one letter name part is an initial: it matches any part starting with that letter, at this similarity.
+INITIAL_SIM = 0.9
 
 # Token similarity below this is treated as a non-match.
 TOKEN_CUTOFF = 0.88
+# Two short parts that differ by two or more edits are different names (IMRAN and IRFAN), and any two parts that
+# differ by three or more are (PETROV and PETRENKO), however close the Jaro-Winkler score looks.
+SHORT_PART = 5
 
 _COMBINING = re.compile(r"[\u0300-\u036f]")
 # Latin letters that NFKD does not decompose. Without this "LUKASZ" typed by an analyst never meets
@@ -92,20 +114,30 @@ _VARIANT_FAMILIES = {
     "AHMAD": "AHMED AHMET AHMAAD", "HUSSAIN": "HUSSEIN HUSAIN HOSSAIN HOSSEIN HUSEIN HOSEIN HUSSAYN HUSAYN HOSAIN",
     "HASSAN": "HASAN HASSEN", "UMAR": "OMAR OMER UMER", "USMAN": "OSMAN UTHMAN OTHMAN UTHMAAN",
     "IBRAHIM": "EBRAHIM IBRAHEEM EBRAHEEM IBRAHEM", "ISMAIL": "ISMAEEL ISMAEL ISMAYIL ISMAIEL ISMAYEL",
-    "YUSUF": "YOUSUF YUSSUF YOUSEF YUSEF YOUSOUF YUSOUF", "SAYED": "SYED SAYYED SAYYID SAYID SEYED",
+    "YUSUF": "YOUSUF YUSSUF YOUSEF YUSEF YOUSOUF YUSOUF YOUSAF YUSAF YUSAAF YOUSAAF", "ZIA": "ZIAUL ZIYA", "FAZAL": "FAZL FAZLUR FAZLE FAZLI", "SAYED": "SYED SAYYED SAYYID SAYID SEYED",
     "SHEIKH": "SHAIKH SHAYKH SHEIK SHAIK SHEKH", "ABDUL": "ABDOL ABDEL ABD ABDOUL ABDOOL ABDELL",
     "ABDULLAH": "ABDALLAH ABDULLA ABDOLLAH ABDELLAH ABDALLA", "RAHMAN": "REHMAN RAHMAAN REHMAAN",
-    "MAHMOOD": "MAHMUD MAHMOUD", "KHALID": "KHALED KHALEED", "SALIM": "SALEEM", "NASIR": "NASSER NASER NASEER",
+    "MAHMOOD": "MAHMUD MAHMOUD MEHMOOD MEHMUD", "KHALID": "KHALED KHALEED", "SALIM": "SALEEM", "NASIR": "NASSER NASER NASEER",
     "SAEED": "SAID SAYEED", "ZUBAIR": "ZUBAYR ZUBEIR ZOBAIR ZUBEER", "HAMZA": "HAMZAH HAMZEH",
     "USAMA": "OSAMA OSSAMA USAMAH OSAMAH", "ZULFIQAR": "ZULFIKAR ZULFEKAR ZULFIQUAR",
     "SIDDIQUI": "SIDDIQI SIDDIQUE SIDIQI SIDDIQUEE", "QURESHI": "KUREISHI QURAISHI QURAYSHI KURESHI",
-    "CHAUDHRY": "CHAUDHARY CHAUDHRI CHAUDHURY CHOUDHARY CHOUDHRY CHAUDRY CHOUDHURY CHOWDHURY",
+    "CHAUDHRY": "CHAUDHARY CHAUDHRI CHAUDHURY CHOUDHARY CHOUDHRY CHAUDRY CHOUDHURY CHOWDHURY CH CHDHRY",
     "HAQ": "HUQ HAQUE HUQUE", "MUSTAFA": "MUSTAPHA MOSTAFA MOUSTAFA", "FATIMA": "FATIMAH FATEMA FATEMAH",
     "AISHA": "AYESHA AYSHA AISHAH AYISHA AAISHA", "JAVED": "JAVID JAVEED JAWED JAWID", "IQBAL": "IKBAL",
     "QASIM": "KASIM QASSIM QASEM KASEM", "TARIQ": "TAREK TAREQ TARIK TAREEQ",
     "SULAIMAN": "SULEIMAN SULAYMAN SULEMAN SOLIMAN SOLEIMAN", "HAFIZ": "HAFEEZ HAFEZ", "MASOOD": "MASUD MASOUD",
-    "JAMIL": "JAMEEL JAMEL", "KARIM": "KAREEM KERIM", "RASHID": "RASHEED RASHED", "NOOR": "NUR NOUR",
+    "JAMIL": "JAMEEL JAMEL", "KARIM": "KAREEM KERIM", "RASHID": "RASHEED RASHED", "NOOR": "NUR NOUR NURUL NOORUL",
     "ABU": "ABOU ABOO", "KHAN": "KHANN",
+    "FAROOQ": "FAROUK FARUQ FAROUQ FARUK FAROOK FARUKH", "HAMID": "HAMEED HAMED", "MAJID": "MAJEED MAJED",
+    "KHAWAJA": "KHWAJA KHAJA KHAWAJAH KHAWJA KHWAJAH",
+    "GILANI": "GILLANI GEELANI GILANEE GEELANEE", "REHAN": "RAIHAN RIHAN RAYHAN RAIHAAN",
+    "ALEXEI": "ALEKSEI ALEXEY ALEKSEY ALEXEJ ALEKSEJ", "TAREEN": "TARIN TAREN", "MIR": "MEER",
+    "GADDAFI": "GADHAFI QADDAFI QADHAFI KADHAFI KADDAFI GHADDAFI QADAFI GADAFI",
+ "SHAKEEL": "SHAKIL SHAKEIL",
+    "SHAHEEN": "SHAHIN SHAHEIN", "MUSHARRAF": "MUSHARAF MOSHARRAF", "RAFIQ": "RAFEEQ RAFIK RAFEEK",
+    "ZAFAR": "ZAFFAR ZUFAR", "SHAUKAT": "SHAWKAT SHAUKET", "NAVEED": "NAVED NAVEEDD NAWEED", "WAQAR": "WAQQAR WAKAR",
+    "SHAHID": "SHAHEED SHAHED", "BASHIR": "BASHEER BASHEIR", "AKHTAR": "AKHTER AKTAR", "SULTAN": "SULTHAN SULTANN",
+    "BILAL": "BELAL BILLAL", "SOHAIL": "SUHAIL SUHEIL SOHEIL", "ANWAR": "ANWER ANOUAR"
 }
 _VARIANT = {v: canon for canon, vs in _VARIANT_FAMILIES.items() for v in vs.split()}
 
@@ -116,7 +148,7 @@ _ABDUL_SECOND = frozenset({
     "RAHMAN", "REHMAN", "RAHIM", "REHIM", "AZIZ", "KARIM", "KAREEM", "QADIR", "KADER", "SALAM", "SAMAD", "GHAFFAR",
     "GHAFOOR", "RAZZAQ", "RAZAQ", "HAKIM", "HAMID", "MAJID", "WAHID", "WAHAB", "BASIT", "BARI", "JABBAR", "LATIF",
     "MALIK", "MANAN", "QAYYUM", "RASHID", "RAOOF", "SATTAR", "SHAKOOR", "WADOOD", "HAQ", "HADI", "HAFIZ", "GHANI",
-    "NASIR", "SABOOR", "RAUF", "QUDDUS", "SAMI", "BASIR", "HALIM", "MUHSIN", "MOHSIN", "NOOR",
+    "NASIR", "SABOOR", "RAUF", "QUDDUS", "SAMI", "BASIR", "HALIM", "MUHSIN", "MOHSIN", "NOOR", "HAMEED", "MAJEED",
 })
 
 
@@ -134,12 +166,78 @@ def _split_abdul(t: str) -> tuple:
 NAME_VARIANTS = os.environ.get("NAME_VARIANTS", "true").strip().lower() not in ("0", "false", "no")
 
 
-def _fold(parts: tuple) -> tuple:
+# Name parts that are often written together ("KHANMUHAMMAD", "MUHAMMADALI"). A part that is exactly two of these
+# is split, on both the applicant and the list side, so both spellings give the same parts.
+_FUSE_WORDS = frozenset({
+    "MUHAMMAD", "ALI", "KHAN", "AHMAD", "HUSSAIN", "HASSAN", "SHAH", "HAQ", "RAHMAN", "DIN", "ULLAH", "ALLAH", "NAWAZ",
+    "SHARIF", "HAMID", "MAJID", "RAZA", "SAEED", "NOOR", "FAZAL", "SIRAJ", "ZIA", "ABDUL", "RAUF", "AZIZ", "KARIM", "LATIF",
+    "MALIK", "AKBAR", "ASGHAR", "REHMAN", "IQBAL", "JAN", "GUL", "BAKHSH", "DAD", "MIR", "ZADA", "SULTAN", "FAROOQ",
+    "TARIQ", "IMRAN", "NAEEM", "WALI", "KHALID", "SALIM", "UMAR", "USMAN", "BILAL", "HAIDER", "NASIR", "FAIZ", "SHER",
+    "BAZ", "RASHID", "SAJID", "ZAFAR", "AMIN", "YOUSAF", "YUSUF", "IBRAHIM", "ISMAIL", "MUSTAFA", "SULEMAN",
+})
+_SUFFIX_PARTICLES = ("UL", "UR", "US", "UD")
+
+
+def _strip_particle(t: str) -> str:
+    """FAZALUR to FAZAL, SIRAJUL to SIRAJ: a fused particle (-ul, -ur, -us, -ud) is not part of the name."""
+    if len(t) >= 7:
+        for suf in _SUFFIX_PARTICLES:
+            if t.endswith(suf) and len(t) - 2 >= 4:
+                return t[:-2]
+    return t
+
+
+def _split_fused(t: str) -> tuple:
+    if len(t) < 6 or _VARIANT.get(t, t) in _FUSE_WORDS:
+        return (t,)
+    for i in range(3, len(t) - 2):
+        a, b = _VARIANT.get(t[:i], t[:i]), _VARIANT.get(t[i:], t[i:])
+        if a in _FUSE_WORDS and b in _FUSE_WORDS and not (a == "ABDUL" and b == "ULLAH"):    # ABDULLAH is one name
+            return (t[:i], t[i:])
+    return (t,)
+
+
+# Vowel and letter habits that differ between Latin spellings of the same sound: JAVAID and JAVED, MOEEN and MOIN,
+# RASOOL and RASUL, GHULAM and GULAM, RAZZAQ and RAZAQ. Applied to every part on both sides after the variant
+# families, so the folded spellings are what get compared.
+_PHONETIC = (("GH", "G"), ("PH", "F"), ("OO", "U"), ("EE", "I"), ("OU", "U"), ("AI", "E"), ("AY", "E"))
+_REPEAT = re.compile(r"(.)\1+")
+
+
+def _phon(t: str) -> str:
+    if len(t) < 3:
+        return t
+    for a, b in _PHONETIC:
+        t = t.replace(a, b)
+    return _REPEAT.sub(r"\1", t)
+
+
+def _split_ullah(t: str) -> tuple:
+    """SAIFULLAH to SAIF ULLAH, SANAULLAH to SANA ULLAH (ABDULLAH is one name and is left alone)."""
+    if t.endswith("ULLAH") and len(t) >= 8 and _VARIANT.get(t, t) != "ABDULLAH" and not t.startswith(_ABDUL_PREFIXES):
+        return (t[:-5], "ULLAH")
+    return (t,)
+
+
+@lru_cache(maxsize=262144)
+def _fold_part(t: str) -> tuple:
     out = []
-    for t in parts:
-        for u in _split_abdul(t):
-            out.append(_VARIANT.get(u, u))
+    for u in _split_abdul(t):
+        for v in _split_ullah(u):
+            for w in _split_fused(_strip_particle(v)):
+                out.append(_phon(_VARIANT.get(w, w)))
     return tuple(out)
+
+
+def _fold(parts: tuple) -> tuple:
+    out: list = []
+    for t in parts:
+        out.extend(_fold_part(t))
+    return tuple(out)
+
+
+SOFT_TITLES = frozenset(_phon(t) for t in SOFT_TITLES)
+COMMON_PARTS = frozenset(_phon(t) for t in COMMON_PARTS)
 
 
 def tokens(s) -> tuple:
@@ -212,6 +310,21 @@ def _js_round(x: float) -> float:
     return math.floor(x + 0.5)
 
 
+def part_similarity(a: str, b: str) -> float:
+    """Similarity (0..1) of two name parts. Initials match any part that starts with the letter; very short parts
+    that differ by two or more edits do not match."""
+    if a == b:
+        return 1.0
+    if len(a) == 1 or len(b) == 1:
+        return INITIAL_SIM if a[0] == b[0] else 0.0
+    s = jw(a, b)
+    if s >= TOKEN_CUTOFF:
+        edits = OSA.distance(a, b)
+        if edits >= 3 or (edits >= 2 and len(a) <= SHORT_PART and len(b) <= SHORT_PART):
+            return 0.0
+    return s
+
+
 class NameScorer:
     """Scores candidate names against one applicant name."""
 
@@ -224,7 +337,7 @@ class NameScorer:
         """Similarity of one candidate token to each applicant token (memoised)."""
         s = self._sim_cache.get(tok)
         if s is None:
-            s = tuple(jw(q, tok) for q in self.q)
+            s = tuple(part_similarity(q, tok) for q in self.q)
             self._sim_cache[tok] = s
         return s
 
@@ -238,30 +351,47 @@ class NameScorer:
             return 0.0
 
         rows = [self._sims(t) for t in ctoks]  # one row per candidate token
+        q_best = [max(row[j] for row in rows) for j in range(len(q))]
+        c_best = [max(row) for row in rows]
+
+        # a title with no partner on the other side is left out, while two other parts remain
+        q_keep = _keep(q, q_best)
+        c_keep = _keep(ctoks, c_best)
 
         # applicant -> candidate coverage
-        q2c = 0.0
-        for j in range(len(q)):
-            best = max(row[j] for row in rows)
-            if best >= TOKEN_CUTOFF:
-                q2c += best
-        q2c /= len(q)
-
+        q2c = sum(q_best[j] for j in q_keep if q_best[j] >= TOKEN_CUTOFF) / len(q_keep)
         # candidate -> applicant coverage
-        c2q = 0.0
-        for row in rows:
-            best = max(row)
-            if best >= TOKEN_CUTOFF:
-                c2q += best
-        c2q /= len(ctoks)
+        c2q = sum(c_best[i] for i in c_keep if c_best[i] >= TOKEN_CUTOFF) / len(c_keep)
 
         # symmetric, weighted by token counts: extra unmatched tokens on
         # either side lower the score
-        s = (q2c * len(q) + c2q * len(ctoks)) / (len(q) + len(ctoks))
-        return _js_round(s * 1000) / 10
+        s = (q2c * len(q_keep) + c2q * len(c_keep)) / (len(q_keep) + len(c_keep))
+        score = _js_round(s * 1000) / 10
+        if score < SUBSET_SCORE:
+            sub = _subset(q, q_best, q_keep, ctoks, c_best, c_keep)
+            if sub:
+                return sub
+        return score
 
     def score(self, name: str) -> float:
         return self.score_tokens(tokens(name))
+
+
+def _keep(toks: tuple, best: list) -> list:
+    """Positions of the parts that count: all of them, minus titles with no partner when two or more others remain."""
+    kept = [i for i, t in enumerate(toks) if not (t in SOFT_TITLES and best[i] < TOKEN_CUTOFF)]
+    return kept if len(kept) >= 2 else list(range(len(toks)))
+
+
+def _subset(q, q_best, q_keep, ctoks, c_best, c_keep) -> float:
+    """SUBSET_SCORE when one name, untouched and of at least two parts, sits wholly inside the other (a middle or
+    family name left off), unless every part of it is a very common one; otherwise 0."""
+    for short, best, keep, full, n_long in ((q, q_best, q_keep, ctoks, len(c_keep)),
+                                              (ctoks, c_best, c_keep, q, len(q_keep))):
+        if len(keep) == len(short) and len(short) >= 2 and 0 < n_long - len(short) <= SUBSET_MAX_EXTRA \
+                and all(b >= TOKEN_CUTOFF for b in best) and any(t not in COMMON_PARTS for t in short):
+            return SUBSET_SCORE
+    return 0.0
 
 
 # --------------------------------------------------------------------------
@@ -284,13 +414,14 @@ class RecordIndex:
     records that share a similar token with the applicant.
     """
 
-    __slots__ = ("vocab", "postings", "by_cnic", "size", "max_len", "_hits")
+    __slots__ = ("vocab", "postings", "by_cnic", "size", "max_len", "_hits", "initials", "by_first", "_toks")
 
     _HITS_MAX = 4096
 
     def __init__(self, records: list):
         postings: dict = {}
         by_cnic: dict = {}
+        self._toks = [r.toks for r in records]
         self.max_len = [max((len(tk) for tk in r.toks), default=0) for r in records]   # longest name of each record
         for i, r in enumerate(records):
             for tk in r.toks:
@@ -302,6 +433,11 @@ class RecordIndex:
                 by_cnic.setdefault(r.cnic, []).append(i)
         self.postings = postings
         self.vocab = list(postings)
+        self.initials = {t: t for t in postings if len(t) == 1}          # one letter parts on the list side
+        self.by_first: dict = {}                                            # first letter -> longer parts, for an applicant initial
+        for t in postings:
+            if len(t) > 1:
+                self.by_first.setdefault(t[0], []).append(t)
         self.by_cnic = by_cnic
         self.size = len(records)
         self._hits: dict = {}    # applicant token -> list-side tokens that are close enough, reused across screenings
@@ -309,8 +445,13 @@ class RecordIndex:
     def _close_tokens(self, q: str) -> tuple:
         hit = self._hits.get(q)
         if hit is None:
-            found = process.extract(q, self.vocab, scorer=JaroWinkler.similarity, score_cutoff=JW_SKIP, limit=None)
-            hit = tuple(tok for tok, _score, _i in found if jw_exact(q, tok) >= TOKEN_CUTOFF)
+            if len(q) == 1:       # an initial matches every part that starts with the letter (see part_similarity)
+                hit = tuple(self.by_first.get(q, ())) + ((q,) if q in self.postings else ())
+            else:
+                found = process.extract(q, self.vocab, scorer=JaroWinkler.similarity, score_cutoff=JW_SKIP, limit=None)
+                hit = tuple(tok for tok, _score, _i in found if jw_exact(q, tok) >= TOKEN_CUTOFF)
+                if q[0] in self.initials:          # a one letter part on the list matches this part by its initial
+                    hit += (q[0],)
             if len(self._hits) >= self._HITS_MAX:
                 self._hits.clear()
             self._hits[q] = hit
@@ -325,23 +466,36 @@ class RecordIndex:
         at most (a + c) / (Q + c): each matched token is worth at most 1, and a name cannot have more than c
         matched tokens. That bound grows with c, so the longest name of the record is used. For
         "Muhammad Ali Khan" at 85 this skips every record that holds only one or two of the three names,
-        which is nearly all of them. Nothing that could reach the threshold is ever skipped.
+        which is nearly all of them. Nothing that could reach the threshold is ever skipped. (Titles that may be left
+        out and the subset lift, both in NameScorer, are allowed for as described in the code below.)
         """
         q = list(applicant_tokens)
         weight = Counter(q)
         coverage: Counter = Counter()
+        close_vocab: set = set()
         for tok, m in weight.items():
             holders: set = set()
             for close in self._close_tokens(tok):
+                close_vocab.add(close)
                 holders.update(self.postings[close])
             for _ in range(m):
                 coverage.update(holders)
         if threshold > 0:
             Q = len(q)
+            soft = sum(t in SOFT_TITLES for t in q)
+            Q_min = Q - soft if Q - soft >= 2 else Q      # titles with no partner leave the denominator
             # score = round_half_up(s * 1000) / 10 >= threshold  <=>  s >= (threshold * 10 - 0.5) / 1000
             need = (threshold * 10 - 0.5) / 1000 - 1e-9
             max_len = self.max_len
-            found = {i for i, a in coverage.items() if (a + max_len[i]) / (Q + max_len[i]) >= need}
+            # a record name wholly inside the applicant's is lifted to SUBSET_SCORE whatever the bound says, so when
+            # that could reach the threshold a record with a name of two or more parts that all have a close partner
+            # stays a candidate. (An applicant name wholly inside the record's has every part matched, and the
+            # bound is then already 1.)
+            subset = SUBSET_SCORE >= threshold
+            toks = self._toks
+            found = {i for i, a in coverage.items()
+                     if (a + max_len[i]) / (Q_min + max_len[i]) >= need
+                     or (subset and any(len(t) >= 2 and all(x in close_vocab for x in t) for t in toks[i]))}
         else:
             found = set(coverage)
         if cnic:

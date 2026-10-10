@@ -18,6 +18,21 @@ The screening logic is a Python port of the n8n **Applicant Screening Engine** a
 
 Lists are downloaded in parallel and kept in memory for `LIST_CACHE_TTL_SECONDS` (default 1 hour; `0` downloads fresh every time, like the workflow). They are loaded when the server starts and reloaded in the background once they are three quarters of the way to expiring, so a screening normally never waits for a download (`PRELOAD_LISTS=false` turns this off). If a background reload fails the previous copy is kept until it expires; after that the source is reported as unavailable, never as clear. Nothing about the lists is stored on disk.
 
+## Matching accuracy
+
+Name matching is Jaro-Winkler per name part (as in the original workflow) with these additions: spelling families (MUHAMMAD, MOHAMMED, MOHD ...), sound folding (JAVAID and JAVED, RASOOL and RASUL, double letters), fused and split words (ABDULRAHMAN, SAIFULLAH, FAZALUR), initials ("M. Imran Khan"), titles that may be dropped between documents (Syed, Mian, Sardar, Malik, Chaudhry ...), a listed name that sits wholly inside the typed one (a middle or family name left off), and a rule that very short parts differing by two or more edits are different names (IMRAN and IRFAN).
+
+It is measured, not assumed. `python scripts/benchmark_matching.py` scores labeled pairs of names (same person written differently, and different people) at the default threshold of 85 and lists every miss and false alarm; `tests/test_accuracy_benchmark.py` fails the build if accuracy drops under 90%, recall under 85% or false alarms over 5%.
+
+| Matcher | Pairs | Same person flagged | Different people wrongly flagged | Overall accuracy |
+|---|---|---|---|---|
+| Before (original scoring), set written first and tuned on | 292 | 68% | 2% | 88% |
+| After, same set (tuned on, so optimistic) | 292 | 100% | 1% | 99% |
+| Before, second set written after tuning | 124 | 73% | 0% | 86% |
+| After, second set, **first run before further changes** | 124 | 87% | 0% | 94% |
+
+The second row is optimistic because the rules were shaped by that set's misses. The fourth row is the fair estimate: names the rules were not fitted to. After that run a few more of its misses were fixed (so it is no longer untouched). Known limits that remain: look-alike given names one letter apart (MARIA and MARIO, AHSAN and HASSAN), a gendered ending (IVANOV and IVANOVA), and spellings with no shared letters. These are flagged for a person to check, which is the safe side. These pairs are test data, not claims about real people, and accuracy on your own applicants will differ: add pairs from your own cases to `tests/benchmark/` and rerun.
+
 ## Users, history and storage (Supabase)
 
 Everything the service remembers lives in a Supabase Postgres database, so the web server itself keeps nothing on disk and can be restarted, redeployed or put to sleep (Render's free plan does this) without losing anything:
