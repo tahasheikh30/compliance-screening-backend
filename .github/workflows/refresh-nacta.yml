@@ -14,7 +14,7 @@ name: Refresh NACTA list
 
 on:
   schedule:
-    - cron: "0 3 * * 1,4"   # Monday and Thursday, 03:00 UTC
+    - cron: "0 3 * * 1"     # every Monday, 03:00 UTC
   workflow_dispatch:
 
 jobs:
