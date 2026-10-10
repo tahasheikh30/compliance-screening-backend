@@ -157,6 +157,9 @@ def test_wikidata_failure_keeps_the_last_good_copy(monkeypatch):
         raise ConnectionError("blocked")
 
     monkeypatch.setattr(pep, "fetch_snapshot", boom)
+    monkeypatch.setattr(config, "PEP_ASSEMBLIES_ENABLED", True)
+    monkeypatch.setattr(loader.pep_assemblies, "fetch_assemblies", lambda get, api: (
+        [], [{"key": "na", "label": "N", "source": "x", "count": 0, "error": "blocked"}]))
     with pytest.raises(ConnectionError):
         loader.refresh_wikidata()
     assert not saved                                        # nothing was overwritten
