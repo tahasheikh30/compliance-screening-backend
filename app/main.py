@@ -32,6 +32,7 @@ Endpoints:
     GET  /api/admin/nacta                 which NACTA file is loaded and how old it is
     GET  /api/admin/pep                   which PEP data is loaded (Wikidata copy and the admin's own list)
     POST /api/admin/pep                   (admin) upload the PEP list (CSV, JSON or XML); DELETE removes it
+    POST /api/admin/pep/refresh           (admin) fetch the Wikidata copy now, in the background
     POST /api/admin/refresh               (admin) drop the in-memory list cache and reload every list
     POST /api/admin/nacta                 (admin, or the secret API_KEY) upload the NACTA CSV or JSON export
     GET  /api/admin/users                 (admin) people who signed up, ?status=pending to see who is waiting
@@ -599,6 +600,7 @@ def _pep_status() -> dict:
     out["refresh_days"] = app_config.PEP_REFRESH_DAYS
     out["lookback_years"] = app_config.PEP_LOOKBACK_YEARS
     out["required"] = app_config.PEP_REQUIRED
+    out["fetch"] = loader.wikidata_fetch_state()
     return out
 
 
@@ -648,6 +650,18 @@ async def upload_pep(request: Request, filename: str = "pep.csv", user: AuthUser
            {"filename": os.path.basename(filename)[:200], "records": out["records"], "bytes": len(data),
             "sha256": hashlib.sha256(data).hexdigest()})
     return out
+
+
+@app.post("/api/admin/pep/refresh", status_code=202)
+@limiter.limit("10/hour")
+def refresh_pep(request: Request, user: AuthUser = Depends(require_admin)):
+    """Start fetching the Wikidata copy now (in the background; it can take a minute or two). Poll GET /api/admin/pep."""
+    if not app_config.PEP_WIKIDATA_ENABLED:
+        raise AppError(409, "PEP_WIKIDATA_OFF", "The Wikidata fetch is switched off on the server.",
+                       "Set PEP_WIKIDATA=true on the backend, or upload your own PEP list.")
+    started = loader._refresh_wikidata_in_background(force=True)
+    _audit(request, user, "pep.refresh", "pep_list", None, {"started": started})
+    return {**_pep_status(), "started": started}
 
 
 @app.delete("/api/admin/pep")
