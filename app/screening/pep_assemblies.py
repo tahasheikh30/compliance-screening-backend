@@ -99,6 +99,13 @@ def official_sources() -> tuple:
     return list(by_key.values()), pending
 
 
+def source_signature() -> str:
+    """Which assembly sources this server reads. A saved copy made from a different set is refetched after a deploy."""
+    sources = list(WIKI_SOURCES) if config.PEP_WIKIPEDIA_FALLBACK else []
+    official, pending = official_sources()
+    return ",".join(sorted(f'{s["key"]}={s.get("url", "")}' for s in sources + official + pending))
+
+
 # a member list with fewer rows than this is a layout we did not understand, not a real assembly
 MIN_MEMBERS = 10
 

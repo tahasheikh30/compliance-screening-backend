@@ -501,6 +501,7 @@ def refresh_wikidata() -> dict:
                                "error": "", "kept": len(a["members"])})
         fresh["assemblies"] = assemblies
         fresh["assembly_report"] = report
+        fresh["source_signature"] = pep_assemblies.source_signature()
         if wd_failure is not None and not any(row["count"] for row in report):
             raise wd_failure          # nothing new from anywhere: keep the saved copy as it is
     elif previous:
@@ -581,7 +582,9 @@ def _wikidata_snapshot() -> tuple:
             snapshot = None
     if not config.PEP_WIKIDATA_ENABLED:
         return snapshot, ("Wikidata is switched off (PEP_WIKIDATA=false); using the last saved copy." if snapshot else None)
-    outdated = config.PEP_ASSEMBLIES_ENABLED and snapshot is not None and "assemblies" not in snapshot   # saved before assemblies existed
+    outdated = config.PEP_ASSEMBLIES_ENABLED and snapshot is not None and (
+        "assemblies" not in snapshot                                    # saved before assemblies existed
+        or snapshot.get("source_signature") != pep_assemblies.source_signature())   # or from other sources
     if snapshot is None or age is None or age > config.PEP_REFRESH_DAYS or outdated:
         _refresh_wikidata_in_background()
         if snapshot is None:
