@@ -362,6 +362,16 @@ def part_similarity(a: str, b: str) -> float:
     return s
 
 
+# Why a name matched, in words a reviewer can check. A "subset" score is a fixed 88, not a measured similarity.
+MATCH_REASONS = {
+    "exact": "Same name parts (spelling variants folded).",
+    "close": "Close spelling of the same name parts.",
+    "initials": "Matched using an initial for one or more name parts.",
+    "subset": "The applicant's name sits inside a longer listed name (a middle or family name left off). "
+              "The score is a fixed 88 for this rule, not a measured similarity.",
+}
+
+
 class NameScorer:
     """Scores candidate names against one applicant name."""
 
@@ -380,12 +390,20 @@ class NameScorer:
 
     def score_tokens(self, ctoks: tuple) -> float:
         """Score 0..100 (one decimal) for an already tokenised candidate name."""
+        return self._detail(ctoks)[0]
+
+    def reason(self, ctoks: tuple) -> str:
+        """Plain words for why this candidate name scored as it did, for the reviewer (see MATCH_REASONS)."""
+        return MATCH_REASONS.get(self._detail(ctoks)[1], "")
+
+    def _detail(self, ctoks: tuple) -> tuple:
+        """(score, kind): kind is one of MATCH_REASONS' keys, or "" when the candidate scored 0."""
         q = self.q
         if not ctoks or not q:
-            return 0.0
+            return 0.0, ""
         # cheap prefilter: at least one shared initial letter
         if not any(t[0] in self.initials for t in ctoks):
-            return 0.0
+            return 0.0, ""
 
         rows = [self._sims(t) for t in ctoks]  # one row per candidate token
         q_best = [max(row[j] for row in rows) for j in range(len(q))]
@@ -395,7 +413,7 @@ class NameScorer:
         # A~AZMA) is not the same name; at least one full part (2+ letters) must match. Skipped when the applicant
         # was typed as initials only.
         if any(len(t) > 1 for t in q) and not any(len(t) > 1 and b >= TOKEN_CUTOFF for t, b in zip(ctoks, c_best)):
-            return 0.0
+            return 0.0, ""
 
         # a title with no partner on the other side is left out, while two other parts remain
         q_keep = _keep(q, q_best)
@@ -413,8 +431,13 @@ class NameScorer:
         if score < SUBSET_SCORE:
             sub = _subset(q, q_best, q_keep, ctoks, c_best, c_keep)
             if sub:
-                return sub
-        return score
+                return sub, "subset"
+        if score <= 0:
+            return score, ""
+        if sorted(q) == sorted(ctoks):
+            return score, "exact"
+        used_initial = any(len(t) == 1 for t in ctoks) or any(len(t) == 1 for t in q)
+        return score, "initials" if used_initial else "close"
 
     def score(self, name: str) -> float:
         return self.score_tokens(tokens(name))

@@ -57,7 +57,8 @@ def resolve_threshold(value) -> float:
     return t
 
 
-def _match_dict(r, best: float, best_name: str, dob_year: str, cnic: str, father_scorer, province: str = "") -> dict:
+def _match_dict(r, best: float, best_name: str, dob_year: str, cnic: str, father_scorer, province: str = "",
+                reason: str = "") -> dict:
     if dob_year and r.dob:
         year_match = "Yes" if dob_year in r.dob else "No"
     else:
@@ -76,6 +77,7 @@ def _match_dict(r, best: float, best_name: str, dob_year: str, cnic: str, father
         "list": r.list,
         "id": r.id,
         "score": best,
+        "match_reason": reason,
         "matched_name": best_name,
         "primary_name": r.primary,
         "type": r.type,
@@ -139,7 +141,9 @@ def match_records(scorer: NameScorer, records: list, threshold: float, dob_year:
             cands.append(((0 if by_cnic else 1, -best), r, best, best_i))
     cands.sort(key=lambda c: c[0])   # stable: equal ranks stay in list order
     kept = cands if limit is None else cands[:limit]
-    return [_match_dict(r, best, r.names[i], dob_year, cnic, father_scorer, province) for _, r, best, i in kept], len(cands)
+    return [_match_dict(r, best, r.names[i], dob_year, cnic, father_scorer, province,
+                        reason=scorer.reason(r.toks[i]) if best > 0 else "")
+            for _, r, best, i in kept], len(cands)
 
 
 def screen(name: str, dob: str = "", nationality: str = "", threshold=None,

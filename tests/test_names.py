@@ -117,3 +117,14 @@ def test_entity_tokens_strip_legal_forms_only_when_something_remains():
     assert entity_tokens("ACME TRADING LLC") == ("ACME", "TRADING")
     assert entity_tokens("INVERSIONES X S.A. DE C.V.") == ("INVERSIONES", "X")
     assert entity_tokens("S.A.") == ("S", "A")          # nothing else left: unchanged
+
+
+# --- the reviewer is told why a name matched ------------------------------------------------------------------
+
+def test_match_reason_tells_a_subset_lift_from_a_close_spelling():
+    sc = NameScorer("Azma Bokhari")
+    assert "fixed 88" in sc.reason(tokens("Azma Zahid Bukhari"))
+    assert sc.reason(tokens("Azma Bokhari")).startswith("Same name parts")
+    assert sc.reason(tokens("Azma Bukhari")).startswith("Close spelling")
+    assert "initial" in sc.reason(tokens("A. Bokhari"))
+    assert sc.reason(entity_tokens("B-WORK S.A.S.")) == ""      # no match, no reason

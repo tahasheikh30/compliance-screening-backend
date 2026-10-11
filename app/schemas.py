@@ -54,6 +54,7 @@ class MatchOut(BaseModel):
     list: str
     id: str
     score: float
+    match_reason: str = ""       # why the name matched, in words (see names.MATCH_REASONS)
     matched_name: str
     primary_name: str
     type: str = ""
