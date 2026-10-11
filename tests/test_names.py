@@ -4,7 +4,7 @@ import random
 import pytest
 
 from app.screening import engine
-from app.screening.names import NameScorer, jw, jw_exact, norm, tokens
+from app.screening.names import NameScorer, entity_tokens, jw, jw_exact, norm, tokens
 
 
 def test_norm_strips_accents_punctuation_and_case():
@@ -88,3 +88,32 @@ def test_jaro_winkler_decisions_match_the_workflow_algorithm():
 def test_jw_exact_known_values():
     assert jw_exact("MARTHA", "MARHTA") == pytest.approx(0.9611, abs=1e-3)
     assert jw_exact("", "A") == 0.0 and jw_exact("A", "A") == 1.0
+
+
+# --- initials and company suffixes must not make a person match a company -----------------------------------
+
+def test_company_suffix_initials_do_not_match_a_person():
+    # "S.A." / "B." used to count as initials of AZMA / BOKHARI and the subset rule lifted the score to 88
+    for company in ("FELIX B. MADURO S.A.", "B-WORK S.A.S."):
+        sc = NameScorer("Azma Bokhari")
+        assert sc.score(company) == 0.0
+        assert sc.score_tokens(entity_tokens(company)) == 0.0
+
+
+def test_close_spellings_of_a_longer_name_still_match():
+    sc = NameScorer("Azma Bokhari")
+    assert sc.score("Azma Zahid Bokhari") >= 85
+    assert sc.score("Azma Zahid Bukhari") >= 85
+
+
+def test_initials_next_to_a_real_part_still_match():
+    assert NameScorer("M. Imran Khan").score("Muhammad Imran Khan") >= 85
+    assert NameScorer("Muhammad Imran Khan").score("M Imran Khan") >= 85
+    assert NameScorer("Azma Bokhari").score("A. Bokhari") >= 85
+
+
+def test_entity_tokens_strip_legal_forms_only_when_something_remains():
+    assert entity_tokens("B-WORK S.A.S.") == ("B", "WORK")
+    assert entity_tokens("ACME TRADING LLC") == ("ACME", "TRADING")
+    assert entity_tokens("INVERSIONES X S.A. DE C.V.") == ("INVERSIONES", "X")
+    assert entity_tokens("S.A.") == ("S", "A")          # nothing else left: unchanged

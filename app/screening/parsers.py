@@ -17,7 +17,7 @@ import re
 from urllib.parse import urlparse
 from dataclasses import dataclass, field
 
-from app.screening.names import tokens, jw
+from app.screening.names import tokens, entity_tokens, jw
 
 # --------------------------------------------------------------------------
 # Record
@@ -48,7 +48,8 @@ class Record:
 def prepare(records: list) -> list:
     """Tokenise every name once, so repeated screenings only do the scoring."""
     for r in records:
-        r.toks = [tokens(n) for n in r.names]
+        tok = entity_tokens if (r.type or "").strip().lower() == "entity" else tokens
+        r.toks = [tok(n) for n in r.names]
     return records
 
 
