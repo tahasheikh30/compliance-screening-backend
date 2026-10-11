@@ -20,6 +20,8 @@ from reportlab.lib.colors import Color
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen import canvas
 
+from app.screening.grouping import group_pep_matches, is_pep
+
 PAGE_W, PAGE_H = 595, 842
 LEFT, RIGHT, CW = 50, 545, 495
 TOP, BOTTOM = 790, 62
@@ -288,9 +290,15 @@ def generate_evidence_pdf(r: dict, case_ref: str) -> tuple:
     d.callout("RESULT: POTENTIAL MATCH. Manual review required.", COL["amber"], COL["amber_bg"], 11, True)
 
     sh, mh = r["sanctions_hit_count"], r["media_hit_count"]
+    sanction_matches = [m for m in r["matches"] if not is_pep(m)]
+    pep_groups = group_pep_matches(r["matches"])
+    pep_shown = sum(len(g["members"]) for g in pep_groups)
+    pep_total = max(int(r.get("pep_hit_count") or 0), pep_shown)
     d.stat_cards([
-        {"label": "Sanctions / watch-list matches" + (" (top 50)" if r["truncated"] else ""),
+        {"label": "Sanctions matches" + (" (top 50)" if r["truncated"] else ""),
          "value": num(sh), "color": COL["red"] if sh > 0 else COL["green"]},
+        {"label": "Politically exposed persons", "value": num(len(pep_groups)),
+         "color": COL["amber"] if pep_groups else COL["green"]},
         {"label": "Adverse media articles", "value": num(mh), "color": COL["amber"] if mh > 0 else COL["green"]},
         {"label": "Records screened", "value": num(r["total_records"]), "color": COL["blue"]},
     ])
@@ -312,6 +320,9 @@ def generate_evidence_pdf(r: dict, case_ref: str) -> tuple:
     d.kv("Match threshold", f"{r['threshold']:g}%")
     d.kv("Records screened", num(r["total_records"]))
     d.kv("Sanctions / watch-list matches", str(sh) + (" (top 50 shown)" if r["truncated"] else ""))
+    d.kv("Politically exposed persons (PEP)",
+         f"{len(pep_groups)} (from {pep_shown} source record{'s' if pep_shown != 1 else ''}"
+         + (f"; {pep_total} matched, top {pep_shown} shown" if pep_total > pep_shown else "") + ")")
     d.kv("Adverse media articles", str(mh))
 
     d.section("Lists screened")
@@ -364,14 +375,23 @@ def generate_evidence_pdf(r: dict, case_ref: str) -> tuple:
               "potential match is not a confirmed identity match. Verify date of birth, nationality and identifiers "
               "before deciding.", COL["blue"], COL["band"], 8.5)
 
-    d.section("Sanctions / watch-list matches")
-    if not r["matches"]:
-        d.para("None at the selected threshold.", indent=10, color=COL["green"], font=F2)
-    for i, m in enumerate(r["matches"]):
-        score = float(m["score"])
+    def draw_card(i, title, score, rows, badge):
         sc = COL["red"] if score >= 95 else COL["amber"]
+        bw = tw(badge, 8.5, True) + 16
+        d.ensure(26 + 44)
+        d.fill_rect(LEFT, d.y - 26, CW, 26, COL["navy"])
+        d.txt(LEFT + 10, d.y - 17, fit_text(f"{i + 1}. {title}", 10.5, True, CW - bw - 40), 10.5, F2, COL["white"])
+        d.fill_rect(RIGHT - bw - 8, d.y - 21, bw, 16, sc)
+        d.txt(RIGHT - bw, d.y - 16, badge, 8.5, F2, COL["white"])
+        d.y -= 26
+        for j, (k, v) in enumerate(rows):
+            d.kv(k, v, boxed=True, alt=j % 2 == 1)
+        d.y -= 14
+
+    def match_rows(m, with_list=True):
         rows = [
-            ("List", m["list"]), ("Reference", m["id"]), ("Matched name / alias", m["matched_name"]),
+            *((("List", m["list"]),) if with_list else ()),
+            ("Reference", m["id"]), ("Matched name / alias", m["matched_name"]),
             *((("Why it matched", m["match_reason"]),) if m.get("match_reason") else ()),
             ("Type", m["type"]), ("Programme / regime", m["programs"]), ("Date(s) of birth", m["dob"]),
             ("DOB year matches applicant", m["dob_year_match"]), ("Nationality", m["nationality"]),
@@ -389,21 +409,44 @@ def generate_evidence_pdf(r: dict, case_ref: str) -> tuple:
             rows.append(("Province", m["province"]))
         if m.get("province_match") is not None:
             rows.append(("Province matches applicant", "Yes" if m["province_match"] else "No"))
+        return rows
+
+    d.section("Sanctions / watch-list matches")
+    if not sanction_matches:
+        d.para("None at the selected threshold.", indent=10, color=COL["green"], font=F2)
+    for i, m in enumerate(sanction_matches):
+        rows = match_rows(m)
         if m.get("aliases"):
             rows.append(("Other names", "; ".join(m["aliases"])))
         if m.get("remarks"):
             rows.append(("Remarks", m["remarks"]))
-        badge = f"SCORE {score:g}%"
-        bw = tw(badge, 8.5, True) + 16
-        d.ensure(26 + 44)
-        d.fill_rect(LEFT, d.y - 26, CW, 26, COL["navy"])
-        d.txt(LEFT + 10, d.y - 17, fit_text(f"{i + 1}. {m['primary_name']}", 10.5, True, CW - bw - 40), 10.5, F2, COL["white"])
-        d.fill_rect(RIGHT - bw - 8, d.y - 21, bw, 16, sc)
-        d.txt(RIGHT - bw, d.y - 16, badge, 8.5, F2, COL["white"])
-        d.y -= 26
-        for j, (k, v) in enumerate(rows):
-            d.kv(k, v, boxed=True, alt=j % 2 == 1)
-        d.y -= 14
+        draw_card(i, m["primary_name"], float(m["score"]), rows, f"SCORE {float(m['score']):g}%")
+
+    d.section("Politically exposed persons (PEP)")
+    d.callout("Being a politically exposed person is not a sanction. These are people who hold or held public office, "
+              "so they call for enhanced due diligence, not rejection. A person listed by several sources is shown "
+              "once, with every source named. Each source record is kept in the screening data.",
+              COL["blue"], COL["band"], 8.5)
+    if not pep_groups:
+        d.para("None at the selected threshold.", indent=10, color=COL["green"], font=F2)
+    for i, g in enumerate(pep_groups):
+        m = g["lead"]
+        rows = match_rows(m, with_list=False)
+        if len(g["members"]) > 1:
+            rows.insert(0, ("Listed in", "; ".join(g["listed_in"])))
+            rows.insert(1, ("Source records", "; ".join(x["id"] for x in g["members"])))
+            rows.insert(2, ("Grouped by", g["basis"]))
+        else:
+            rows.insert(0, ("Listed in", g["listed_in"][0]))
+        if g["other_names"]:
+            rows.append(("Other names", "; ".join(g["other_names"][:15])))
+        if m.get("position"):
+            rows.append(("Position", m["position"]))
+        if m.get("remarks"):
+            rows.append(("Remarks", m["remarks"]))
+        n = len(g["members"])
+        badge = f"SCORE {float(m['score']):g}%" + (f"  |  {n} RECORDS" if n > 1 else "")
+        draw_card(i, m["primary_name"], float(m["score"]), rows, badge)
 
     d.section("Adverse media (open news search)")
     d.callout("News articles whose title or summary contains the applicant's surname, at least one more part of the "

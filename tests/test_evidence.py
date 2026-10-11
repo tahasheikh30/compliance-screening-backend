@@ -47,3 +47,27 @@ def test_non_latin_names_do_not_crash_the_pdf(fake_sources):
 
 def test_clean_helper():
     assert evidence.clean("Zoë \u2014 x") == "Zoe - x" and evidence.clean("日本") == "??"
+
+
+def test_pep_matches_get_their_own_section_and_one_person_is_shown_once():
+    import pymupdf
+    from app.evidence import generate_evidence_pdf
+    from tests.test_grouping import azma_records
+
+    recs = azma_records()
+    for m in recs:
+        m.update(type="Individual", programs="PEP, Provincial, Punjab", dob_year_match="n/a", nationality="Pakistan",
+                 listed_on="", province_match=True, cnic_match=None, father_match=None, father_name="", position="",
+                 match_reason="", list="Politically Exposed Persons (national and provincial)")
+    result = {"applicant": {"name": "Azma Bokhari", "dob": "", "nationality": "Pakistan", "cnic": "", "father_name": "",
+                            "province": "Punjab"},
+              "threshold": 85.0, "screened_at": "2026-10-12T10:00:00+00:00", "lists": [], "total_records": 10,
+              "sanctions_hit_count": 0, "media_hit_count": 0, "pep_hit_count": 3, "hit_count": 0, "hit": False,
+              "adverse_media": None, "matches": recs, "truncated": False, "sources": {}}
+    _, pdf = generate_evidence_pdf(result, "CS-TEST")
+    with pymupdf.open(stream=pdf, filetype="pdf") as doc:
+        text = "\n".join(page.get_text() for page in doc)
+    assert "POLITICALLY EXPOSED PERSONS (PEP)" in text
+    assert "1 (from 3 source records)" in text
+    assert text.count("3 RECORDS") == 1
+    assert "None at the selected threshold." in text          # the sanctions section is empty

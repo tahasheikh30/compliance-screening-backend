@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 
 from app.config import MATCH_THRESHOLD, MAX_MATCHES, MAX_THRESHOLD, MIN_THRESHOLD
 from app.errors import logger
+from app.screening.grouping import group_pep_matches
 from app.screening import loader, names, parsers
 from app.screening.parsers import normalize_cnic, normalize_province
 from app.screening.names import NameScorer
@@ -232,7 +233,8 @@ def screen(name: str, dob: str = "", nationality: str = "", threshold=None,
         "total_records": total_records,
         "sanctions_hit_count": sanctions_hits,
         "media_hit_count": media_hits,
-        "pep_hit_count": pep_hits,
+        "pep_hit_count": pep_hits,                 # PEP source records that matched
+        "pep_person_count": len(group_pep_matches(all_matches)),   # the same, one per person (see grouping.py)
         "hit_count": sanctions_hits + media_hits,
         "hit": sanctions_hits + media_hits > 0,
         "adverse_media": news,
