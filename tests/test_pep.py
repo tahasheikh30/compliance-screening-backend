@@ -703,3 +703,13 @@ def test_a_failed_assembly_row_says_when_the_uploaded_list_covers_its_province(m
 def test_plain_reason_turns_a_raw_error_into_a_short_sentence(raw, short):
     from app.screening import pep_assemblies as pa
     assert short in pa.plain_reason(raw)
+
+
+def test_the_full_error_text_is_kept_not_cut_at_140_characters():
+    from app.screening import pep_assemblies as pa
+    cause = ("ConnectTimeoutError(<HTTPSConnection(host='www.pap.gov.pk', port=443) at 0x7f>, "
+             "'Connection to www.pap.gov.pk timed out. (connect timeout=30)')")
+    exc = RuntimeError("HTTPSConnectionPool(host='www.pap.gov.pk', port=443): Max retries exceeded with url: "
+                       "/members/listing/en/22?byname=true&limit=all (Caused by " + cause + ")")
+    text = pa._why(exc)
+    assert len(text) > 140 and "connect timeout=30" in text and text.endswith("))")
