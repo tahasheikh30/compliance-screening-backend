@@ -177,6 +177,45 @@ def _text(resp: requests.Response) -> str:
         return raw.decode("latin-1")
 
 
+_RETRY_STATUS = {429, 500, 502, 503, 504}
+_page_lock = threading.Lock()
+_page_last = [0.0]
+
+
+def _retry_after(resp, default: float) -> float:
+    """Seconds the server asked us to wait (Retry-After as a number), else `default`; never more than a minute."""
+    try:
+        return max(1.0, min(float(resp.headers.get("Retry-After", "")), 60.0))
+    except (TypeError, ValueError):
+        return min(default, 60.0)
+
+
+def _polite_page_get(url: str, params) -> str:
+    """
+    GET one public web page (Wikipedia, na.gov.pk) without hammering it: requests are spaced PEP_PAGE_INTERVAL
+    apart across the whole process, Wikipedia gets the descriptive User-Agent it requires, and a 429 or 5xx
+    answer is retried after the pause the server asks for (or a growing one).
+    """
+    kw = {"params": params} if params else {}
+    host = (urlparse(url).hostname or "").lower()
+    headers = {"User-Agent": config.WIKI_USER_AGENT} if host.endswith(("wikipedia.org", "wikimedia.org")) else {}
+    attempts = max(1, config.PEP_PAGE_ATTEMPTS)
+    for n in range(attempts):
+        with _page_lock:                    # one request at a time, spaced apart
+            wait = _page_last[0] + config.PEP_PAGE_INTERVAL - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            _page_last[0] = time.monotonic()
+        try:
+            return _text(_get(url, READ_TIMEOUT, headers=headers, **kw))
+        except requests.HTTPError as exc:
+            resp = exc.response
+            if resp is None or resp.status_code not in _RETRY_STATUS or n == attempts - 1:
+                raise
+            time.sleep(_retry_after(resp, 4.0 * 2 ** n))
+    raise RuntimeError("unreachable")       # the loop always returns or raises
+
+
 def fetch_text(url: str, read_timeout: float = READ_TIMEOUT) -> str:
     return _text(_get(url, read_timeout))
 
@@ -382,8 +421,7 @@ def refresh_wikidata() -> dict:
         return _text(_get(url, READ_TIMEOUT, params=params, headers={"Accept": "application/sparql-results+json"}))
 
     def page_get(url, params):
-        kw = {"params": params} if params else {}
-        return _text(_get(url, READ_TIMEOUT, **kw))
+        return _polite_page_get(url, params)
 
     previous = None
     stored = db_pep("wikidata")
