@@ -70,7 +70,7 @@ OFFICIAL_SOURCES = [
     # the 22 is the assembly term on that site; the page may refuse automated access in its robots.txt, in which
     # case the Lists page says so and the last saved members stay
     {"key": "punjab_official", "label": "Punjab Assembly website (pap.gov.pk)", "level": PROVINCIAL,
-     "province": "Punjab", "url": "https://www.pap.gov.pk/members/listing/en/22?byname=true", "parser": "pairs"},
+     "province": "Punjab", "url": "https://www.pap.gov.pk/members/listing/en/22?byname=true&limit=all", "parser": "pairs"},
     {"key": "balochistan_official", "label": "Balochistan Assembly website (pabalochistan.gov.pk)",
      "level": PROVINCIAL, "province": "Balochistan", "url": "https://pabalochistan.gov.pk/list-members",
      "parser": "profiles"},
@@ -422,6 +422,22 @@ def members_from_profiles(html: str) -> list:
     return out
 
 
+_SHOWING = re.compile(r"Showing\s*(?:<[^>]+>)?\s*\d+\s*(?:<[^>]+>)?\s*-\s*(?:<[^>]+>)?\s*\d+\s*(?:<[^>]+>)?\s*of\s*(?:<[^>]+>)?\s*(\d+)", re.I)
+
+
+def expected_total(html: str):
+    """The record count a paged site announces ("Showing 1 - 10 of 369 Records"), or None when it announces none."""
+    m = _SHOWING.search(html or "")
+    return int(m.group(1)) if m else None
+
+
+def check_complete(html: str, members: list) -> None:
+    """Raise when the page says it has more members than were read (the site showed only one page of them)."""
+    total = expected_total(html)
+    if total and len(members) < total * 0.98:
+        raise ValueError(f"only {len(members)} of the {total} members the page lists were read (it shows them in pages)")
+
+
 _PARSERS = {"table": members_from_html, "cards": members_from_cards,
             "pairs": members_from_pairs, "profiles": members_from_profiles}
 
@@ -473,7 +489,9 @@ def fetch_assemblies(get, wiki_api_url: str, sources=None, official=None) -> tup
                            "count": 0, "error": err})
     for src in official:
         try:
-            got = _PARSERS.get(src.get("parser", "table"), members_from_html)(get(src["url"], None))
+            page = get(src["url"], None)
+            got = _PARSERS.get(src.get("parser", "table"), members_from_html)(page)
+            check_complete(page, got)
             if len(got) < MIN_MEMBERS:
                 raise ValueError(f"only {len(got)} member rows could be read")
             assemblies.append({"key": src["key"], "label": src["label"], "level": src["level"],
