@@ -699,6 +699,17 @@ def monitoring_counts(user_id=None) -> dict:
     return {"monitored_applicants": monitored, "open_alerts": open_alerts}
 
 
+def monitored_people(user_id, limit: int = 500) -> list:
+    """The user's own monitored screenings, newest enrolment first, each with its count of open alerts."""
+    sql = ("SELECT a.id AS applicant_id, a.full_name, a.father_name, a.dob, a.overall_status, a.monitored_since, "
+           "a.last_monitored_at, "
+           "(SELECT count(*) FROM monitoring_alerts al WHERE al.applicant_id = a.id AND al.status = 'open') AS open_alerts "
+           "FROM applicants a WHERE a.monitored AND a.user_id = %s "
+           "ORDER BY a.monitored_since DESC NULLS LAST, a.id DESC LIMIT %s")
+    with pool().connection() as conn:
+        return [_clean(r) for r in conn.execute(sql, [user_id, limit]).fetchall()]
+
+
 # --------------------------------------------------------------------------
 # Batch screening
 # --------------------------------------------------------------------------

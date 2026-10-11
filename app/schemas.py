@@ -216,6 +216,17 @@ class MonitoringOut(BaseModel):
     new_alerts: int = 0       # found by the check that runs at the moment of enrolment
 
 
+class MonitoredPersonOut(BaseModel):
+    applicant_id: int
+    full_name: str
+    father_name: Optional[str] = None
+    dob: Optional[str] = None
+    overall_status: Optional[str] = None      # the result of the screening that put them under watch
+    monitored_since: Optional[str] = None
+    last_monitored_at: Optional[str] = None
+    open_alerts: int = 0
+
+
 class AlertOut(BaseModel):
     id: int
     applicant_id: int

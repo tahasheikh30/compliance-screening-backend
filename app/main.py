@@ -43,6 +43,7 @@ Endpoints:
     POST /api/admin/users/{id}/status     (admin) approve or reject someone
     POST /api/admin/users/{id}/role       (admin) make someone an admin, or a normal user again
     POST /api/applicants/{id}/monitoring  enrol a screened person in continuous monitoring (or stop)
+    GET  /api/monitoring/people           the people you are monitoring (stop one with POST .../monitoring {enabled:false})
     GET  /api/monitoring/alerts           new potential matches found by re-screening; /decision records the outcome
     GET  /api/monitoring/status           monitoring state: people watched, open alerts, last check per list
                                           (monitoring is private to the analyst who ran the screening, admins included)
@@ -82,7 +83,7 @@ from app.config import FIA_REQUIRED, NACTA_REQUIRED, PEP_REQUIRED, PRELOAD_LISTS
 from app.errors import AppError, configure_logging, install as install_error_handlers, request_context, logger
 from app.schemas import (AlertDecisionIn, AlertOut, ApplicantSummary, AuditEntryOut, AuditPageOut, AuditVerifyOut,
                          BatchOut, BatchRowOut, MeOut,
-                         CoverageIn, CoverageOut, CoverageRowOut, HistoryClearedOut, ReviewIn, ReviewOut, MonitoringIn, MonitoringOut, MonitoringStatusOut, SourceMonitoringOut, ScreenRequest, ScreenResponse, ScreeningResultOut, UserDeletedOut, UserOut,
+                         CoverageIn, CoverageOut, CoverageRowOut, HistoryClearedOut, ReviewIn, ReviewOut, MonitoredPersonOut, MonitoringIn, MonitoringOut, MonitoringStatusOut, SourceMonitoringOut, ScreenRequest, ScreenResponse, ScreeningResultOut, UserDeletedOut, UserOut,
                          UserRoleIn, UserStatusIn)
 from app.screening import engine, loader, nacta_store, parsers, pep
 
@@ -943,6 +944,14 @@ def set_applicant_monitoring(request: Request, applicant_id: int, body: Monitori
     return MonitoringOut(applicant_id=applicant_id, monitored=bool(row.get("monitored")),
                          monitored_since=row.get("monitored_since"), last_monitored_at=row.get("last_monitored_at"),
                          new_alerts=new_alerts)
+
+
+@app.get("/api/monitoring/people", response_model=list[MonitoredPersonOut])
+@limiter.limit("60/minute")
+def monitoring_people(request: Request, response: Response, user: AuthUser = Depends(require_approved)):
+    """The people you are monitoring (private to you, administrators included), each with its open alerts."""
+    response.headers["Cache-Control"] = "no-store"
+    return db.monitored_people(user.id)
 
 
 @app.get("/api/monitoring/alerts", response_model=list[AlertOut])
