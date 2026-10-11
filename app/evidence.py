@@ -372,6 +372,7 @@ def generate_evidence_pdf(r: dict, case_ref: str) -> tuple:
         sc = COL["red"] if score >= 95 else COL["amber"]
         rows = [
             ("List", m["list"]), ("Reference", m["id"]), ("Matched name / alias", m["matched_name"]),
+            *((("Why it matched", m["match_reason"]),) if m.get("match_reason") else ()),
             ("Type", m["type"]), ("Programme / regime", m["programs"]), ("Date(s) of birth", m["dob"]),
             ("DOB year matches applicant", m["dob_year_match"]), ("Nationality", m["nationality"]),
             ("Listed on", m["listed_on"]),
