@@ -11,7 +11,6 @@ import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-from starlette.concurrency import run_in_threadpool  # noqa: F401  (kept for callers that want the shared pool)
 
 from app import config
 from app.errors import AppError
