@@ -401,3 +401,50 @@ def test_load_pep_lists_each_assembly_with_its_own_count_and_error(monkeypatch):
     assert rows["PEP members: National Assembly (16th)"]["records"] == 1
     assert "page not found" in rows["PEP members: Gilgit-Baltistan Assembly"]["note"]
     assert len(g.records) == 1
+
+
+def test_page_get_retries_429_with_wikipedia_user_agent(monkeypatch):
+    import requests
+    from app import config
+    from app.screening import loader
+
+    monkeypatch.setattr(config, "PEP_PAGE_INTERVAL", 0)
+    monkeypatch.setattr(loader.time, "sleep", lambda s: None)
+    calls = []
+
+    def fake_get(url, timeout, headers=None, **kw):
+        calls.append(headers)
+        if len(calls) < 3:
+            resp = requests.Response()
+            resp.status_code = 429
+            resp.headers["Retry-After"] = "2"
+            raise requests.HTTPError("429 Client Error: Too Many Requests", response=resp)
+        r = requests.Response()
+        r._content = b"ok"
+        return r
+
+    monkeypatch.setattr(loader, "_get", fake_get)
+    assert loader._polite_page_get("https://en.wikipedia.org/w/api.php", {"a": "b"}) == "ok"
+    assert len(calls) == 3
+    assert all(h["User-Agent"] == config.WIKI_USER_AGENT for h in calls)
+
+
+def test_page_get_gives_up_on_non_retryable_error(monkeypatch):
+    import pytest
+    import requests
+    from app import config
+    from app.screening import loader
+
+    monkeypatch.setattr(config, "PEP_PAGE_INTERVAL", 0)
+    n = []
+
+    def fake_get(url, timeout, headers=None, **kw):
+        n.append(1)
+        resp = requests.Response()
+        resp.status_code = 404
+        raise requests.HTTPError("404", response=resp)
+
+    monkeypatch.setattr(loader, "_get", fake_get)
+    with pytest.raises(requests.HTTPError):
+        loader._polite_page_get("https://na.gov.pk/en/all_members.php", None)
+    assert len(n) == 1

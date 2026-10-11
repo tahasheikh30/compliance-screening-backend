@@ -116,6 +116,15 @@ PEP_REFRESH_DAYS = _float_env("PEP_REFRESH_DAYS", 7)
 # (Wikipedia and na.gov.pk). They fill the gaps in Wikidata and are refreshed with it. PEP_ASSEMBLIES=false skips them.
 PEP_ASSEMBLIES_ENABLED = os.environ.get("PEP_ASSEMBLIES", "true").strip().lower() not in ("0", "false", "no")
 PEP_WIKIPEDIA_API = os.environ.get("PEP_WIKIPEDIA_API", "https://en.wikipedia.org/w/api.php").strip()
+# Wikimedia asks every client to send a descriptive User-Agent with a way to reach the operator, and answers 429 to
+# generic browser-style ones. Set WIKI_CONTACT to an email or URL of the operator.
+WIKI_CONTACT = os.environ.get("WIKI_CONTACT", "https://github.com/tahasheikh30/compliance-screening-backend").strip()
+WIKI_USER_AGENT = os.environ.get(
+    "WIKI_USER_AGENT", f"ComplianceScreeningBot/1.0 ({WIKI_CONTACT}) python-requests"
+).strip()
+# Pause between page requests (seconds), and how many times a 429/5xx answer is retried (it honours Retry-After).
+PEP_PAGE_INTERVAL = _float_env("PEP_PAGE_INTERVAL", 1.5)
+PEP_PAGE_ATTEMPTS = int(_float_env("PEP_PAGE_ATTEMPTS", 5))
 # How long after leaving office a person still counts as a PEP. 0 means current office holders only,
 # a negative number means never drop anyone.
 PEP_LOOKBACK_YEARS = _float_env("PEP_LOOKBACK_YEARS", 5)
