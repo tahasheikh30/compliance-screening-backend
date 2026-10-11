@@ -419,3 +419,26 @@ def test_clear_history_deletes_only_your_own_unmonitored_screenings(client, fake
     log = client.get("/api/admin/audit?limit=50", headers=API_HEADERS).json()
     entries = log["entries"] if isinstance(log, dict) else log
     assert any(e["action"] == "history.clear" for e in entries)
+
+
+def test_the_monitoring_list_shows_only_my_monitored_people_and_stopping_removes_them(client, fake_sources):
+    mine = _screen(client, "Alpha Person", monitor=True)
+    _screen(client, "Beta Person")                                     # screened, not monitored
+    _screen(client, "Gamma Person", headers=USER2_HEADERS, monitor=True)   # someone else's
+    rows = client.get("/api/monitoring/people", headers=USER_HEADERS).json()
+    assert [r["full_name"] for r in rows] == ["Alpha Person"]
+    assert rows[0]["applicant_id"] == mine["applicant_id"] and rows[0]["monitored_since"] and rows[0]["open_alerts"] == 0
+    assert [r["full_name"] for r in client.get("/api/monitoring/people", headers=USER2_HEADERS).json()] == ["Gamma Person"]
+    assert client.get("/api/monitoring/people", headers=API_HEADERS).json() == []     # an admin sees only their own
+    stop = client.post(f"/api/applicants/{mine['applicant_id']}/monitoring", json={"enabled": False}, headers=USER_HEADERS)
+    assert stop.status_code == 200 and stop.json()["monitored"] is False
+    assert client.get("/api/monitoring/people", headers=USER_HEADERS).json() == []
+
+
+def test_the_monitoring_list_counts_open_alerts_per_person(client, fake_sources):
+    _screen(client, monitor=True)
+    monitoring.run_once()
+    _list_person(fake_sources)
+    monitoring.run_once()
+    rows = client.get("/api/monitoring/people", headers=USER_HEADERS).json()
+    assert len(rows) == 1 and rows[0]["open_alerts"] == 1
