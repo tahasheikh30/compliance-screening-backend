@@ -209,6 +209,8 @@ def _robots_allows(url: str) -> bool:
         return True
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
+    if host in config.PEP_ROBOTS_OVERRIDE_HOSTS:
+        return True
     now = time.monotonic()
     with _page_lock:
         hit = _robots.get(host)

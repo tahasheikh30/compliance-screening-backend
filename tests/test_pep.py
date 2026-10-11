@@ -635,3 +635,13 @@ def test_a_saved_copy_made_from_other_sources_is_refetched_after_a_deploy(monkey
     monkeypatch.setattr(loader, "db_pep", lambda kind: (json.dumps(current).encode(), {}))
     loader._wikidata_snapshot()
     assert started == [1]                                                  # same sources: no refetch
+
+
+def test_an_operator_listed_host_is_read_despite_robots_txt_and_other_hosts_are_not(monkeypatch):
+    import pytest
+    from app import config
+    loader, seen = _robots_env(monkeypatch, "User-agent: *\nDisallow: /\n")
+    monkeypatch.setattr(config, "PEP_ROBOTS_OVERRIDE_HOSTS", ("www.pap.gov.pk",))
+    assert "page" in loader._polite_page_get("https://www.pap.gov.pk/members/listing/en/22", None)
+    with pytest.raises(loader.RobotsDisallowed):
+        loader._polite_page_get("https://www.pakp.gov.pk/members/", None)
