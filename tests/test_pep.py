@@ -439,7 +439,8 @@ def test_page_get_gives_up_on_non_retryable_error(monkeypatch):
     n = []
 
     def fake_get(url, timeout, headers=None, **kw):
-        n.append(1)
+        if not url.endswith("robots.txt"):
+            n.append(1)
         resp = requests.Response()
         resp.status_code = 404
         raise requests.HTTPError("404", response=resp)
@@ -448,3 +449,170 @@ def test_page_get_gives_up_on_non_retryable_error(monkeypatch):
     with pytest.raises(requests.HTTPError):
         loader._polite_page_get("https://na.gov.pk/en/all_members.php", None)
     assert len(n) == 1
+
+
+_KP_PAGE = "".join(
+    f'<a href="https://www.pakp.gov.pk/members/member-{i}-pk-{i}-2024/">Member Number{i} PK-{i} Swat-{i}</a>'
+    for i in range(1, 13)
+) + ('<a href="https://www.pakp.gov.pk/members/x/">Rehana Ismail WR-1</a>'
+     '<a href="https://www.pakp.gov.pk/members/y/">Mr. Gurpal Singh MR-2</a>'
+     '<a href="https://www.pakp.gov.pk/members/">Members Listing</a>'
+     '<a href="https://www.pakp.gov.pk/act">Acts PK-1</a>')
+
+
+def test_kp_cards_parser_reads_name_seat_and_skips_other_links():
+    from app.screening import pep_assemblies as pa
+    got = pa.members_from_cards(_KP_PAGE)
+    assert len(got) == 14
+    assert got[0]["name"] == "Member Number1" and got[0]["constituency"] == "PK-1 Swat-1"
+    assert any(m["constituency"] == "WR-1" for m in got)       # reserved seats are members too
+
+
+def test_official_sources_are_used_without_wikipedia_and_pending_ones_are_reported(monkeypatch):
+    from app import config
+    from app.screening import pep_assemblies as pa
+    monkeypatch.setattr(config, "PEP_WIKIPEDIA_FALLBACK", False)
+    monkeypatch.setattr(config, "PEP_EXTRA_SOURCES", "")
+    seen = []
+
+    def get(url, params):
+        seen.append(url)
+        if "pakp.gov.pk" in url:
+            return _KP_PAGE
+        raise ConnectionError("blocked")
+
+    assemblies, report = pa.fetch_assemblies(get, "https://en.wikipedia.org/w/api.php")
+    assert not any("wikipedia" in u for u in seen)
+    assert [a["key"] for a in assemblies] == ["kp_official"]
+    by = {r["key"]: r for r in report}
+    assert by["kp_official"]["count"] == 14 and by["senate_official"]["error"]
+    assert "not set up" in by["gb_official"]["error"] and by["punjab_official"]["error"]
+
+
+def test_extra_sources_add_and_replace_official_entries(monkeypatch):
+    from app import config
+    from app.screening import pep_assemblies as pa
+    monkeypatch.setattr(config, "PEP_EXTRA_SOURCES", json.dumps([
+        {"key": "punjab_official", "label": "Punjab", "province": "Punjab", "url": "https://www.pap.gov.pk/members/", "parser": "cards"},
+        {"key": "bad", "url": "http://insecure.example/"}]))
+    sources, pending = pa.official_sources()
+    keys = [s["key"] for s in sources]
+    assert "punjab_official" in keys and "bad" not in keys
+    assert "punjab_official" not in [p["key"] for p in pending]
+
+
+def _senate_html(n=12):
+    rows = "".join(
+        f'<tr><td>{i}</td><td><a href="/en/profile.php?uid={i}">Senator Name{i}</a>    (In vice of Someone Else)</td>'
+        f'<td>March 2021 to March 2027</td><td>Pakistan Peoples Party Parliamentarians (PPPP)</td><td>Sindh</td>'
+        f'<td><img src="x.jpg"></td></tr>' for i in range(1, n + 1))
+    return ("<table><tr><th>S.No.</th><th>Name</th><th>Tenure</th><th>Party</th><th>Province</th><th>Picture</th></tr>"
+            + rows + "</table>")
+
+
+def test_senate_page_layout_is_read_and_the_in_vice_note_is_not_part_of_the_name():
+    from app.screening import pep_assemblies as pa
+    got = pa.members_from_html(_senate_html())
+    assert len(got) == 12
+    assert got[0]["name"] == "Senator Name1" or got[0]["name"] == "Name1"
+    assert "vice" not in " ".join(got[0]["names"]).lower()
+    assert "Peoples Party" in got[0]["party"]
+
+
+def _sindh_html(n=12):
+    body = "".join(
+        f'<div><span>{chr(65 + i % 3)}</span><img src="x.jpg"><a href="javascript:void(0)">Member Person{i}</a>'
+        f'<p>PS-{i} Karachi East-{i}</p></div>' for i in range(1, n + 1))
+    body += '<div><a href="javascript:void(0)">Reserved Lady</a><p>RSW-146</p></div>'
+    return "<html><body><h2>Members Directory</h2>" + body + "<p>Total: 13</p></body></html>"
+
+
+def test_sindh_pairs_parser_reads_name_and_seat_including_reserved_seats():
+    from app.screening import pep_assemblies as pa
+    got = pa.members_from_pairs(_sindh_html())
+    assert len(got) == 13
+    assert got[0]["name"] == "Member Person1" and got[0]["constituency"] == "PS-1 Karachi East-1"
+    assert got[-1]["name"] == "Reserved Lady" and got[-1]["constituency"] == "RSW-146"
+
+
+def _balochistan_html(n=12):
+    cards = "".join(
+        f'<a href="https://pabalochistan.gov.pk/member-profile/{500 + i}"><span>Member Name</span>'
+        f'<h5>Mr. Member Person{i}</h5><small>N-A</small><b>Tenure:</b> 2024-2029 <b>Constituency:</b> PB-{i} '
+        f'<b>Seat Type:</b> Elected</a>' for i in range(1, n + 1))
+    cards += ('<a href="/member-profile/900"><span>Member Name</span><h5>Ms. Reserved Lady N-A</h5>'
+              '<b>Constituency:</b> Reserved</a><a href="/standing-committees">Committees</a>')
+    return "<html><body>" + cards + "</body></html>"
+
+
+def test_balochistan_profiles_parser_reads_name_and_constituency_and_skips_other_links():
+    from app.screening import pep_assemblies as pa
+    got = pa.members_from_profiles(_balochistan_html())
+    assert len(got) == 13
+    assert got[0]["constituency"] == "PB-1" and "N-A" not in " ".join(got[0]["names"])
+    assert any("Reserved Lady" in n for n in got[-1]["names"]) and not got[-1]["name"].endswith("N-A")
+
+
+def _robots_env(monkeypatch, robots_text, status=200):
+    import requests
+    from app import config
+    from app.screening import loader
+    monkeypatch.setattr(config, "PEP_PAGE_INTERVAL", 0)
+    monkeypatch.setattr(config, "PEP_RESPECT_ROBOTS", True)
+    loader._robots.clear()
+    seen = []
+
+    def fake_get(url, timeout, headers=None, **kw):
+        seen.append(url)
+        if url.endswith("robots.txt"):
+            if status != 200:
+                resp = requests.Response()
+                resp.status_code = status
+                raise requests.HTTPError(str(status), response=resp)
+            r = requests.Response()
+            r._content = robots_text.encode()
+            return r
+        r = requests.Response()
+        r._content = b"<html>page</html>"
+        return r
+
+    monkeypatch.setattr(loader, "_get", fake_get)
+    return loader, seen
+
+
+def test_a_site_whose_robots_txt_disallows_us_is_not_read(monkeypatch):
+    import pytest
+    loader, seen = _robots_env(monkeypatch, "User-agent: *\nDisallow: /members/\n")
+    with pytest.raises(loader.RobotsDisallowed):
+        loader._polite_page_get("https://www.pap.gov.pk/members/listing/en/22?byname=true", None)
+    assert not any("members/listing" in u for u in seen)
+
+
+def test_robots_txt_that_only_blocks_other_agents_lets_us_read(monkeypatch):
+    loader, _seen = _robots_env(monkeypatch, "User-agent: GPTBot\nDisallow: /\n\nUser-agent: *\nAllow: /\n")
+    assert "page" in loader._polite_page_get("https://www.pap.gov.pk/members/listing/en/22?byname=true", None)
+
+
+def test_missing_robots_txt_allows_and_unreadable_robots_txt_blocks(monkeypatch):
+    import pytest
+    loader, _ = _robots_env(monkeypatch, "", status=404)
+    assert "page" in loader._polite_page_get("https://pas.gov.pk/members/byname/33", None)
+    loader, _ = _robots_env(monkeypatch, "", status=503)
+    with pytest.raises(loader.RobotsDisallowed):
+        loader._polite_page_get("https://pas.gov.pk/members/byname/33", None)
+
+
+def _punjab_html(n=12):
+    rows = "".join(
+        f"<div><b>Member Person{i} | pp{i}@pap.gov.pk</b><p>PP-{i} (Lahore-{i}) | Lahore</p>"
+        f"<p>Pakistan Muslim League (Nawaz)</p><p>5{i} Years</p></div>" for i in range(1, n + 1))
+    rows += "<div><b>Reserved Lady</b><p>W-348 | Reserved Seats</p><p>Pakistan Muslim League (Nawaz)</p></div>"
+    return "<html><body><h1>Members' Directory</h1>" + rows + "</body></html>"
+
+
+def test_punjab_directory_layout_is_read_by_the_pairs_parser():
+    from app.screening import pep_assemblies as pa
+    got = pa.members_from_pairs(_punjab_html())
+    assert len(got) == 13
+    assert got[0]["name"] == "Member Person1" and "pap.gov.pk" not in " ".join(got[0]["names"])
+    assert got[0]["constituency"].startswith("PP-1 ") and got[-1]["name"] == "Reserved Lady"

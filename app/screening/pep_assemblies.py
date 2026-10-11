@@ -11,6 +11,7 @@ which is reported per source on the Lists page instead of failing the whole PEP 
 import json
 import re
 from html.parser import HTMLParser
+from app import config
 
 NATIONAL, PROVINCIAL = "National", "Provincial"
 
@@ -51,10 +52,52 @@ WIKI_SOURCES = [
                 "Azad Jammu and Kashmir Legislative Assembly"]},
 ]
 
+# The assemblies' own websites. parser "table": the page has a member table (found by its header text);
+# parser "cards": the page has one link per member reading "Name PK-12 Constituency" (the KP Assembly's layout);
+# parser "pairs": a member's name is followed by a line with the seat, "PS-124 Karachi Central-III" (Sindh) or
+# "PP-262 (Layyah-I) | Layyah" (Punjab, where the name line may read "Name | email");
+# parser "profiles": one link per member to a /member-profile/ page whose text starts with the name (Balochistan).
 OFFICIAL_SOURCES = [
     {"key": "na_official", "label": "National Assembly website (na.gov.pk)", "level": NATIONAL, "province": "",
-     "url": "https://na.gov.pk/en/all_members.php"},
+     "url": "https://na.gov.pk/en/all_members.php", "parser": "table"},
+    {"key": "senate_official", "label": "Senate website (senate.gov.pk)", "level": NATIONAL, "province": "",
+     "url": "https://senate.gov.pk/en/current_members.php", "parser": "table"},
+    {"key": "kp_official", "label": "Khyber Pakhtunkhwa Assembly website (pakp.gov.pk)", "level": PROVINCIAL,
+     "province": "Khyber Pakhtunkhwa", "url": "https://www.pakp.gov.pk/members/", "parser": "cards"},
+    # the 33 is the assembly term on that site (2024 - till date); a new term gets a new number
+    {"key": "sindh_official", "label": "Sindh Assembly website (pas.gov.pk)", "level": PROVINCIAL,
+     "province": "Sindh", "url": "https://www.pas.gov.pk/members/byname/33", "parser": "pairs"},
+    # the 22 is the assembly term on that site; the page may refuse automated access in its robots.txt, in which
+    # case the Lists page says so and the last saved members stay
+    {"key": "punjab_official", "label": "Punjab Assembly website (pap.gov.pk)", "level": PROVINCIAL,
+     "province": "Punjab", "url": "https://www.pap.gov.pk/members/listing/en/22?byname=true", "parser": "pairs"},
+    {"key": "balochistan_official", "label": "Balochistan Assembly website (pabalochistan.gov.pk)",
+     "level": PROVINCIAL, "province": "Balochistan", "url": "https://pabalochistan.gov.pk/list-members",
+     "parser": "profiles"},
 ]
+
+# Assemblies whose official member list is not set up yet. They are shown on the Lists page as such (instead of
+# being silently missing) and keep their last saved members. Add each with PEP_EXTRA_SOURCES once its page is known.
+PENDING_OFFICIAL = [
+    {"key": "gb_official", "label": "Gilgit-Baltistan Assembly website"},
+    {"key": "ajk_official", "label": "Azad Jammu and Kashmir Assembly website"},
+]
+
+
+def official_sources() -> tuple:
+    """(sources, pending): the built-in official sources with PEP_EXTRA_SOURCES applied on top."""
+    by_key = {src["key"]: dict(src) for src in OFFICIAL_SOURCES}
+    if config.PEP_EXTRA_SOURCES:
+        try:
+            extra = json.loads(config.PEP_EXTRA_SOURCES)
+        except ValueError:
+            extra = []
+        for src in extra if isinstance(extra, list) else []:
+            if isinstance(src, dict) and src.get("key") and str(src.get("url", "")).startswith("https://"):
+                by_key[src["key"]] = {"level": PROVINCIAL, "province": "", "parser": "table", "label": src["key"], **src}
+    pending = [p for p in PENDING_OFFICIAL if p["key"] not in by_key]
+    return list(by_key.values()), pending
+
 
 # a member list with fewer rows than this is a layout we did not understand, not a real assembly
 MIN_MEMBERS = 10
@@ -233,6 +276,149 @@ def members_from_html(html: str) -> list:
     return uniq
 
 
+class _Links(HTMLParser):
+    """Every <a href> as (href, text)."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links: list = []
+        self._href = None
+        self._text: list = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self._href = dict(attrs).get("href") or ""
+            self._text = []
+
+    def handle_data(self, data):
+        if self._href is not None:
+            self._text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._href is not None:
+            self.links.append((self._href, " ".join("".join(self._text).split())))
+            self._href = None
+
+
+_CARD = re.compile(r"^(?P<name>.+?)\s+(?P<seat>(?:PK|PP|PS|PB|NA|WR|MR|RW|GB|LA)[-\s]?\d+[A-Za-z]?)\b[-\s]*(?P<place>.*)$")
+
+
+def members_from_cards(html: str) -> list:
+    """[{name, names, constituency, party}] from links reading "Name PK-12 Constituency" under a /members/ address."""
+    parser = _Links()
+    parser.feed(html)
+    out, seen = [], set()
+    for href, text in parser.links:
+        if "/members/" not in href:
+            continue
+        m = _CARD.match(text)
+        if not m:
+            continue
+        names = _clean_name(m.group("name"))
+        if not names or names[0].lower() in seen:
+            continue
+        seen.add(names[0].lower())
+        out.append({"name": names[0], "names": names,
+                    "constituency": (m.group("seat") + " " + m.group("place")).strip(), "party": ""})
+    return out
+
+
+class _TextNodes(HTMLParser):
+    """Every non-empty text node of a page, in order (scripts and styles skipped)."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.nodes: list = []
+        self._skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self._skip += 1
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style") and self._skip:
+            self._skip -= 1
+
+    def handle_data(self, data):
+        text = " ".join(data.split())
+        if text and not self._skip:
+            self.nodes.append(text)
+
+
+_SEAT_LINE = re.compile(r"^(?:PS|PP|PK|PB|NA|RSW|RSM|WR|MR|W)[-\s]?\d+\b")
+
+
+def members_from_pairs(html: str) -> list:
+    """Members from a page where each name is directly followed by its seat line (PS-124 Karachi Central-III)."""
+    parser = _TextNodes()
+    parser.feed(html)
+    nodes, out, seen = parser.nodes, [], set()
+    for i, node in enumerate(nodes):
+        if i == 0 or not _SEAT_LINE.match(node) or _SEAT_LINE.match(nodes[i - 1]):
+            continue
+        raw = nodes[i - 1].split(" | ")[0]            # Punjab prints "Name | email address"
+        names = _clean_name(raw)
+        if not names or len(raw) < 3:
+            continue
+        key = (names[0].lower(), node.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"name": names[0], "names": names, "constituency": node, "party": ""})
+    return out
+
+
+class _LinkNodes(HTMLParser):
+    """Every <a href> with the text nodes inside it."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links: list = []
+        self._href = None
+        self._nodes: list = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self._href = dict(attrs).get("href") or ""
+            self._nodes = []
+
+    def handle_data(self, data):
+        text = " ".join(data.split())
+        if self._href is not None and text:
+            self._nodes.append(text)
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._href is not None:
+            self.links.append((self._href, self._nodes))
+            self._href = None
+
+
+def members_from_profiles(html: str) -> list:
+    """Members from links to /member-profile/ pages: the name is the first text after the "Member Name" label."""
+    parser = _LinkNodes()
+    parser.feed(html)
+    out, seen = [], set()
+    for href, nodes in parser.links:
+        if "member-profile" not in href or not nodes:
+            continue
+        first = re.sub(r"^\s*Member\s*Name\s*:?\s*", "", nodes[0], flags=re.I)
+        if not first and len(nodes) > 1:
+            first = nodes[1]
+        first = re.sub(r"\s+N-?A\s*$", "", first).strip()          # "N-A" is the empty portfolio field
+        names = _clean_name(first)
+        if not names or names[0].lower() in seen:
+            continue
+        seen.add(names[0].lower())
+        text = " ".join(nodes)
+        seat = re.search(r"Constituency:\s*(\S+)", text)
+        out.append({"name": names[0], "names": names, "constituency": seat.group(1) if seat else "", "party": ""})
+    return out
+
+
+_PARSERS = {"table": members_from_html, "cards": members_from_cards,
+            "pairs": members_from_pairs, "profiles": members_from_profiles}
+
+
 # --------------------------------------------------------------------------
 # Fetching
 # --------------------------------------------------------------------------
@@ -254,7 +440,12 @@ def fetch_assemblies(get, wiki_api_url: str, sources=None, official=None) -> tup
     members}]; `report` is [{key, label, source, count, error}] for the Lists page.
     """
     assemblies, report = [], []
-    for src in (WIKI_SOURCES if sources is None else sources):
+    if sources is None:
+        sources = WIKI_SOURCES if config.PEP_WIKIPEDIA_FALLBACK else []
+    pending = []
+    if official is None:
+        official, pending = official_sources()
+    for src in sources:
         err, got, used = "page not found", [], ""
         for title in src["titles"]:
             try:
@@ -273,9 +464,9 @@ def fetch_assemblies(get, wiki_api_url: str, sources=None, official=None) -> tup
         else:
             report.append({"key": src["key"], "label": src["label"], "source": used or src["titles"][0],
                            "count": 0, "error": err})
-    for src in (OFFICIAL_SOURCES if official is None else official):
+    for src in official:
         try:
-            got = members_from_html(get(src["url"], None))
+            got = _PARSERS.get(src.get("parser", "table"), members_from_html)(get(src["url"], None))
             if len(got) < MIN_MEMBERS:
                 raise ValueError(f"only {len(got)} member rows could be read")
             assemblies.append({"key": src["key"], "label": src["label"], "level": src["level"],
@@ -283,6 +474,9 @@ def fetch_assemblies(get, wiki_api_url: str, sources=None, official=None) -> tup
             report.append({"key": src["key"], "label": src["label"], "source": src["url"], "count": len(got), "error": ""})
         except Exception as exc:              # noqa: BLE001
             report.append({"key": src["key"], "label": src["label"], "source": src["url"], "count": 0, "error": _why(exc)})
+    for src in pending:
+        report.append({"key": src["key"], "label": src["label"], "source": "", "count": 0,
+                       "error": "official member list not set up yet"})
     return assemblies, report
 
 

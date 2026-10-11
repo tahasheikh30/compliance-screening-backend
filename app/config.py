@@ -116,6 +116,17 @@ PEP_REFRESH_DAYS = _float_env("PEP_REFRESH_DAYS", 7)
 # (Wikipedia and na.gov.pk). They fill the gaps in Wikidata and are refreshed with it. PEP_ASSEMBLIES=false skips them.
 PEP_ASSEMBLIES_ENABLED = os.environ.get("PEP_ASSEMBLIES", "true").strip().lower() not in ("0", "false", "no")
 PEP_WIKIPEDIA_API = os.environ.get("PEP_WIKIPEDIA_API", "https://en.wikipedia.org/w/api.php").strip()
+# Wikipedia member tables are only a fallback for assemblies whose official site is not set up, and are OFF by default:
+# the official assembly websites are the source. PEP_WIKIPEDIA_FALLBACK=true turns the fallback on.
+PEP_WIKIPEDIA_FALLBACK = os.environ.get("PEP_WIKIPEDIA_FALLBACK", "false").strip().lower() in ("1", "true", "yes")
+# More official member lists without a code change: a JSON list of
+# {"key","label","level","province","url","parser"} where parser is "table" (a member table) or "cards"
+# (one link per member, "Name PK-1 Constituency"). An entry with the key of a built-in source replaces it.
+PEP_EXTRA_SOURCES = os.environ.get("PEP_EXTRA_SOURCES", "").strip()
+# Official assembly sites are read only where their robots.txt allows this server (agent "ComplianceScreening").
+# A site that does not allow it is reported as such on the Lists page and is not read. Set false only if you have
+# the site's permission.
+PEP_RESPECT_ROBOTS = os.environ.get("PEP_RESPECT_ROBOTS", "true").strip().lower() not in ("0", "false", "no")
 # Wikimedia asks every client to send a descriptive User-Agent with a way to reach the operator, and answers 429 to
 # generic browser-style ones. Set WIKI_CONTACT to an email or URL of the operator.
 WIKI_CONTACT = os.environ.get("WIKI_CONTACT", "https://github.com/tahasheikh30/compliance-screening-backend").strip()

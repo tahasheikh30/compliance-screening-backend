@@ -24,6 +24,7 @@ import re
 import threading
 import time
 from urllib.parse import urljoin, urlparse
+from urllib.robotparser import RobotFileParser
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -190,6 +191,47 @@ def _retry_after(resp, default: float) -> float:
         return min(default, 60.0)
 
 
+ROBOTS_AGENT = "ComplianceScreening"
+ROBOTS_TTL = 6 * 3600
+_robots: dict = {}          # host -> (fetched at, parser, or None when the site has no robots.txt)
+
+
+class RobotsDisallowed(Exception):
+    """The site's robots.txt does not allow this server to read the page."""
+
+
+def _robots_allows(url: str) -> bool:
+    """
+    Whether the host's robots.txt allows ROBOTS_AGENT to read `url`. No robots.txt (4xx) means allowed; a robots.txt
+    that cannot be read (5xx, network) means not allowed this time, and is not remembered.
+    """
+    if not config.PEP_RESPECT_ROBOTS:
+        return True
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    now = time.monotonic()
+    with _page_lock:
+        hit = _robots.get(host)
+    if hit and now - hit[0] < ROBOTS_TTL:
+        parser = hit[1]
+    else:
+        try:
+            text = _text(_get(f"{parsed.scheme}://{parsed.netloc}/robots.txt", 20))
+            parser = RobotFileParser()
+            parser.parse(text.splitlines())
+        except requests.HTTPError as exc:
+            status = getattr(exc.response, "status_code", 0)
+            if 400 <= status < 500:
+                parser = None
+            else:
+                return False
+        except Exception:                      # noqa: BLE001  (network, unsafe redirect)
+            return False
+        with _page_lock:
+            _robots[host] = (now, parser)
+    return True if parser is None else parser.can_fetch(ROBOTS_AGENT, url)
+
+
 def _polite_page_get(url: str, params) -> str:
     """
     GET one public web page (Wikipedia, na.gov.pk) without hammering it: requests are spaced PEP_PAGE_INTERVAL
@@ -199,6 +241,8 @@ def _polite_page_get(url: str, params) -> str:
     kw = {"params": params} if params else {}
     host = (urlparse(url).hostname or "").lower()
     headers = {"User-Agent": config.WIKI_USER_AGENT} if host.endswith(("wikipedia.org", "wikimedia.org")) else {}
+    if not host.endswith(("wikipedia.org", "wikimedia.org")) and not _robots_allows(url):
+        raise RobotsDisallowed("the site's robots.txt does not allow automated access")
     attempts = max(1, config.PEP_PAGE_ATTEMPTS)
     for n in range(attempts):
         with _page_lock:                    # one request at a time, spaced apart
@@ -446,6 +490,15 @@ def refresh_wikidata() -> dict:
             if not row["count"] and row["key"] in old:
                 assemblies.append(old[row["key"]])
                 row["kept"] = len(old[row["key"]].get("members", []))
+        # an assembly saved earlier that no source covers any more (the Wikipedia-based ones) is kept, and shown as
+        # kept, until an official list replaces it: dropping sitting members from screening is worse than a stale copy
+        reported = {row["key"] for row in report}
+        have = {a.get("key") for a in assemblies}
+        for key, a in old.items():
+            if key and key not in reported and key not in have and a.get("members"):
+                assemblies.append(a)
+                report.append({"key": key, "label": a.get("label", key), "source": a.get("source", ""), "count": 0,
+                               "error": "", "kept": len(a["members"])})
         fresh["assemblies"] = assemblies
         fresh["assembly_report"] = report
         if wd_failure is not None and not any(row["count"] for row in report):
