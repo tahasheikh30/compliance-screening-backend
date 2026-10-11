@@ -127,6 +127,11 @@ PEP_EXTRA_SOURCES = os.environ.get("PEP_EXTRA_SOURCES", "").strip()
 # A site that does not allow it is reported as such on the Lists page and is not read. Set false only if you have
 # the site's permission.
 PEP_RESPECT_ROBOTS = os.environ.get("PEP_RESPECT_ROBOTS", "true").strip().lower() not in ("0", "false", "no")
+# Hosts (comma separated, e.g. "pap.gov.pk,www.pakp.gov.pk") that the operator has decided to read although their
+# robots.txt asks automated readers to stay away. Only those hosts; every other site is still checked. The server
+# still identifies itself honestly and keeps its request spacing. This is the operator's decision and risk: the
+# site may block the server's address, and its terms of use may apply.
+PEP_ROBOTS_OVERRIDE_HOSTS = tuple(h.strip().lower() for h in os.environ.get("PEP_ROBOTS_OVERRIDE_HOSTS", "").split(",") if h.strip())
 # Wikimedia asks every client to send a descriptive User-Agent with a way to reach the operator, and answers 429 to
 # generic browser-style ones. Set WIKI_CONTACT to an email or URL of the operator.
 WIKI_CONTACT = os.environ.get("WIKI_CONTACT", "https://github.com/tahasheikh30/compliance-screening-backend").strip()
