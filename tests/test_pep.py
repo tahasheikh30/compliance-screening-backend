@@ -399,7 +399,8 @@ def test_load_pep_lists_each_assembly_with_its_own_count_and_error(monkeypatch):
     g = loader._load_pep()
     rows = {m["list"]: m for m in g.meta}
     assert rows["PEP members: National Assembly (16th)"]["records"] == 1
-    assert "page not found" in rows["PEP members: Gilgit-Baltistan Assembly"]["note"]
+    assert "page was not found" in rows["PEP members: Gilgit-Baltistan Assembly"]["note"]
+    assert rows["PEP members: Gilgit-Baltistan Assembly"]["detail"] == "page not found"
     assert len(g.records) == 1
 
 
@@ -686,5 +687,19 @@ def test_a_failed_assembly_row_says_when_the_uploaded_list_covers_its_province(m
     monkeypatch.setattr(loader, "_wikidata_snapshot", lambda: (snap, None))
     monkeypatch.setattr(loader, "db_pep", lambda kind: (csv.encode(), {"filename": "assemblies.csv"}) if kind == "upload" else None)
     rows = {m["list"]: m for m in loader._load_pep().meta}
-    assert "Your uploaded list has 2 members for Punjab" in rows["PEP members: Punjab Assembly website"]["note"]
+    assert "Your uploaded list (2 members for Punjab) is used instead" in rows["PEP members: Punjab Assembly website"]["note"]
+    assert rows["PEP members: Punjab Assembly website"]["detail"] == "ConnectTimeout"
     assert "uploaded list" not in rows["PEP members: Gilgit-Baltistan Assembly website"]["note"]
+
+
+@pytest.mark.parametrize("raw,short", [
+    ("HTTPSConnectionPool(host='www.pap.gov.pk', port=443): Max retries exceeded with url: /m (Caused by )", "did not answer"),
+    ("HTTPSConnectionPool(host='x'): Max retries exceeded (Caused by NameResolutionError(\"HTTPSConnect)", "address could not be found"),
+    ("the site's robots.txt does not allow automated access", "robots.txt"),
+    ("429 Client Error: Too Many Requests for url", "fewer requests"),
+    ("page not found", "page was not found"),
+    ("only 12 of the 369 members the page lists were read (it shows them in pages)", "only part"),
+])
+def test_plain_reason_turns_a_raw_error_into_a_short_sentence(raw, short):
+    from app.screening import pep_assemblies as pa
+    assert short in pa.plain_reason(raw)

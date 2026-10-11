@@ -508,6 +508,26 @@ def fetch_assemblies(get, wiki_api_url: str, sources=None, official=None) -> tup
     return assemblies, report
 
 
+def plain_reason(error: str) -> str:
+    """A short, plain-language reason for the Lists page; the full error text is kept for the details view."""
+    e = (error or "").lower()
+    if "robots.txt" in e:
+        return "the site's robots.txt does not allow automated access"
+    if any(k in e for k in ("nameresolution", "name or service", "getaddrinfo", "resolve")):
+        return "the site's address could not be found"
+    if any(k in e for k in ("timeout", "timed out", "max retries", "connection", "connect")):
+        return "the site did not answer the server"
+    m = re.search(r"\b(4\d\d|5\d\d)\b", e)
+    if m:
+        return {"404": "the page was not found", "403": "the site refused access", "429": "the site asked for fewer requests"
+                }.get(m.group(1), f"the site answered with error {m.group(1)}")
+    if "not found" in e:
+        return "the page was not found"
+    if "member rows" in e or "of the" in e and "members" in e:
+        return "the page layout was not understood or only part of it was read"
+    return (error or "unknown reason")[:80]
+
+
 def _why(exc: Exception) -> str:
     text = str(exc).split("\n")[0]
     text = re.sub(r"https?://\S+", "", text).strip(" :")

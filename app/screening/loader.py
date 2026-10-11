@@ -293,6 +293,8 @@ def list_info(meta: dict, debug: bool = False) -> dict:
         out["note"] = meta["note"]
     if debug:
         out["source"] = meta.get("source") or None
+        if meta.get("detail"):
+            out["detail"] = str(meta["detail"])[:600]
         if meta.get("sample"):
             out["sample"] = meta["sample"]
     return out
@@ -630,12 +632,14 @@ def _load_pep() -> GroupData:
             item = {"list": "PEP members: " + row.get("label", row.get("key", "")), "source": row.get("source", ""),
                     "published": published, "records": row.get("count") or row.get("kept") or 0}
             if row.get("error"):
-                item["note"] = ("Could not be read this time (" + row["error"] + ")" +
-                                (f"; the last saved {row['kept']} members are used." if row.get("kept") else "."))
+                note = "Could not be read this time: " + pep_assemblies.plain_reason(row["error"]) + "."
                 have = uploaded_by_province.get(row.get("province") or "", 0)
-                if have and not row.get("count"):
-                    item["note"] += (f" Your uploaded list has {have} members for {row['province']}, which are used "
-                                     "for screening in the meantime.")
+                if row.get("kept"):
+                    note += f" The last saved {row['kept']} members are used."
+                elif have and not row.get("count"):
+                    note += f" Your uploaded list ({have} members for {row['province']}) is used instead."
+                item["note"] = note
+                item["detail"] = row["error"]
             lists.append(item)
     records = pep.merge(*groups)
     if not records:
