@@ -673,3 +673,18 @@ def test_punjab_minority_seats_are_read_like_the_other_reserved_seats():
             '<div><a href="/p/2">Minority Member Two | m@x.com</a></div><div>NM-368 | Reserved Seats</div>')
     got = pa.members_from_pairs(html)
     assert [m["name"] for m in got] == ["Gen Member One", "Minority Member Two"]
+
+
+def test_a_failed_assembly_row_says_when_the_uploaded_list_covers_its_province(monkeypatch):
+    snap = {"fetched_at": "2026-10-01T00:00:00+00:00", "people": [], "politicians": [], "assemblies": [],
+            "assembly_report": [{"key": "punjab_official", "label": "Punjab Assembly website", "source": "u", "count": 0,
+                                 "error": "ConnectTimeout", "province": "Punjab"},
+                                {"key": "gb_official", "label": "Gilgit-Baltistan Assembly website", "source": "", "count": 0,
+                                 "error": "official member list not set up yet", "province": "Gilgit-Baltistan"}]}
+    csv = ("Name,Position,Level,Province\nAbdul Razzaq Khan,Member of the Punjab Assembly (PP-117),Provincial,Punjab\n"
+           "Ahmad Iqbal Chaudhary,Member of the Punjab Assembly (PP-54),Provincial,Punjab\n")
+    monkeypatch.setattr(loader, "_wikidata_snapshot", lambda: (snap, None))
+    monkeypatch.setattr(loader, "db_pep", lambda kind: (csv.encode(), {"filename": "assemblies.csv"}) if kind == "upload" else None)
+    rows = {m["list"]: m for m in loader._load_pep().meta}
+    assert "Your uploaded list has 2 members for Punjab" in rows["PEP members: Punjab Assembly website"]["note"]
+    assert "uploaded list" not in rows["PEP members: Gilgit-Baltistan Assembly website"]["note"]

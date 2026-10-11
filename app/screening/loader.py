@@ -601,12 +601,16 @@ def _load_pep() -> GroupData:
     snapshot, wd_note = _wikidata_snapshot()
     up = db_pep("upload")
     lists, groups, notes = [], [], [n for n in [wd_note] if n]
+    uploaded_by_province: dict = {}
     if up:
         try:
             up_records, up_info = pep.parse_pep_persons(decode_bytes(up[0]))
         except ValueError as exc:
             raise SourceUnavailable(f"The uploaded PEP file could not be read: {exc}") from None
         groups.append(up_records)
+        for rec in up_records:
+            if getattr(rec, "province", ""):
+                uploaded_by_province[rec.province] = uploaded_by_province.get(rec.province, 0) + 1
         lists.append({"list": "PEP list uploaded by an administrator", "source": up[1].get("filename") or "uploaded file",
                       "published": (up[1].get("uploaded_at") or "n/a")[:10], "records": len(up_records)})
     if snapshot is not None:
@@ -628,6 +632,10 @@ def _load_pep() -> GroupData:
             if row.get("error"):
                 item["note"] = ("Could not be read this time (" + row["error"] + ")" +
                                 (f"; the last saved {row['kept']} members are used." if row.get("kept") else "."))
+                have = uploaded_by_province.get(row.get("province") or "", 0)
+                if have and not row.get("count"):
+                    item["note"] += (f" Your uploaded list has {have} members for {row['province']}, which are used "
+                                     "for screening in the meantime.")
             lists.append(item)
     records = pep.merge(*groups)
     if not records:
