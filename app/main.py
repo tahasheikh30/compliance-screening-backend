@@ -278,7 +278,7 @@ def _screen_one(req: ScreenRequest, user: AuthUser, request: Request | None = No
     evidence_pdf, evidence_failed = None, False
     if result["hit"]:
         try:
-            evidence_pdf = evidence.generate_evidence_pdf(result, case_ref)
+            evidence_pdf = evidence.generate_evidence_pdf(result, case_ref, overall_status=overall)
         except Exception:
             logger.exception("Evidence PDF generation failed for applicant %s", applicant_id)
             evidence_failed = True
