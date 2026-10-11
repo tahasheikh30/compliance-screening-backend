@@ -531,4 +531,4 @@ def plain_reason(error: str) -> str:
 def _why(exc: Exception) -> str:
     text = str(exc).split("\n")[0]
     text = re.sub(r"https?://\S+", "", text).strip(" :")
-    return (text or exc.__class__.__name__)[:140]
+    return (text or exc.__class__.__name__)[:600]
