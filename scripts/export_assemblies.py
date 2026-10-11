@@ -68,6 +68,7 @@ def main() -> int:
             resp = requests.get(src["url"], headers={"User-Agent": UA}, timeout=60)
             resp.raise_for_status()
             members = pa._PARSERS[src.get("parser", "table")](resp.text)
+            pa.check_complete(resp.text, members)
         except Exception as exc:                              # noqa: BLE001
             print(f"{key}: could not be read ({exc.__class__.__name__}: {str(exc)[:120]})")
             continue

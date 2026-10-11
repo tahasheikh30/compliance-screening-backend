@@ -645,3 +645,31 @@ def test_an_operator_listed_host_is_read_despite_robots_txt_and_other_hosts_are_
     assert "page" in loader._polite_page_get("https://www.pap.gov.pk/members/listing/en/22", None)
     with pytest.raises(loader.RobotsDisallowed):
         loader._polite_page_get("https://www.pakp.gov.pk/members/", None)
+
+
+def _punjab_page(n, total):
+    rows = "".join(
+        f'<div class="mpa_name"><strong><a href="/p/{i}">Member {i} Khan\t\t | m{i}@x.com\t</a></strong></div>\n'
+        f'<div class="mpa_const">\n\t\tPP-{i} (City-{i}) | City\t</div>' for i in range(1, n + 1))
+    return f"<html>{rows}<span>Showing <b>1</b> - <b>{n}</b> of <b>{total}</b> Records</span></html>"
+
+
+def test_a_paged_member_list_that_shows_only_the_first_page_is_reported_not_accepted(monkeypatch):
+    from app.screening import pep_assemblies as pa
+    assert pa.expected_total(_punjab_page(10, 369)) == 369
+    assert pa.expected_total("<html>no count</html>") is None
+    src = {"key": "punjab_official", "label": "Punjab Assembly website (pap.gov.pk)", "level": "Provincial",
+           "province": "Punjab", "url": "https://x.test/p", "parser": "pairs"}
+    _a, report = pa.fetch_assemblies(lambda url, params: _punjab_page(12, 369), "", sources=[], official=[src])
+    assert report[0]["count"] == 0 and "12 of the 369" in report[0]["error"]
+    asm, report = pa.fetch_assemblies(lambda url, params: _punjab_page(12, 12), "", sources=[], official=[src])
+    assert report[0]["count"] == 12 and not report[0]["error"]
+    assert "limit=all" in next(s for s in pa.OFFICIAL_SOURCES if s["key"] == "punjab_official")["url"]
+
+
+def test_punjab_minority_seats_are_read_like_the_other_reserved_seats():
+    from app.screening import pep_assemblies as pa
+    html = ('<div><a href="/p/1">Gen Member One</a></div><div>PP-5 (City-v) | City</div>'
+            '<div><a href="/p/2">Minority Member Two | m@x.com</a></div><div>NM-368 | Reserved Seats</div>')
+    got = pa.members_from_pairs(html)
+    assert [m["name"] for m in got] == ["Gen Member One", "Minority Member Two"]
