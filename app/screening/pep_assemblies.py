@@ -483,10 +483,11 @@ def fetch_assemblies(get, wiki_api_url: str, sources=None, official=None) -> tup
         if len(got) >= MIN_MEMBERS:
             assemblies.append({"key": src["key"], "label": src["label"], "level": src["level"],
                                "province": src["province"], "source": "en.wikipedia.org: " + used, "members": got})
-            report.append({"key": src["key"], "label": src["label"], "source": used, "count": len(got), "error": ""})
+            report.append({"key": src["key"], "label": src["label"], "source": used, "count": len(got), "error": "",
+                           "province": src["province"]})
         else:
             report.append({"key": src["key"], "label": src["label"], "source": used or src["titles"][0],
-                           "count": 0, "error": err})
+                           "count": 0, "error": err, "province": src["province"]})
     for src in official:
         try:
             page = get(src["url"], None)
@@ -496,9 +497,11 @@ def fetch_assemblies(get, wiki_api_url: str, sources=None, official=None) -> tup
                 raise ValueError(f"only {len(got)} member rows could be read")
             assemblies.append({"key": src["key"], "label": src["label"], "level": src["level"],
                                "province": src["province"], "source": src["url"], "members": got})
-            report.append({"key": src["key"], "label": src["label"], "source": src["url"], "count": len(got), "error": ""})
+            report.append({"key": src["key"], "label": src["label"], "source": src["url"], "count": len(got), "error": "",
+                           "province": src["province"]})
         except Exception as exc:              # noqa: BLE001
-            report.append({"key": src["key"], "label": src["label"], "source": src["url"], "count": 0, "error": _why(exc)})
+            report.append({"key": src["key"], "label": src["label"], "source": src["url"], "count": 0, "error": _why(exc),
+                           "province": src["province"]})
     for src in pending:
         report.append({"key": src["key"], "label": src["label"], "source": "", "count": 0,
                        "error": "official member list not set up yet"})
