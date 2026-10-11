@@ -113,7 +113,7 @@ PEP_WIKIDATA_URL = os.environ.get("PEP_WIKIDATA_URL", "https://query.wikidata.or
 PEP_WIKIDATA_COUNTRY = os.environ.get("PEP_WIKIDATA_COUNTRY", "Q843").strip()
 PEP_REFRESH_DAYS = _float_env("PEP_REFRESH_DAYS", 7)
 # Members of the National Assembly, the Senate and the provincial assemblies, read from the public member lists
-# (Wikipedia and na.gov.pk). They fill the gaps in Wikidata and are refreshed with it. PEP_ASSEMBLIES=false skips them.
+# (official sites; Wikipedia only as an opt-in fallback). They fill the gaps in Wikidata and are refreshed with it. PEP_ASSEMBLIES=false skips them.
 PEP_ASSEMBLIES_ENABLED = os.environ.get("PEP_ASSEMBLIES", "true").strip().lower() not in ("0", "false", "no")
 PEP_WIKIPEDIA_API = os.environ.get("PEP_WIKIPEDIA_API", "https://en.wikipedia.org/w/api.php").strip()
 # Wikipedia member tables are only a fallback for assemblies whose official site is not set up, and are OFF by default:

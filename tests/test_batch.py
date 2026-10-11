@@ -8,7 +8,6 @@ import pytest
 from openpyxl import Workbook, load_workbook
 
 from app import batch_files
-from tests import fixtures as fx
 from tests.conftest import API_HEADERS, PENDING_HEADERS, USER2_HEADERS, USER_HEADERS
 
 XLSX = "application/octet-stream"

@@ -7,7 +7,7 @@ import requests
 from app import config, database
 from app.screening import loader, parsers
 from tests import fixtures as fx
-from tests.conftest import (ADMIN_ID, API_HEADERS, PENDING_ID, USER_HEADERS, USER_ID, USER2_HEADERS)
+from tests.conftest import (ADMIN_ID, API_HEADERS, PENDING_ID, USER_HEADERS, USER2_HEADERS)
 
 
 # ---- outbound requests -----------------------------------------------------------------------------------
