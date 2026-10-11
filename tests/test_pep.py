@@ -616,3 +616,22 @@ def test_punjab_directory_layout_is_read_by_the_pairs_parser():
     assert len(got) == 13
     assert got[0]["name"] == "Member Person1" and "pap.gov.pk" not in " ".join(got[0]["names"])
     assert got[0]["constituency"].startswith("PP-1 ") and got[-1]["name"] == "Reserved Lady"
+
+
+def test_a_saved_copy_made_from_other_sources_is_refetched_after_a_deploy(monkeypatch):
+    from app.screening import nacta_store
+    from app.screening import pep_assemblies
+    started = []
+    monkeypatch.setattr(config, "PEP_WIKIDATA_ENABLED", True)
+    monkeypatch.setattr(config, "PEP_ASSEMBLIES_ENABLED", True)
+    monkeypatch.setattr(nacta_store, "age_days", lambda _meta: 1)          # young: only the sources can make it outdated
+    monkeypatch.setattr(loader, "_refresh_wikidata_in_background", lambda: started.append(1))
+    old = {"people": [], "politicians": [], "assemblies": [], "assembly_report": []}      # no signature: the old code
+    monkeypatch.setattr(loader, "db_pep", lambda kind: (json.dumps(old).encode(), {}))
+    loader._wd_error = None
+    loader._wikidata_snapshot()
+    assert started == [1]
+    current = {**old, "source_signature": pep_assemblies.source_signature()}
+    monkeypatch.setattr(loader, "db_pep", lambda kind: (json.dumps(current).encode(), {}))
+    loader._wikidata_snapshot()
+    assert started == [1]                                                  # same sources: no refetch
