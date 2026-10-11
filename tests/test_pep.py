@@ -670,6 +670,6 @@ def test_a_paged_member_list_that_shows_only_the_first_page_is_reported_not_acce
 def test_punjab_minority_seats_are_read_like_the_other_reserved_seats():
     from app.screening import pep_assemblies as pa
     html = ('<div><a href="/p/1">Gen Member One</a></div><div>PP-5 (City-v) | City</div>'
-            '<div><a href="/p/2">Minority Member Two | m@x.com</a></div><div>M-368 | Reserved Seats</div>')
+            '<div><a href="/p/2">Minority Member Two | m@x.com</a></div><div>NM-368 | Reserved Seats</div>')
     got = pa.members_from_pairs(html)
     assert [m["name"] for m in got] == ["Gen Member One", "Minority Member Two"]

@@ -352,7 +352,7 @@ class _TextNodes(HTMLParser):
             self.nodes.append(text)
 
 
-_SEAT_LINE = re.compile(r"^(?:PS|PP|PK|PB|NA|RSW|RSM|WR|MR|W|M)[-\s]?\d+\b")
+_SEAT_LINE = re.compile(r"^(?:PS|PP|PK|PB|NA|RSW|RSM|NM|WR|MR|W)[-\s]?\d+\b")
 
 
 def members_from_pairs(html: str) -> list:
