@@ -622,8 +622,13 @@ def _load_pep() -> GroupData:
         from_lists = info.get("assembly_members", 0)
         entry = {"list": "PEP list from Wikidata (office holders and politicians)", "source": config.PEP_WIKIDATA_URL,
                  "published": published, "records": len(wd_records) - from_lists}
+        levels = info.get("by_level") or {}
+        parts = [f"{levels[k]:,} {k.lower()}" for k in ("National", "Provincial", "Local", "Political figure") if levels.get(k)]
+        if parts:
+            entry["note"] = "Counted as PEPs: " + ", ".join(parts) + "."
         if info.get("top_unclassified"):
-            entry["note"] = ("Positions not counted as PEP offices (most common): " + "; ".join(info["top_unclassified"][:8]))
+            entry["note"] = (entry.get("note", "") + " Positions not counted as PEP offices (most common): "
+                             + "; ".join(info["top_unclassified"][:15])).strip()
         extra = " ".join(x for x in [wd_note] + [p for p in snapshot.get("problems", [])] if x)
         if extra:
             entry["note"] = (entry.get("note", "") + " " + extra).strip()
