@@ -45,6 +45,11 @@ from tests.conftest import API_HEADERS, USER_HEADERS
     ("Mayor of Karachi", ("Local", "Sindh")),
     ("Member of the Hyderabad Municipal Corporation, Sindh", ("Local", "Sindh")),
     ("Member of the Greater Hyderabad Municipal Corporation", None),
+    ("Member of the Hyderabad Municipal Corporation", ("Local", "Sindh")),
+    ("councillor in the municipal corporation of Sukkar", ("Local", "Sindh")),
+    ("councillor in the municipal corporation of Sialkot", ("Local", "Punjab")),
+    ("councillor in the municipal corporation of Sargodha", ("Local", "Punjab")),
+    ("councillor in the municipal corporation of Sahiwal", ("Local", "Punjab")),
     ("Mayor of London", None),
     ("Member of the Parliament of Bangladesh", None),
     ("Member of the Dhaka North City Corporation, Bangladesh", None),
@@ -786,3 +791,13 @@ def test_snapshot_reports_how_many_peps_were_counted_per_level():
     recs, info = pep.records_from_snapshot(snap, date(2026, 10, 13), lookback_years=-1)
     assert info["by_level"] == {"National": 1, "Provincial": 1, "Local": 1}
     assert info["top_unclassified"] == ["Member of the Municipal Corporation of Delhi"]
+
+
+def test_politicians_with_a_recorded_office_are_counted_once_and_reported():
+    snap = {"people": [{"id": "Q1", "name": "Arsalan Islam Shaikh",
+                        "positions": [{"label": "councillor in the municipal corporation of Sukkar"}]}],
+            "politicians": [{"id": "Q1", "name": "Arsalan Islam Shaikh"}, {"id": "Q2", "name": "Only Politician"}]}
+    recs, info = pep.records_from_snapshot(snap, date(2026, 10, 13), lookback_years=-1)
+    assert len(recs) == 2
+    assert info["by_level"] == {"Local": 1, "Political figure": 1}
+    assert info["politicians_now_with_office"] == 1
