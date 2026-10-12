@@ -641,7 +641,9 @@ def _load_pep() -> GroupData:
                 item["note"] = note
                 item["detail"] = row["error"]
             lists.append(item)
-    records = pep.merge(*groups)
+    # last check before screening: no record that carries Bangladesh data can be shown as a PEP hit
+    records = [r for r in pep.merge(*groups)
+               if not pep.mentions_excluded_country(r.position, r.remarks, r.programs, r.province)]
     if not records:
         why = "; ".join(notes) if notes else "nothing has been fetched or uploaded"
         raise SourceUnavailable("No PEP data is loaded (" + why + "). Upload a PEP list on the Lists page or enable "

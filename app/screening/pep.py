@@ -11,7 +11,12 @@ Pakistan has no official PEP list, so the records come from two places that are 
 Levels: "National" (President, Prime Minister, National Assembly and Senate members, federal ministers, the
 top judiciary, the military chiefs, central bank governor, ambassadors and so on) and "Provincial" (provincial
 assembly members, chief ministers, governors, provincial ministers and speakers, Gilgit-Baltistan and Azad
-Jammu and Kashmir assemblies and governments). A person with offices at both levels is National.
+Jammu and Kashmir assemblies and governments). A person with offices at both levels is National. "Local" covers members and councillors of the metropolitan and
+municipal corporations and district councils of the Pakistani cities listed in `_CITY_PROVINCE`; a person with a
+national or provincial office as well keeps that higher level.
+
+Offices of other countries are never PEP offices here: anything that names Bangladesh is refused (see
+`mentions_excluded_country`), and no Bangladesh text reaches a PEP record or a PEP hit.
 """
 
 import json
@@ -24,7 +29,7 @@ from app.screening import parsers
 from app.screening.parsers import Record, _clean_cell, _hkey, normalize_cnic, normalize_province
 
 PEP_LABEL = "Politically Exposed Persons (national and provincial)"
-NATIONAL, PROVINCIAL = "National", "Provincial"
+NATIONAL, PROVINCIAL, LOCAL = "National", "Provincial", "Local"
 POLITICAL = "Political figure"     # a politician with no recorded national or provincial office
 
 # --------------------------------------------------------------------------
@@ -70,6 +75,26 @@ _PROVINCIAL_RULES = [re.compile(p, re.I) for p in (
 )]
 
 
+# Local government: a member or councillor of a metropolitan or municipal corporation or a district council. Only
+# the cities below are accepted, so "Municipal Corporation of Delhi" or a Bangladeshi city never becomes a PEP office.
+_CITY_PROVINCE = {
+    "lahore": "Punjab", "faisalabad": "Punjab", "multan": "Punjab", "rawalpindi": "Punjab", "gujranwala": "Punjab",
+    "karachi": "Sindh", "hyderabad": "Sindh", "sukkur": "Sindh", "larkana": "Sindh",
+    "peshawar": "Khyber Pakhtunkhwa", "swat": "Khyber Pakhtunkhwa", "mardan": "Khyber Pakhtunkhwa",
+    "abbottabad": "Khyber Pakhtunkhwa", "quetta": "Balochistan",
+}
+_LOCAL_BODY = re.compile(r"\b(metropolitan|municipal) corporation\b|\bdistrict council\b|\bcity council\b", re.I)
+_CITY_NAMES = re.compile(r"\b(" + "|".join(_CITY_PROVINCE) + r")\b", re.I)
+
+# Offices of these countries are not PEP offices for this list, even for a person who is Pakistani on Wikidata.
+_EXCLUDED_COUNTRIES = re.compile(r"\bbangladesh(i)?\b", re.I)
+
+
+def mentions_excluded_country(*texts) -> bool:
+    """True when any of the texts names a country whose offices must not appear on the PEP list (Bangladesh)."""
+    return any(_EXCLUDED_COUNTRIES.search(str(t or "")) for t in texts)
+
+
 def classify_position(label: str) -> tuple | None:
     """
     (level, province) for a position label, or None when the position does not make someone a PEP.
@@ -79,6 +104,8 @@ def classify_position(label: str) -> tuple | None:
     if not text:
         return None
     if re.search(r"\bformer\b|\bcandidate\b|\bvoter\b", text, re.I):
+        return None
+    if mentions_excluded_country(text):
         return None
     prov_match = _PROVINCE_NAMES.search(text)
     province = normalize_province(prov_match.group(1)) if prov_match else ""
@@ -92,11 +119,18 @@ def classify_position(label: str) -> tuple | None:
     # "Governor of Reserve Bank of India" is not a province at all) is not accepted from a public data set
     if any(r.search(text) for r in _NATIONAL_RULES[2:]):
         return NATIONAL, ""
+    # a member or councillor of a city corporation or district council of a known Pakistani city
+    if _LOCAL_BODY.search(text):
+        city = _CITY_NAMES.search(text)
+        if city:
+            return LOCAL, _CITY_PROVINCE[city.group(1).lower()]
     return None
 
 
 def _level_from_text(v: str) -> str:
     t = str(v or "").strip().lower()
+    if re.search(r"local|municipal|metropolitan|district|city|council", t):
+        return LOCAL
     if re.search(r"prov|state|region|assembly of (sindh|punjab|balochistan|khyber)", t):
         return PROVINCIAL
     if re.search(r"nat|fed|central|senate", t):
@@ -144,23 +178,34 @@ def _make_record(rid: str, names: list, positions: list, dob: str = "", cnic: st
                  extra: str = "", level_hint: str = "", province_hint: str = "", source: str = "") -> Record | None:
     """One PEP record from a person's names and the positions that qualify (list of (label, level, province, span))."""
     names = [n for n in dict.fromkeys(x.strip() for x in names if x and x.strip())]
+    # No Bangladesh data on a PEP record: its offices are dropped, and so are the extra notes that name it
+    positions = [p for p in positions if not mentions_excluded_country(p[0])]
+    if mentions_excluded_country(extra, father, level_hint, province_hint):
+        extra = "" if mentions_excluded_country(extra) else extra
+        father = "" if mentions_excluded_country(father) else father
+        level_hint = "" if mentions_excluded_country(level_hint) else level_hint
+        province_hint = "" if mentions_excluded_country(province_hint) else province_hint
     if not names or not positions:
         return None
-    level = NATIONAL if any(p[1] == NATIONAL for p in positions) else (positions[0][1] or level_hint)
-    provinces = list(dict.fromkeys(p[2] for p in positions if p[2] and p[1] == PROVINCIAL)) or (
+    # the highest level wins: National, then Provincial, then Local
+    levels = [p[1] for p in positions]
+    level = (NATIONAL if NATIONAL in levels else PROVINCIAL if PROVINCIAL in levels
+             else LOCAL if LOCAL in levels else (positions[0][1] or level_hint))
+    province_level = PROVINCIAL if level == PROVINCIAL else LOCAL
+    provinces = list(dict.fromkeys(p[2] for p in positions if p[2] and p[1] == province_level)) or (
         [province_hint] if province_hint else [])
     shown = [f"{p[0]}{p[3]}" for p in positions[:4]]
     if len(positions) > 4:
         shown.append(f"and {len(positions) - 4} more")
     position = "; ".join(shown)
-    where = f", {', '.join(provinces)}" if level == PROVINCIAL and provinces else ""
+    where = f", {', '.join(provinces)}" if level in (PROVINCIAL, LOCAL) and provinces else ""
     remarks = "; ".join(x for x in [position, ("Father/Husband: " + father) if father else "",
                                     ("CNIC: " + cnic) if cnic else "", extra, ("Source: " + source) if source else ""] if x)
     return Record(
         list=PEP_LABEL, id=rid, primary=names[0], type="Individual",
         programs=f"PEP, {level}{where}" if level else "PEP",
         dob=dob, nationality="Pakistan", listed_on="", remarks=remarks, names=names, source_key="pep",
-        cnic=cnic, father=father, province=provinces[0] if (level == PROVINCIAL and provinces) else "",
+        cnic=cnic, father=father, province=provinces[0] if (level in (PROVINCIAL, LOCAL) and provinces) else "",
         pep_level=level, position=position,
     )
 
@@ -179,8 +224,10 @@ def records_from_snapshot(snapshot: dict, today: date | None = None,
         for pos in person.get("positions", []):
             c = classify_position(pos.get("label"))
             if not c:
-                unclassified += 1
                 lab = str(pos.get("label") or "")
+                if mentions_excluded_country(lab):
+                    continue            # another country's office: left out on purpose, not reported
+                unclassified += 1
                 unknown[lab] = unknown.get(lab, 0) + 1
                 continue
             if not _within_lookback(pos.get("end"), today, years):
@@ -202,6 +249,8 @@ def records_from_snapshot(snapshot: dict, today: date | None = None,
         if k in have_names or _key(pol.get("name", ""), str(pol.get("dob") or "")) in have:
             continue
         party = str(pol.get("party") or "")
+        if mentions_excluded_country(party):
+            party = ""
         rec = _make_record("PEP-WD-" + str(pol.get("id", "")), [pol.get("name", "")],
                            [("Politician" + (f" ({party})" if party else ""), POLITICAL, "", "")],
                            dob=str(pol.get("dob") or "")[:10], source="Wikidata " + str(pol.get("id", "")))
@@ -219,6 +268,8 @@ def records_from_snapshot(snapshot: dict, today: date | None = None,
                 continue
             seat = str(m.get("constituency") or "")
             party = str(m.get("party") or "")
+            if mentions_excluded_country(seat, party):
+                seat, party = ("" if mentions_excluded_country(seat) else seat), ("" if mentions_excluded_country(party) else party)
             label = f"Member, {asm.get('label', 'assembly')}" + (
                 f" ({', '.join(x for x in (seat, party) if x)})" if seat or party else "")
             rec = _make_record("PEP-ASM-" + asm.get("key", "") + "-" + re.sub(r"\W+", "", names[0])[:30], names,
