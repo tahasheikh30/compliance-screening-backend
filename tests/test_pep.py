@@ -34,6 +34,18 @@ from tests.conftest import API_HEADERS, USER_HEADERS
     ("Member of the District Council Peshawar", ("Local", "Khyber Pakhtunkhwa")),
     ("councillor in the district council of Swat", ("Local", "Khyber Pakhtunkhwa")),
     ("councillor in the district council of Mardan", ("Local", "Khyber Pakhtunkhwa")),
+    ("Member of the Islamabad Metropolitan Corporation", ("Local", "Islamabad Capital Territory")),
+    ("councillor in the district council of Jhang", ("Local", "Punjab")),
+    ("councillor in the district council of Nawabshah", ("Local", "Sindh")),
+    ("councillor in the municipal corporation of Bahawalpur", ("Local", "Punjab")),
+    ("councillor in the district council of Jamshoro", ("Local", "Sindh")),
+    ("councillor in the district council of Rahim Yar Khan", ("Local", "Punjab")),
+    ("councillor in the district council of Sheikhupura", ("Local", "Punjab")),
+    ("councillor in the district council of Kasur", ("Local", "Punjab")),
+    ("Mayor of Karachi", ("Local", "Sindh")),
+    ("Member of the Hyderabad Municipal Corporation, Sindh", ("Local", "Sindh")),
+    ("Member of the Greater Hyderabad Municipal Corporation", None),
+    ("Mayor of London", None),
     ("Member of the Parliament of Bangladesh", None),
     ("Member of the Dhaka North City Corporation, Bangladesh", None),
     ("Member of the Municipal Corporation of Delhi", None),
@@ -762,3 +774,15 @@ def test_uploaded_pep_row_naming_bangladesh_is_dropped():
                                         "B Khan,Member of the District Council Peshawar\n")
     assert [r.primary for r in records] == ["B Khan"] and records[0].pep_level == "Local"
     assert all("Bangladesh" not in r.remarks for r in records)
+
+
+def test_snapshot_reports_how_many_peps_were_counted_per_level():
+    snap = {"people": [
+        {"id": "Q1", "name": "A One", "positions": [{"label": "Senator"}]},
+        {"id": "Q2", "name": "B Two", "positions": [{"label": "Member of the Provincial Assembly of the Punjab"}]},
+        {"id": "Q3", "name": "C Three", "positions": [{"label": "councillor in the district council of Kasur"}]},
+        {"id": "Q4", "name": "D Four", "positions": [{"label": "Member of the Municipal Corporation of Delhi"}]},
+    ]}
+    recs, info = pep.records_from_snapshot(snap, date(2026, 10, 13), lookback_years=-1)
+    assert info["by_level"] == {"National": 1, "Provincial": 1, "Local": 1}
+    assert info["top_unclassified"] == ["Member of the Municipal Corporation of Delhi"]

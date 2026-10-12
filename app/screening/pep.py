@@ -75,16 +75,67 @@ _PROVINCIAL_RULES = [re.compile(p, re.I) for p in (
 )]
 
 
-# Local government: a member or councillor of a metropolitan or municipal corporation or a district council. Only
-# the cities below are accepted, so "Municipal Corporation of Delhi" or a Bangladeshi city never becomes a PEP office.
-_CITY_PROVINCE = {
-    "lahore": "Punjab", "faisalabad": "Punjab", "multan": "Punjab", "rawalpindi": "Punjab", "gujranwala": "Punjab",
-    "karachi": "Sindh", "hyderabad": "Sindh", "sukkur": "Sindh", "larkana": "Sindh",
-    "peshawar": "Khyber Pakhtunkhwa", "swat": "Khyber Pakhtunkhwa", "mardan": "Khyber Pakhtunkhwa",
-    "abbottabad": "Khyber Pakhtunkhwa", "quetta": "Balochistan",
+# Local government: a member, councillor or mayor of a metropolitan or municipal corporation, city, town, tehsil or
+# union council, municipal committee, cantonment board or district council. The label must also name a Pakistani
+# city or district from the lists below, so "Municipal Corporation of Delhi" or a Bangladeshi city is never a PEP
+# office. A place that is missing here is left out and shows in the "not counted" note on the Lists page, so it can
+# be added.
+_PLACES = {
+    "Punjab": (
+        "lahore faisalabad multan rawalpindi gujranwala sialkot sargodha bahawalpur sahiwal okara kasur sheikhupura "
+        "nankana sahib jhang chiniot toba tek singh khanewal vehari lodhran pakpattan bahawalnagar rahim yar khan "
+        "dera ghazi khan muzaffargarh layyah rajanpur mianwali bhakkar khushab jhelum chakwal attock gujrat "
+        "mandi bahauddin hafizabad narowal murree taxila wah"),
+    "Sindh": (
+        "karachi sukkur larkana nawabshah shaheed benazirabad jamshoro thatta badin dadu mirpur khas umerkot "
+        "tharparkar tando allahyar tando muhammad khan matiari sanghar khairpur ghotki shikarpur jacobabad kashmore "
+        "kambar shahdadkot naushahro feroze sujawal korangi malir keamari"),
+    "Khyber Pakhtunkhwa": (
+        "peshawar mardan swat abbottabad kohat bannu nowshera charsadda swabi mansehra haripur upper dir lower dir "
+        "chitral buner shangla malakand hangu karak lakki marwat dera ismail khan battagram kohistan torghar "
+        "orakzai kurram mohmand bajaur waziristan khyber mingora"),
+    "Balochistan": (
+        "quetta gwadar turbat khuzdar sibi zhob loralai chaman pishin kalat mastung nasirabad jaffarabad kharan "
+        "lasbela awaran panjgur hub"),
+    "Islamabad Capital Territory": "islamabad",
+    "Gilgit-Baltistan": "gilgit skardu hunza ghizer diamer astore",
+    "Azad Jammu and Kashmir": "muzaffarabad kotli rawalakot bhimber neelum",
 }
-_LOCAL_BODY = re.compile(r"\b(metropolitan|municipal) corporation\b|\bdistrict council\b|\bcity council\b", re.I)
-_CITY_NAMES = re.compile(r"\b(" + "|".join(_CITY_PROVINCE) + r")\b", re.I)
+# multi-word names are listed with their words together above, so they are read from this explicit set
+_MULTI = {"nankana sahib", "toba tek singh", "rahim yar khan", "dera ghazi khan", "mandi bahauddin", "shaheed benazirabad",
+          "mirpur khas", "tando allahyar", "tando muhammad khan", "kambar shahdadkot", "naushahro feroze", "upper dir",
+          "lower dir", "lakki marwat", "dera ismail khan"}
+
+
+def _place_table() -> dict:
+    table = {}
+    for province, names in _PLACES.items():
+        words = names.split()
+        i = 0
+        while i < len(words):
+            for n in (3, 2):        # a multi-word name first
+                cand = " ".join(words[i:i + n])
+                if cand in _MULTI:
+                    table[cand] = province
+                    i += n
+                    break
+            else:
+                table[words[i]] = province
+                i += 1
+    return table
+
+
+_CITY_PROVINCE = _place_table()
+_LOCAL_BODY = re.compile(
+    r"\b(metropolitan|municipal|city|town|tehsil|union|district|cantonment) (corporation|council|committee|board)\b"
+    r"|\b(deputy )?mayor\b", re.I)
+_CITY_NAMES = re.compile(r"\b(" + "|".join(sorted(map(re.escape, _CITY_PROVINCE), key=len, reverse=True)) + r")\b", re.I)
+# names shared with places in other countries: accepted only when the label also says Sindh or Pakistan
+_AMBIGUOUS = {"hyderabad": "Sindh", "mirpur": "Azad Jammu and Kashmir"}
+_AMBIGUOUS_NAMES = re.compile(r"\b(" + "|".join(_AMBIGUOUS) + r")\b", re.I)
+_PAKISTAN_HINT = re.compile(r"\b(pakistan|sindh|azad (jammu|kashmir)|ajk)\b", re.I)
+_FOREIGN = re.compile(r"\b(india|indian|delhi|telangana|andhra|maharashtra|gujarat|uttar pradesh|afghanistan|iran|"
+                      r"united kingdom|london|england)\b", re.I)
 
 # Offices of these countries are not PEP offices for this list, even for a person who is Pakistani on Wikidata.
 _EXCLUDED_COUNTRIES = re.compile(r"\bbangladesh(i)?\b", re.I)
@@ -120,10 +171,13 @@ def classify_position(label: str) -> tuple | None:
     if any(r.search(text) for r in _NATIONAL_RULES[2:]):
         return NATIONAL, ""
     # a member or councillor of a city corporation or district council of a known Pakistani city
-    if _LOCAL_BODY.search(text):
+    if _LOCAL_BODY.search(text) and not _FOREIGN.search(text):
         city = _CITY_NAMES.search(text)
         if city:
             return LOCAL, _CITY_PROVINCE[city.group(1).lower()]
+        amb = _AMBIGUOUS_NAMES.search(text)
+        if amb and _PAKISTAN_HINT.search(text):
+            return LOCAL, _AMBIGUOUS[amb.group(1).lower()]
     return None
 
 
@@ -279,7 +333,11 @@ def records_from_snapshot(snapshot: dict, today: date | None = None,
                 records.append(rec)
                 have_names.add(k)
                 members += 1
+    by_level = {}
+    for r in records:
+        by_level[r.pep_level or POLITICAL] = by_level.get(r.pep_level or POLITICAL, 0) + 1
     return records, {"people": len(snapshot.get("people", [])), "politicians": politicians, "assembly_members": members,
+                     "by_level": by_level,
                      "unclassified_positions": unclassified,
                      "expired_positions": expired,
                      "top_unclassified": sorted(unknown, key=lambda k: -unknown[k])[:15]}
