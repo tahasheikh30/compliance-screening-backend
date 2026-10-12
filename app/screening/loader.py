@@ -626,6 +626,9 @@ def _load_pep() -> GroupData:
         parts = [f"{levels[k]:,} {k.lower()}" for k in ("National", "Provincial", "Local", "Political figure") if levels.get(k)]
         if parts:
             entry["note"] = "Counted as PEPs: " + ", ".join(parts) + "."
+            if info.get("politicians_now_with_office"):
+                entry["note"] += (f" {info['politicians_now_with_office']:,} people Wikidata lists as politicians "
+                                  "are counted through a recorded office, not as political figures.")
         if info.get("top_unclassified"):
             entry["note"] = (entry.get("note", "") + " Positions not counted as PEP offices (most common): "
                              + "; ".join(info["top_unclassified"][:15])).strip()

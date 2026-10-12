@@ -126,6 +126,14 @@ def _place_table() -> dict:
 
 
 _CITY_PROVINCE = _place_table()
+# other spellings Wikidata uses for the same places ("councillor in the municipal corporation of Sukkar")
+_CITY_PROVINCE.update({
+    "sukkar": "Sindh", "mirpurkhas": "Sindh", "naushehro feroze": "Sindh", "nowshero feroze": "Sindh",
+    "shaikhupura": "Punjab", "sheikhupura": "Punjab", "lyallpur": "Punjab", "d.g. khan": "Punjab", "dg khan": "Punjab",
+    "d.i. khan": "Khyber Pakhtunkhwa", "di khan": "Khyber Pakhtunkhwa", "nowshehra": "Khyber Pakhtunkhwa",
+    "charsada": "Khyber Pakhtunkhwa", "abbotabad": "Khyber Pakhtunkhwa",
+    "jafarabad": "Balochistan", "lasbella": "Balochistan",
+})
 _LOCAL_BODY = re.compile(
     r"\b(metropolitan|municipal|city|town|tehsil|union|district|cantonment) (corporation|council|committee|board)\b"
     r"|\b(deputy )?mayor\b", re.I)
@@ -176,7 +184,9 @@ def classify_position(label: str) -> tuple | None:
         if city:
             return LOCAL, _CITY_PROVINCE[city.group(1).lower()]
         amb = _AMBIGUOUS_NAMES.search(text)
-        if amb and _PAKISTAN_HINT.search(text):
+        # "Hyderabad Municipal Corporation" on a Pakistani citizen is Sindh's; "Greater Hyderabad" is India's
+        if amb and (_PAKISTAN_HINT.search(text)
+                    or (amb.group(1).lower() == "hyderabad" and not re.search(r"\bgreater\b", text, re.I))):
             return LOCAL, _AMBIGUOUS[amb.group(1).lower()]
     return None
 
@@ -297,10 +307,11 @@ def records_from_snapshot(snapshot: dict, today: date | None = None,
     # people Wikidata knows as politicians but with no office on record
     have = {_key(r.primary, r.dob) for r in records}
     have_names = {_key(r.primary, "") for r in records}
-    politicians = 0
+    politicians, upgraded = 0, 0
     for pol in snapshot.get("politicians", []):
         k = _key(pol.get("name", ""), "")
         if k in have_names or _key(pol.get("name", ""), str(pol.get("dob") or "")) in have:
+            upgraded += 1       # already a PEP through a recorded office: no longer just a "political figure"
             continue
         party = str(pol.get("party") or "")
         if mentions_excluded_country(party):
@@ -337,7 +348,7 @@ def records_from_snapshot(snapshot: dict, today: date | None = None,
     for r in records:
         by_level[r.pep_level or POLITICAL] = by_level.get(r.pep_level or POLITICAL, 0) + 1
     return records, {"people": len(snapshot.get("people", [])), "politicians": politicians, "assembly_members": members,
-                     "by_level": by_level,
+                     "by_level": by_level, "politicians_now_with_office": upgraded,
                      "unclassified_positions": unclassified,
                      "expired_positions": expired,
                      "top_unclassified": sorted(unknown, key=lambda k: -unknown[k])[:15]}
