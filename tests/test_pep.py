@@ -27,6 +27,16 @@ from tests.conftest import API_HEADERS, USER_HEADERS
     ("Speaker of the Provincial Assembly of Balochistan", ("Provincial", "Balochistan")),
     ("Minister of Education (Punjab)", ("Provincial", "Punjab")),
     ("Member of the Legislative Assembly of Gilgit-Baltistan", ("Provincial", "Gilgit-Baltistan")),
+    ("Member of the Metropolitan Corporation Lahore", ("Local", "Punjab")),
+    ("Member of the Karachi Metropolitan Corporation", ("Local", "Sindh")),
+    ("Member of the Faisalabad Municipal Corporation", ("Local", "Punjab")),
+    ("Member of the Municipal Corporation Multan", ("Local", "Punjab")),
+    ("Member of the District Council Peshawar", ("Local", "Khyber Pakhtunkhwa")),
+    ("councillor in the district council of Swat", ("Local", "Khyber Pakhtunkhwa")),
+    ("councillor in the district council of Mardan", ("Local", "Khyber Pakhtunkhwa")),
+    ("Member of the Parliament of Bangladesh", None),
+    ("Member of the Dhaka North City Corporation, Bangladesh", None),
+    ("Member of the Municipal Corporation of Delhi", None),
     ("captain of Pakistan cricket team", None),
     ("Chief Minister of Gujarat", None),
     ("Governor of Reserve Bank of India", None),
@@ -713,3 +723,42 @@ def test_the_full_error_text_is_kept_not_cut_at_140_characters():
                        "/members/listing/en/22?byname=true&limit=all (Caused by " + cause + ")")
     text = pa._why(exc)
     assert len(text) > 140 and "connect timeout=30" in text and text.endswith("))")
+
+
+# ---- local government offices, and nothing from Bangladesh ----------------------
+
+def test_local_office_makes_a_local_pep_and_the_higher_level_wins():
+    snap = {"people": [
+        {"id": "Q1", "name": "Aslam Lahori", "positions": [{"label": "Member of the Metropolitan Corporation Lahore"}]},
+        {"id": "Q2", "name": "Bashir Senator", "positions": [{"label": "Member of the Municipal Corporation Multan"},
+                                                              {"label": "Senator"}]},
+    ]}
+    recs, info = pep.records_from_snapshot(snap, date(2026, 10, 13), lookback_years=-1)
+    by = {r.primary: r for r in recs}
+    assert by["Aslam Lahori"].pep_level == "Local" and by["Aslam Lahori"].province == "Punjab"
+    assert by["Aslam Lahori"].programs == "PEP, Local, Punjab"
+    assert by["Bashir Senator"].pep_level == "National"
+    assert info["unclassified_positions"] == 0
+
+
+def test_no_bangladesh_data_reaches_a_pep_record():
+    snap = {"people": [
+        {"id": "Q3", "name": "Only Dhaka", "positions": [{"label": "Member of the Parliament of Bangladesh"}]},
+        {"id": "Q4", "name": "Both Countries", "positions": [{"label": "Member of the Parliament of Bangladesh"},
+                                                             {"label": "Member of the National Assembly of Pakistan"}]},
+    ], "politicians": [{"id": "Q5", "name": "Odd Party", "party": "Bangladesh Nationalist Party"}]}
+    recs, info = pep.records_from_snapshot(snap, date(2026, 10, 13), lookback_years=-1)
+    names = {r.primary for r in recs}
+    assert "Only Dhaka" not in names
+    assert all(not pep.mentions_excluded_country(r.position, r.remarks, r.programs) for r in recs)
+    both = next(r for r in recs if r.primary == "Both Countries")
+    assert both.pep_level == "National" and "Bangladesh" not in both.remarks
+    # an excluded office is left out on purpose and is not listed as a position that was missed
+    assert not any("Bangladesh" in x for x in info["top_unclassified"])
+
+
+def test_uploaded_pep_row_naming_bangladesh_is_dropped():
+    records, _ = pep.parse_pep_persons("Name,Position\nA Khan,Member of the Parliament of Bangladesh\n"
+                                        "B Khan,Member of the District Council Peshawar\n")
+    assert [r.primary for r in records] == ["B Khan"] and records[0].pep_level == "Local"
+    assert all("Bangladesh" not in r.remarks for r in records)
