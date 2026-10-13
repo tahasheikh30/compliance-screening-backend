@@ -515,7 +515,7 @@ def test_official_sources_are_used_without_wikipedia_and_pending_ones_are_report
     assert [a["key"] for a in assemblies] == ["kp_official"]
     by = {r["key"]: r for r in report}
     assert by["kp_official"]["count"] == 14 and by["senate_official"]["error"]
-    assert "not set up" in by["gb_official"]["error"] and by["punjab_official"]["error"]
+    assert "not set up" in by["ajk_official"]["error"] and by["punjab_official"]["error"] and by["gb_official"]["error"]
 
 
 def test_extra_sources_add_and_replace_official_entries(monkeypatch):
@@ -863,3 +863,48 @@ def test_bare_hyderabad_needs_pakistani_context():
 ])
 def test_short_place_names_need_the_local_body_beside_them(label, expected):
     assert pep.classify_position(label) == expected
+
+
+# ---- Gilgit-Baltistan Assembly website ----------------------------------------
+
+_GB_PAGE = """<table><tr><th>Tenure</th><th>Member Name</th><th>Political Party</th><th>Constituency</th><th>Seat Type</th><th>District</th></tr>
+<tr><td>2023-2025</td><td>Jamil Ahmad</td><td>Pakistan Peoples Party</td><td>GBA-2 Gilgit-II</td><td>General</td><td>Gilgit</td></tr>
+<tr><td>2020-2025</td><td>Amina Bibi</td><td>Pakistan Muslim League (N)</td><td>Women</td><td>Reserved</td><td>Skardu</td></tr>
+<tr><td>2009-2014</td><td>Old Member Khan</td><td>Independent</td><td>GBA-5</td><td>General</td><td>Diamer</td></tr>
+<tr><td>2021 - Till Date</td><td>Present Member Shah</td><td>PTI</td><td>GBA-7</td><td>General</td><td>Hunza</td></tr>
+<tr><td></td><td>No Tenure Given</td><td>PTI</td><td>GBA-8</td><td>General</td><td>Ghizer</td></tr></table>"""
+
+
+def test_gilgit_baltistan_site_is_an_official_source_and_no_longer_pending():
+    from app.screening import pep_assemblies as pa
+    official, pending = pa.official_sources()
+    gb = next(s for s in official if s["key"] == "gb_official")
+    assert gb["url"] == "https://gba.gov.pk/members/" and gb["province"] == "Gilgit-Baltistan" and gb["level"] == pep.PROVINCIAL
+    assert all(p["key"] != "gb_official" for p in pending)
+
+
+def test_gb_member_table_is_read_and_members_who_left_office_long_ago_are_dropped():
+    from app.screening import pep_assemblies as pa
+    got = pa.members_from_html(_GB_PAGE, today=date(2026, 10, 13))
+    names = [m["name"] for m in got]
+    assert names == ["Jamil Ahmad", "Amina Bibi", "Present Member Shah", "No Tenure Given"]   # 2009-2014 is dropped
+    assert got[0]["party"] == "Pakistan Peoples Party" and got[0]["constituency"] == "GBA-2 Gilgit-II"
+
+
+def test_tenure_reading_never_drops_on_a_guess():
+    from app.screening import pep_assemblies as pa
+    t = date(2026, 10, 13)
+    assert pa._tenure_is_recent("2023-2025", t) and pa._tenure_is_recent("2021 - present", t)
+    assert pa._tenure_is_recent("", t) and pa._tenure_is_recent("Fifth term", t)
+    assert not pa._tenure_is_recent("2009-2014", t)
+
+
+def test_fetch_reads_the_gb_site_and_reports_it(monkeypatch):
+    from app.screening import pep_assemblies as pa
+    rows = "".join(f"<tr><td>2020-2025</td><td>Member Number{chr(65 + i)} Khan</td><td>PPP</td><td>GBA-{i + 1}</td><td>General</td><td>Gilgit</td></tr>"
+                   for i in range(12))
+    page = _GB_PAGE.split("</table>")[0].split("<tr><td>2023")[0] + rows + "</table>"
+    src = next(s for s in pa.OFFICIAL_SOURCES if s["key"] == "gb_official")
+    assemblies, report = pa.fetch_assemblies(lambda url, params: page, "", sources=[], official=[src])
+    assert report[0]["count"] == 12 and not report[0]["error"] and report[0]["province"] == "Gilgit-Baltistan"
+    assert assemblies[0]["members"][0]["name"] == "Member NumberA Khan"
