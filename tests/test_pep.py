@@ -60,7 +60,8 @@ from tests.conftest import API_HEADERS, USER_HEADERS
     ("", None),
 ])
 def test_classify_position(label, expected):
-    assert pep.classify_position(label) == expected
+    # as the Wikidata path calls it: everyone fetched there holds Pakistani citizenship
+    assert pep.classify_position(label, pakistani=True) == expected
 
 
 # ---- the administrator's file --------------------------------------------------
@@ -812,3 +813,53 @@ def test_level_words_keep_national_and_provincial_before_local():
     assert pep._level_from_text("Municipal Corporation") == pep.LOCAL
     assert pep._level_from_text("District Council") == pep.LOCAL
     assert pep._level_from_text("") == ""
+
+
+# ---- review points: left-out records are reported, Hyderabad needs Pakistani context, short place names ----
+
+def test_records_left_out_for_naming_bangladesh_are_counted():
+    snap = {"people": [
+        {"id": "Q3", "name": "Only Dhaka", "positions": [{"label": "Member of the Parliament of Bangladesh"}]},
+        {"id": "Q4", "name": "Both", "positions": [{"label": "Member of the Parliament of Bangladesh"}, {"label": "Senator"}]},
+    ]}
+    _, info = pep.records_from_snapshot(snap, date(2026, 10, 13), lookback_years=-1)
+    assert info["excluded_country"] == 1          # "Both" still has a Pakistani office and stays
+    _, up = pep.parse_pep_persons("Name,Position\nA Khan,Member of the Parliament of Bangladesh\nB Khan,Senator\n")
+    assert up["excluded_country"] == 1
+
+
+def test_load_pep_tells_the_admin_how_many_were_left_out(monkeypatch):
+    from app.screening import loader
+    snap = {"fetched_at": "2026-10-13", "people": [
+        {"id": "Q3", "name": "Only Dhaka", "positions": [{"label": "Member of the Parliament of Bangladesh"}]},
+        {"id": "Q4", "name": "Real Senator", "positions": [{"label": "Senator"}]}]}
+    monkeypatch.setattr(loader, "_wikidata_snapshot", lambda: (snap, None))
+    monkeypatch.setattr(loader, "db_pep", lambda kind: None)
+    data = loader._load_pep()
+    note = " ".join(x.get("note", "") for x in data.meta)
+    assert "1 people left out" in note and "Bangladesh" in note
+
+
+def test_bare_hyderabad_needs_pakistani_context():
+    label = "Hyderabad Municipal Corporation councillor"
+    assert pep.classify_position(label) is None                              # e.g. an uploaded row: could be India's
+    assert pep.classify_position(label, pakistani=True) == ("Local", "Sindh")
+    assert pep.classify_position("Hyderabad Municipal Corporation, Sindh") == ("Local", "Sindh")
+    assert pep.classify_position("Hyderabad Municipal Corporation, Pakistan") == ("Local", "Sindh")
+    assert pep.classify_position("Greater Hyderabad Municipal Corporation", pakistani=True) is None
+    assert pep.classify_position("Hyderabad Municipal Corporation India", pakistani=True) is None
+
+
+@pytest.mark.parametrize("label,expected", [
+    ("Mayor of Wah Cantonment", None),                         # bare "Mayor of ..." with only a wordy name is not enough
+    ("Wah Cantonment Board member", ("Local", "Punjab")),
+    ("Member of the Municipal Committee of Chaman", ("Local", "Balochistan")),
+    ("Hub Town Committee member", ("Local", "Balochistan")),
+    ("Member of the district council of Swat", ("Local", "Khyber Pakhtunkhwa")),
+    ("Union Council chairman of Swat", ("Local", "Khyber Pakhtunkhwa")),
+    ("City council member, Wah, Ohio", None),                  # ambiguous name, no body next to it and no Pakistan
+    ("Union council member, Hub Chemicals Ltd", None),
+    ("Wah Pakistan Municipal Committee member", ("Local", "Punjab")),
+])
+def test_short_place_names_need_the_local_body_beside_them(label, expected):
+    assert pep.classify_position(label) == expected
