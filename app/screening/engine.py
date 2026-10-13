@@ -332,8 +332,12 @@ def overall_status(statuses: dict, fia_required: bool = True, nacta_required: bo
     exceptions are the FIA Red Book (FIA_REQUIRED=false, which mirrors the workflow where
     that list is optional) and NACTA (NACTA_REQUIRED=false).
     """
-    # SKIPPED (a list the analyst switched off) neither blocks nor clears: it is shown on the case as not screened
-    statuses = {k: v for k, v in statuses.items() if v != "SKIPPED"}
+    # SKIPPED (a list the analyst switched off) neither blocks nor clears: the verdict comes from the lists that were
+    # checked, and the case says which were not. If every list is off nothing was checked, so it is never clear.
+    checked = {k: v for k, v in statuses.items() if v != "SKIPPED"}
+    if statuses and not checked:
+        return "MANUAL_REVIEW"
+    statuses = checked
     vals = list(statuses.values())
     if "HIT" in vals:
         return "ESCALATE_TO_COMPLIANCE"

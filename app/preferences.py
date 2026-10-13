@@ -2,9 +2,8 @@
 A person's own settings, stored as one validated JSON document in `user_preferences`.
 
   notifications  what the app tells them about: everything on or off, pop-ups on or off, and each kind of message
-  lists          the optional lists their own screenings leave out ("off"). Only the sources an operator allows
-                 people to switch off (USER_SWITCHABLE_SOURCES) can be listed: the core sanctions and watch lists
-                 can never be switched off by a person.
+  lists          the lists their own screenings leave out ("off"). Any source can be switched off by the person
+                 it is for; the case says which were not checked.
   screening      the match threshold they start from, and whether new screenings are monitored by default
   security       minutes without activity before they are signed out (never more than the 30 minute policy)
   display        the tab they open on, and how dense the tables are
@@ -79,8 +78,8 @@ class Preferences(_Strict):
 
 
 def switchable_sources() -> list:
-    """The sources a person may switch off for their own screenings (an operator setting)."""
-    return list(config.USER_SWITCHABLE_SOURCES)
+    """The sources a person may switch off for their own screenings (all of them)."""
+    return list(config.SWITCHABLE_SOURCES)
 
 
 def defaults() -> dict:

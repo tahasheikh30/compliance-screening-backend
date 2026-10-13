@@ -97,12 +97,9 @@ NACTA_MAX_AGE_DAYS = _float_env("NACTA_MAX_AGE_DAYS", 30)
 # Like the FIA Red Book: when true (the default), a NACTA list that is missing or out
 # of date sends an otherwise clear applicant to manual review.
 NACTA_REQUIRED = os.environ.get("NACTA_REQUIRED", "true").strip().lower() not in ("0", "false", "no")
-# The sources a person may switch off for their own screenings (Settings, Lists). Comma separated keys from UNSC, OFAC,
-# UKSL, FIA_REDBOOK, NACTA, PEP, ADVERSE_MEDIA. The default leaves the core sanctions and Pakistani watch lists
-# always on. A source that is switched off is shown as such on the case, and never counts as screened.
-_SWITCHABLE_ALL = ("UNSC", "OFAC", "UKSL", "FIA_REDBOOK", "NACTA", "PEP", "ADVERSE_MEDIA")
-USER_SWITCHABLE_SOURCES = tuple(k for k in (x.strip().upper() for x in os.environ.get("USER_SWITCHABLE_SOURCES", "UKSL,PEP,ADVERSE_MEDIA").split(","))
-                                if k in _SWITCHABLE_ALL)
+# Every source a person can switch off for their own screenings (Settings, Lists). A source that is switched off is
+# shown as such on the case, and never counts as screened.
+SWITCHABLE_SOURCES = ("UNSC", "OFAC", "UKSL", "FIA_REDBOOK", "NACTA", "PEP", "ADVERSE_MEDIA")
 
 
 # --- Politically exposed persons (PEPs), national and provincial ---------

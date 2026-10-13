@@ -553,8 +553,7 @@ def save_my_preferences(request: Request, body: dict = Body(...), user: AuthUser
     refused = [k for k in prefs["lists"]["off"] if k not in allowed]
     if refused:
         raise AppError(422, "LIST_CANNOT_BE_SWITCHED_OFF", "That list cannot be switched off.",
-                       "Only " + ", ".join(sorted(allowed)) + " can be switched off." if allowed else
-                       "This server does not allow any list to be switched off.")
+                       "Choose from " + ", ".join(sorted(allowed)) + ".")
     db.set_preferences(user.id, prefs)
     _audit(request, user, "preferences.update", "user", user.id, {"lists_off": prefs["lists"]["off"]})
     return PreferencesOut(preferences=prefs, switchable_sources=preferences.switchable_sources())
