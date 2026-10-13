@@ -41,7 +41,7 @@ def test_a_new_person_gets_the_defaults(client):
         "screening": True, "monitoring": True, "lists": True, "account": True, "admin": True}}
     assert p["lists"]["off"] == [] and p["screening"]["threshold"] is None
     assert p["security"]["idle_minutes"] == 30 and p["display"]["default_tab"] == "screen"
-    assert set(r["switchable_sources"]) == {"UKSL", "PEP", "ADVERSE_MEDIA"}
+    assert set(r["switchable_sources"]) == {"UNSC", "OFAC", "UKSL", "FIA_REDBOOK", "NACTA", "PEP", "ADVERSE_MEDIA"}
 
 
 def test_settings_are_saved_per_person(client):
@@ -72,11 +72,12 @@ def test_an_unknown_setting_is_refused(client):
     assert client.put("/api/account/preferences", json=prefs, headers=USER_HEADERS).status_code == 422
 
 
-def test_the_core_lists_cannot_be_switched_off(client):
-    for key in ("UNSC", "OFAC", "FIA_REDBOOK", "NACTA"):
-        r = _save(client, {"lists.off": [key]})
-        assert r.status_code == 422 and _code(r) == "LIST_CANNOT_BE_SWITCHED_OFF"
-    assert _prefs(client)["lists"]["off"] == []
+def test_every_list_can_be_switched_off_but_only_real_ones(client):
+    for key in ("UNSC", "OFAC", "FIA_REDBOOK", "NACTA", "UKSL", "PEP", "ADVERSE_MEDIA"):
+        assert _save(client, {"lists.off": [key]}).status_code == 200
+        assert _prefs(client)["lists"]["off"] == [key]
+    r = _save(client, {"lists.off": ["NOT_A_LIST"]})
+    assert r.status_code == 422 and _code(r) == "LIST_CANNOT_BE_SWITCHED_OFF"
 
 
 def test_settings_need_an_approved_account(client):
@@ -108,7 +109,7 @@ def test_a_list_that_is_switched_off_is_not_screened_and_says_so(client, monkeyp
     assert r.json()["overall_status"] == "AUTO_CLEAR"
 
 
-def test_switching_a_list_off_never_hides_a_sanctions_match(client):
+def test_a_hit_on_a_list_that_is_still_on_is_never_hidden(client):
     assert _save(client, {"lists.off": ["PEP", "ADVERSE_MEDIA", "UKSL"]}).status_code == 200
     r = client.post("/api/screen", json={"full_name": "Muhammad Ali Khan", "dob": "1975-03-04", "threshold": 90},
                     headers=USER_HEADERS)
@@ -124,6 +125,9 @@ def test_the_engine_never_counts_a_switched_off_list_as_clear():
     assert engine.overall_status(only_skipped) == "AUTO_CLEAR"          # does not block, and the row says not screened
     assert engine.overall_status({**only_skipped, "UNSC": "ERROR"}) == "MANUAL_REVIEW"
     assert engine.overall_status({**only_skipped, "OFAC": "HIT"}) == "ESCALATE_TO_COMPLIANCE"
+    # a core list can be off too: the rest decide, but with every list off nothing was checked, so it is never clear
+    assert engine.overall_status({"UNSC": "SKIPPED", "OFAC": "CLEAR", "FIA_REDBOOK": "CLEAR", "NACTA": "CLEAR"}) == "AUTO_CLEAR"
+    assert engine.overall_status({k: "SKIPPED" for k in only_skipped}) == "MANUAL_REVIEW"
 
 
 def test_the_screening_audit_entry_records_which_lists_were_off(client, storage):
