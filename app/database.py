@@ -366,6 +366,24 @@ def delete_profile(user_id) -> dict | None:
         return _clean(cur)
 
 
+def get_preferences(user_id):
+    """The stored settings document of a person, or None when they have never saved any."""
+    if not user_id:
+        return None
+    with pool().connection() as conn:
+        row = conn.execute("SELECT prefs FROM user_preferences WHERE user_id = %s", (user_id,)).fetchone()
+    return row["prefs"] if row else None
+
+
+def set_preferences(user_id, prefs: dict) -> None:
+    from psycopg.types.json import Jsonb
+    with pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO user_preferences (user_id, prefs, updated_at) VALUES (%s, %s, now()) "
+            "ON CONFLICT (user_id) DO UPDATE SET prefs = EXCLUDED.prefs, updated_at = now()",
+            (user_id, Jsonb(prefs)))
+
+
 def is_deleted_user(user_id) -> bool:
     with pool().connection() as conn:
         return conn.execute("SELECT 1 FROM deleted_users WHERE id = %s", (user_id,)).fetchone() is not None

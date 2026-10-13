@@ -238,3 +238,13 @@ ALTER TABLE monitoring_state  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE deleted_users     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE batches           ENABLE ROW LEVEL SECURITY;
 ALTER TABLE batch_rows        ENABLE ROW LEVEL SECURITY;
+
+-- Each person's own settings (notifications, which optional lists their screenings use, default threshold, idle
+-- sign out time, display). One validated JSON document per person (see app/preferences.py). It is removed with the
+-- account. Nothing here is applicant data.
+CREATE TABLE IF NOT EXISTS user_preferences (
+    user_id     uuid PRIMARY KEY REFERENCES profiles (id) ON DELETE CASCADE,
+    prefs       jsonb NOT NULL DEFAULT '{}'::jsonb,
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE user_preferences ENABLE ROW LEVEL SECURITY;
