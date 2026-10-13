@@ -308,6 +308,17 @@ def test_cors_preflight_for_the_app_headers_is_allowed(client):
     assert "x-api-key" in allowed and "authorization" in allowed
 
 
+def test_cors_preflight_allows_every_method_the_app_uses(client):
+    # Saving settings is the app's only PUT. A preflight that refuses it makes the browser report "Could not reach
+    # the backend" even though the server is fine.
+    for method in ("GET", "POST", "PUT", "DELETE"):
+        r = client.options("/api/account/preferences", headers={
+            "Origin": "http://localhost:5173", "Access-Control-Request-Method": method,
+            "Access-Control-Request-Headers": "authorization,content-type,x-api-key,x-request-id"})
+        assert r.status_code == 200, method
+        assert method in r.headers["access-control-allow-methods"]
+
+
 def test_a_non_ascii_app_key_is_a_clean_401_not_a_500(client):
     r = client.get("/api/applicants", headers=[(b"x-api-key", "café-key".encode("latin-1")),
                                                (b"authorization", _token_only(USER_ID)["Authorization"].encode())])
