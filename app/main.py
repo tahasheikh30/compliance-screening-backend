@@ -63,10 +63,11 @@ from datetime import datetime, timezone
 from typing import Literal
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import Response
+from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
 
 from app import database as db
@@ -75,13 +76,14 @@ from app import evidence
 from app import config as app_config
 from app import auth
 from app import batch as batch_runner
+from app import preferences
 from app import supabase_admin
 from app import batch_files
 from app import monitoring
 from app.auth import AuthUser, require_admin, require_admin_or_service_key, require_approved
 from app.config import FIA_REQUIRED, NACTA_REQUIRED, PEP_REQUIRED, PRELOAD_LISTS
 from app.errors import AppError, configure_logging, install as install_error_handlers, request_context, logger
-from app.schemas import (AlertDecisionIn, AlertOut, ApplicantSummary, AuditEntryOut, AuditPageOut, AuditVerifyOut,
+from app.schemas import (AccountChangedOut, AccountDeleteIn, PreferencesOut, AlertDecisionIn, AlertOut, ApplicantSummary, AuditEntryOut, AuditPageOut, AuditVerifyOut,
                          BatchOut, BatchRowOut, MeOut,
                          CoverageIn, CoverageOut, CoverageRowOut, HistoryClearedOut, ReviewIn, ReviewOut, MonitoredPersonOut, MonitoringIn, MonitoringOut, MonitoringStatusOut, SourceMonitoringOut, ScreenRequest, ScreenResponse, ScreeningResultOut, UserDeletedOut, UserOut,
                          UserRoleIn, UserStatusIn)
@@ -238,7 +240,10 @@ def _screen_one(req: ScreenRequest, user: AuthUser, request: Request | None = No
     (which has no request: it runs in a background thread, so the audit entry carries the batch id instead).
     """
     now = datetime.now(timezone.utc)
-    threshold = engine.resolve_threshold(req.threshold)
+    prefs = preferences.load(db.get_preferences(user.id)) if user.id else preferences.defaults()
+    # a threshold the form did not send is the person's own default (Settings), then the server's
+    threshold = engine.resolve_threshold(req.threshold if req.threshold is not None else prefs["screening"]["threshold"])
+    skipped = frozenset(prefs["lists"]["off"])      # optional lists this person switched off in Settings
     try:
         engine.check_screenable(req.full_name)   # the request model already checked; this is the safety net
     except engine.UnscreenableName as exc:
@@ -250,7 +255,7 @@ def _screen_one(req: ScreenRequest, user: AuthUser, request: Request | None = No
 
     result = engine.screen(req.full_name, req.dob or "", req.nationality or "", threshold,
                            cnic=req.cnic or "", father_name=req.father_name or "",
-                           province=req.province or "")
+                           province=req.province or "", skip=skipped)
 
     statuses: dict = {}
     rows: list = []
@@ -294,6 +299,7 @@ def _screen_one(req: ScreenRequest, user: AuthUser, request: Request | None = No
                {"batch_id": batch_id} if batch_id is not None else None)
     _audit(request, user, "screening.run", "applicant", applicant_id,
            {"overall_status": overall, "threshold": threshold, "sanctions_hits": result["sanctions_hit_count"],
+            **({"lists_off": sorted(skipped)} if skipped else {}),
             "media_hits": result["media_hit_count"], "pep_hits": result["pep_hit_count"], "evidence": bool(evidence_pdf),
             **({"batch_id": batch_id} if batch_id is not None else {})})
     results_out = [
@@ -513,6 +519,109 @@ def clear_my_history(request: Request, user: AuthUser = Depends(require_approved
     out = db.clear_history(user.id)
     _audit(request, user, "history.clear", "user", user.id, out)
     return HistoryClearedOut(**out)
+
+
+# --------------------------------------------------------------------------
+# A person's own settings, and switching off or deleting their own account
+# --------------------------------------------------------------------------
+
+@app.get("/api/account/preferences", response_model=PreferencesOut)
+@limiter.limit("60/minute")
+def get_my_preferences(request: Request, user: AuthUser = Depends(require_approved)):
+    """The signed in person's settings (defaults for anything they have not changed)."""
+    return PreferencesOut(preferences=preferences.load(db.get_preferences(user.id)),
+                          switchable_sources=preferences.switchable_sources())
+
+
+@app.put("/api/account/preferences", response_model=PreferencesOut)
+@limiter.limit("60/minute")
+def save_my_preferences(request: Request, body: dict = Body(...), user: AuthUser = Depends(require_approved)):
+    """
+    Save the signed in person's settings (the whole document). Refused with 422 when a value is not one of the
+    allowed choices, or when it switches off a list that this server does not let people switch off.
+    """
+    if not user.id:
+        raise HTTPException(400, "This sign in has no personal settings")
+    try:
+        prefs = preferences.Preferences.model_validate(body).model_dump()
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        where = ".".join(str(x) for x in first["loc"])
+        raise AppError(422, "PREFERENCES_INVALID", f"A setting is not valid ({where}).",
+                       "Reload the page and try again.") from None
+    allowed = set(preferences.switchable_sources())
+    refused = [k for k in prefs["lists"]["off"] if k not in allowed]
+    if refused:
+        raise AppError(422, "LIST_CANNOT_BE_SWITCHED_OFF", "That list cannot be switched off.",
+                       "Only " + ", ".join(sorted(allowed)) + " can be switched off." if allowed else
+                       "This server does not allow any list to be switched off.")
+    db.set_preferences(user.id, prefs)
+    _audit(request, user, "preferences.update", "user", user.id, {"lists_off": prefs["lists"]["off"]})
+    return PreferencesOut(preferences=prefs, switchable_sources=preferences.switchable_sources())
+
+
+@app.post("/api/account/disable", response_model=AccountChangedOut)
+@limiter.limit("5/minute")
+def disable_my_account(request: Request, user: AuthUser = Depends(require_approved)):
+    """
+    Switch off the signed in person's own account. They are locked out at once, their screenings are kept, and only an
+    administrator can switch the account back on. Refused for the last administrator.
+    """
+    if not user.id:
+        raise HTTPException(400, "This sign in has no account to disable")
+    try:
+        profile = db.update_profile(user.id, status="disabled", decided_by=user.id)
+    except db.LastAdminError:
+        raise AppError(409, "LAST_ADMIN", "You are the only administrator, so the account cannot be disabled.",
+                       "Make someone else an administrator first.") from None
+    if profile is None:
+        raise AppError(404, "USER_NOT_FOUND", "No account found.")
+    auth.invalidate_profile(user.id)
+    _audit(request, user, "account.disable.self", "user", user.id)
+    logger.info("User %s disabled their own account", user.id)
+    return AccountChangedOut(id=user.id, email=profile["email"], status="disabled")
+
+
+@app.delete("/api/account", response_model=AccountChangedOut)
+@limiter.limit("3/minute")
+def delete_my_account(request: Request, body: AccountDeleteIn, user: AuthUser = Depends(require_approved)):
+    """
+    Delete the signed in person's own account: the sign in and the profile, with their settings. Their past screenings
+    stay in the compliance record without their name on them (visible to administrators only), exactly as when an
+    administrator deletes someone. The person must type their email address to confirm. Refused for the last
+    administrator, and when the sign in service is not set up (use Disable instead).
+    """
+    if not user.id:
+        raise HTTPException(400, "This sign in has no account to delete")
+    if body.confirm_email.strip().lower() != (user.email or "").strip().lower():
+        raise AppError(422, "CONFIRM_EMAIL_MISMATCH", "The email address you typed does not match your account.",
+                       "Type your own email address exactly to confirm.")
+    if not supabase_admin.configured():
+        raise AppError(503, "USER_DELETE_NOT_CONFIGURED", "Deleting accounts is not set up on this server.",
+                       "Disable the account instead, or ask an administrator.")
+    try:
+        profile = db.update_profile(user.id, status="disabled", decided_by=user.id)   # locks out at once; keeps the last admin
+    except db.LastAdminError:
+        raise AppError(409, "LAST_ADMIN", "You are the only administrator, so the account cannot be deleted.",
+                       "Make someone else an administrator first.") from None
+    if profile is None:
+        raise AppError(404, "USER_NOT_FOUND", "No account found.")
+    auth.invalidate_profile(user.id)
+    try:
+        removed = supabase_admin.delete_auth_user(user.id)
+    except supabase_admin.AuthServiceError as exc:
+        logger.error("Deleting own account %s: %s", user.id, exc)
+        _audit(request, user, "account.delete.failed", "user", user.id)
+        raise AppError(502, "USER_DELETE_FAILED", "The account was disabled but could not be fully removed.",
+                       "The sign in service did not answer. Try Delete again in a moment.") from None
+    try:
+        db.delete_profile(user.id)
+    except db.LastAdminError:
+        raise AppError(409, "LAST_ADMIN", "You are the only administrator, so the account cannot be deleted.") from None
+    auth.invalidate_profile(user.id)
+    _audit(request, user, "account.delete.self", "user", user.id, {"email": profile["email"], "sign_in_removed": removed})
+    logger.info("User %s deleted their own account", user.id)
+    return AccountChangedOut(id=user.id, email=profile["email"], status="deleted", sign_in_removed=removed)
 
 
 def _csv_cell(v) -> str:

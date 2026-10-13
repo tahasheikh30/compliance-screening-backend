@@ -148,11 +148,12 @@ def match_records(scorer: NameScorer, records: list, threshold: float, dob_year:
 
 
 def screen(name: str, dob: str = "", nationality: str = "", threshold=None,
-           cnic: str = "", father_name: str = "", province: str = "") -> dict:
+           cnic: str = "", father_name: str = "", province: str = "", skip=frozenset()) -> dict:
     """
     Run one screening. Returns a dict with the overall result and one entry per
     source under "sources". A source that could not be loaded is reported with
-    status ERROR / NOT_CONFIGURED, never as CLEAR.
+    status ERROR / NOT_CONFIGURED, never as CLEAR. `skip` is the sources the analyst switched off in their
+    settings: they are not read or matched, and are reported as SKIPPED (never as screened, never as clear).
     """
     name = str(name or "").strip()
     check_screenable(name)
@@ -168,9 +169,9 @@ def screen(name: str, dob: str = "", nationality: str = "", threshold=None,
 
     # sanctions lists and the news search are independent, run them together
     with ThreadPoolExecutor(max_workers=2) as ex:
-        news_f = ex.submit(_news, name)
+        news_f = ex.submit(_news, name) if "ADVERSE_MEDIA" not in skip else None
         groups = loader.load_groups()
-        news = news_f.result()
+        news = news_f.result() if news_f else {"source": "", "query": "", "status": "", "articles_reviewed": 0, "hits": []}
 
     scorer = NameScorer(name)
     all_matches: list = []
@@ -181,6 +182,9 @@ def screen(name: str, dob: str = "", nationality: str = "", threshold=None,
     pep_hits = 0       # being a PEP is not a sanction: counted on its own and never as a sanctions hit
 
     for key in loader.SOURCE_KEYS:
+        if key in skip:
+            sources[key] = _skipped_source(key)
+            continue
         g = groups[key]
         lists_meta.extend(g.meta)
         # a low threshold on a common name must not produce a huge response: keep the best MAX_MATCHES
@@ -216,7 +220,7 @@ def screen(name: str, dob: str = "", nationality: str = "", threshold=None,
     truncated = sanctions_hits > MAX_MATCHES
     kept = all_matches[:MAX_MATCHES]
 
-    media_sources = {
+    media_sources = _skipped_source("ADVERSE_MEDIA") if "ADVERSE_MEDIA" in skip else {
         "key": "ADVERSE_MEDIA", "label": SOURCE_LABELS["ADVERSE_MEDIA"], "available": news["status"] == "OK",
         "error": None if news["status"] == "OK" else news["status"].removeprefix("Not available: "), "records": news["articles_reviewed"],
         "list_version": None, "lists": [], "partial": False, "matches": [], "match_count": 0, "articles": news["hits"],
@@ -242,6 +246,13 @@ def screen(name: str, dob: str = "", nationality: str = "", threshold=None,
         "truncated": truncated,
         "sources": sources,
     }
+
+
+def _skipped_source(key: str) -> dict:
+    """A source the analyst switched off: nothing was read, and the row says so."""
+    return {"key": key, "label": SOURCE_LABELS[key], "available": False, "skipped": True,
+            "error": "Switched off in the analyst's settings", "records": 0, "list_version": None, "lists": [],
+            "partial": False, "matches": [], "match_count": 0, "articles": []}
 
 
 def coverage(names_list: list, threshold=None) -> list:
@@ -298,7 +309,9 @@ def _news(name: str) -> dict:
 
 
 def source_status(src: dict, fia_required: bool = True) -> str:
-    """HIT / PARTIAL / REVIEW / CLEAR / NOT_CONFIGURED / ERROR for one source."""
+    """HIT / PARTIAL / REVIEW / CLEAR / NOT_CONFIGURED / ERROR / SKIPPED (switched off by the analyst) for one source."""
+    if src.get("skipped"):
+        return "SKIPPED"
     if not src["available"]:
         if src["key"] in ("FIA_REDBOOK", "NACTA", "PEP"):
             return "NOT_CONFIGURED"
@@ -319,6 +332,8 @@ def overall_status(statuses: dict, fia_required: bool = True, nacta_required: bo
     exceptions are the FIA Red Book (FIA_REQUIRED=false, which mirrors the workflow where
     that list is optional) and NACTA (NACTA_REQUIRED=false).
     """
+    # SKIPPED (a list the analyst switched off) neither blocks nor clears: it is shown on the case as not screened
+    statuses = {k: v for k, v in statuses.items() if v != "SKIPPED"}
     vals = list(statuses.values())
     if "HIT" in vals:
         return "ESCALATE_TO_COMPLIANCE"
@@ -338,6 +353,8 @@ def overall_status(statuses: dict, fia_required: bool = True, nacta_required: bo
 
 def describe_source(src: dict, status: str, threshold: float) -> str:
     """One readable sentence for a source's result row."""
+    if status == "SKIPPED":
+        return "Not screened. This list was switched off in the analyst's settings, so it was not checked for this case."
     if status in ("ERROR", "NOT_CONFIGURED"):
         reason = (src["error"] or "The source was unavailable").strip().rstrip(".")
         return f"Not screened. {reason}. Treat this applicant as not yet cleared by this source."

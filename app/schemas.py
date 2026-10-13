@@ -333,3 +333,19 @@ class ReviewOut(BaseModel):
     review_decision: Optional[str] = None
     review_note: Optional[str] = None
     reviewed_at: Optional[str] = None
+
+
+class PreferencesOut(BaseModel):
+    preferences: dict
+    switchable_sources: List[str]      # the sources this server lets a person switch off for their own screenings
+
+
+class AccountDeleteIn(BaseModel):
+    confirm_email: str = Field(..., max_length=320)
+
+
+class AccountChangedOut(BaseModel):
+    id: str
+    email: str
+    status: str
+    sign_in_removed: Optional[bool] = None    # delete only: the sign in account itself was removed too
