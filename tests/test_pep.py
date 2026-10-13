@@ -801,3 +801,14 @@ def test_politicians_with_a_recorded_office_are_counted_once_and_reported():
     assert len(recs) == 2
     assert info["by_level"] == {"Local": 1, "Political figure": 1}
     assert info["politicians_now_with_office"] == 1
+
+
+def test_level_words_keep_national_and_provincial_before_local():
+    from app.screening import pep
+    assert pep._level_from_text("Provincial Council") == pep.PROVINCIAL
+    assert pep._level_from_text("National Council") == pep.NATIONAL
+    assert pep._level_from_text("Federal") == pep.NATIONAL
+    assert pep._level_from_text("Local") == pep.LOCAL
+    assert pep._level_from_text("Municipal Corporation") == pep.LOCAL
+    assert pep._level_from_text("District Council") == pep.LOCAL
+    assert pep._level_from_text("") == ""

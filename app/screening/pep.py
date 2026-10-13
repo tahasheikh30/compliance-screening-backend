@@ -193,12 +193,13 @@ def classify_position(label: str) -> tuple | None:
 
 def _level_from_text(v: str) -> str:
     t = str(v or "").strip().lower()
-    if re.search(r"local|municipal|metropolitan|district|city|council", t):
-        return LOCAL
+    # National and provincial are checked first so "Provincial Council" or "National Council" keep their level
     if re.search(r"prov|state|region|assembly of (sindh|punjab|balochistan|khyber)", t):
         return PROVINCIAL
     if re.search(r"nat|fed|central|senate", t):
         return NATIONAL
+    if re.search(r"\blocal\b|municipal|metropolitan|\bdistrict\b|\bcity\b|\btown\b|union council", t):
+        return LOCAL
     return ""
 
 
