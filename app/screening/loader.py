@@ -599,6 +599,12 @@ def _wikidata_snapshot() -> tuple:
     return snapshot, None
 
 
+def _bangladesh_note(n: int, what: str, when: str = "") -> str:
+    """Why some PEP entries are missing: offices of Bangladesh are not PEP offices here, and the Lists page says how many."""
+    return (f"{n:,} {what} left out {when}because they name Bangladesh, whose offices are not counted as PEP offices. "
+            "Check them by hand if you need them.").replace("  ", " ")
+
+
 def _load_pep() -> GroupData:
     snapshot, wd_note = _wikidata_snapshot()
     up = db_pep("upload")
@@ -613,8 +619,11 @@ def _load_pep() -> GroupData:
         for rec in up_records:
             if getattr(rec, "province", ""):
                 uploaded_by_province[rec.province] = uploaded_by_province.get(rec.province, 0) + 1
-        lists.append({"list": "PEP list uploaded by an administrator", "source": up[1].get("filename") or "uploaded file",
-                      "published": (up[1].get("uploaded_at") or "n/a")[:10], "records": len(up_records)})
+        up_entry = {"list": "PEP list uploaded by an administrator", "source": up[1].get("filename") or "uploaded file",
+                    "published": (up[1].get("uploaded_at") or "n/a")[:10], "records": len(up_records)}
+        if up_info.get("excluded_country"):
+            up_entry["note"] = _bangladesh_note(up_info["excluded_country"], "rows")
+        lists.append(up_entry)
     if snapshot is not None:
         wd_records, info = pep.records_from_snapshot(snapshot)
         groups.append(wd_records)
@@ -622,8 +631,18 @@ def _load_pep() -> GroupData:
         from_lists = info.get("assembly_members", 0)
         entry = {"list": "PEP list from Wikidata (office holders and politicians)", "source": config.PEP_WIKIDATA_URL,
                  "published": published, "records": len(wd_records) - from_lists}
+        levels = info.get("by_level") or {}
+        parts = [f"{levels[k]:,} {k.lower()}" for k in ("National", "Provincial", "Local", "Political figure") if levels.get(k)]
+        if parts:
+            entry["note"] = "Counted as PEPs: " + ", ".join(parts) + "."
+            if info.get("politicians_now_with_office"):
+                entry["note"] += (f" {info['politicians_now_with_office']:,} people Wikidata lists as politicians "
+                                  "are counted through a recorded office, not as political figures.")
         if info.get("top_unclassified"):
-            entry["note"] = ("Positions not counted as PEP offices (most common): " + "; ".join(info["top_unclassified"][:8]))
+            entry["note"] = (entry.get("note", "") + " Positions not counted as PEP offices (most common): "
+                             + "; ".join(info["top_unclassified"][:15])).strip()
+        if info.get("excluded_country"):
+            entry["note"] = (entry.get("note", "") + " " + _bangladesh_note(info["excluded_country"], "people")).strip()
         extra = " ".join(x for x in [wd_note] + [p for p in snapshot.get("problems", [])] if x)
         if extra:
             entry["note"] = (entry.get("note", "") + " " + extra).strip()
@@ -641,7 +660,12 @@ def _load_pep() -> GroupData:
                 item["note"] = note
                 item["detail"] = row["error"]
             lists.append(item)
-    records = pep.merge(*groups)
+    # last check before screening: no record that carries Bangladesh data can be shown as a PEP hit
+    merged = pep.merge(*groups)
+    records = [r for r in merged if not pep.mentions_excluded_country(r.position, r.remarks, r.programs, r.province)]
+    if len(records) < len(merged) and lists:
+        lists[0]["note"] = (lists[0].get("note", "") + " " + _bangladesh_note(len(merged) - len(records), "records",
+                                                                              "at the last check")).strip()
     if not records:
         why = "; ".join(notes) if notes else "nothing has been fetched or uploaded"
         raise SourceUnavailable("No PEP data is loaded (" + why + "). Upload a PEP list on the Lists page or enable "

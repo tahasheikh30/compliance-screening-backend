@@ -27,13 +27,41 @@ from tests.conftest import API_HEADERS, USER_HEADERS
     ("Speaker of the Provincial Assembly of Balochistan", ("Provincial", "Balochistan")),
     ("Minister of Education (Punjab)", ("Provincial", "Punjab")),
     ("Member of the Legislative Assembly of Gilgit-Baltistan", ("Provincial", "Gilgit-Baltistan")),
+    ("Member of the Metropolitan Corporation Lahore", ("Local", "Punjab")),
+    ("Member of the Karachi Metropolitan Corporation", ("Local", "Sindh")),
+    ("Member of the Faisalabad Municipal Corporation", ("Local", "Punjab")),
+    ("Member of the Municipal Corporation Multan", ("Local", "Punjab")),
+    ("Member of the District Council Peshawar", ("Local", "Khyber Pakhtunkhwa")),
+    ("councillor in the district council of Swat", ("Local", "Khyber Pakhtunkhwa")),
+    ("councillor in the district council of Mardan", ("Local", "Khyber Pakhtunkhwa")),
+    ("Member of the Islamabad Metropolitan Corporation", ("Local", "Islamabad Capital Territory")),
+    ("councillor in the district council of Jhang", ("Local", "Punjab")),
+    ("councillor in the district council of Nawabshah", ("Local", "Sindh")),
+    ("councillor in the municipal corporation of Bahawalpur", ("Local", "Punjab")),
+    ("councillor in the district council of Jamshoro", ("Local", "Sindh")),
+    ("councillor in the district council of Rahim Yar Khan", ("Local", "Punjab")),
+    ("councillor in the district council of Sheikhupura", ("Local", "Punjab")),
+    ("councillor in the district council of Kasur", ("Local", "Punjab")),
+    ("Mayor of Karachi", ("Local", "Sindh")),
+    ("Member of the Hyderabad Municipal Corporation, Sindh", ("Local", "Sindh")),
+    ("Member of the Greater Hyderabad Municipal Corporation", None),
+    ("Member of the Hyderabad Municipal Corporation", ("Local", "Sindh")),
+    ("councillor in the municipal corporation of Sukkar", ("Local", "Sindh")),
+    ("councillor in the municipal corporation of Sialkot", ("Local", "Punjab")),
+    ("councillor in the municipal corporation of Sargodha", ("Local", "Punjab")),
+    ("councillor in the municipal corporation of Sahiwal", ("Local", "Punjab")),
+    ("Mayor of London", None),
+    ("Member of the Parliament of Bangladesh", None),
+    ("Member of the Dhaka North City Corporation, Bangladesh", None),
+    ("Member of the Municipal Corporation of Delhi", None),
     ("captain of Pakistan cricket team", None),
     ("Chief Minister of Gujarat", None),
     ("Governor of Reserve Bank of India", None),
     ("", None),
 ])
 def test_classify_position(label, expected):
-    assert pep.classify_position(label) == expected
+    # as the Wikidata path calls it: everyone fetched there holds Pakistani citizenship
+    assert pep.classify_position(label, pakistani=True) == expected
 
 
 # ---- the administrator's file --------------------------------------------------
@@ -487,7 +515,7 @@ def test_official_sources_are_used_without_wikipedia_and_pending_ones_are_report
     assert [a["key"] for a in assemblies] == ["kp_official"]
     by = {r["key"]: r for r in report}
     assert by["kp_official"]["count"] == 14 and by["senate_official"]["error"]
-    assert "not set up" in by["gb_official"]["error"] and by["punjab_official"]["error"]
+    assert "not set up" in by["ajk_official"]["error"] and by["punjab_official"]["error"] and by["gb_official"]["error"]
 
 
 def test_extra_sources_add_and_replace_official_entries(monkeypatch):
@@ -713,3 +741,170 @@ def test_the_full_error_text_is_kept_not_cut_at_140_characters():
                        "/members/listing/en/22?byname=true&limit=all (Caused by " + cause + ")")
     text = pa._why(exc)
     assert len(text) > 140 and "connect timeout=30" in text and text.endswith("))")
+
+
+# ---- local government offices, and nothing from Bangladesh ----------------------
+
+def test_local_office_makes_a_local_pep_and_the_higher_level_wins():
+    snap = {"people": [
+        {"id": "Q1", "name": "Aslam Lahori", "positions": [{"label": "Member of the Metropolitan Corporation Lahore"}]},
+        {"id": "Q2", "name": "Bashir Senator", "positions": [{"label": "Member of the Municipal Corporation Multan"},
+                                                              {"label": "Senator"}]},
+    ]}
+    recs, info = pep.records_from_snapshot(snap, date(2026, 10, 13), lookback_years=-1)
+    by = {r.primary: r for r in recs}
+    assert by["Aslam Lahori"].pep_level == "Local" and by["Aslam Lahori"].province == "Punjab"
+    assert by["Aslam Lahori"].programs == "PEP, Local, Punjab"
+    assert by["Bashir Senator"].pep_level == "National"
+    assert info["unclassified_positions"] == 0
+
+
+def test_no_bangladesh_data_reaches_a_pep_record():
+    snap = {"people": [
+        {"id": "Q3", "name": "Only Dhaka", "positions": [{"label": "Member of the Parliament of Bangladesh"}]},
+        {"id": "Q4", "name": "Both Countries", "positions": [{"label": "Member of the Parliament of Bangladesh"},
+                                                             {"label": "Member of the National Assembly of Pakistan"}]},
+    ], "politicians": [{"id": "Q5", "name": "Odd Party", "party": "Bangladesh Nationalist Party"}]}
+    recs, info = pep.records_from_snapshot(snap, date(2026, 10, 13), lookback_years=-1)
+    names = {r.primary for r in recs}
+    assert "Only Dhaka" not in names
+    assert all(not pep.mentions_excluded_country(r.position, r.remarks, r.programs) for r in recs)
+    both = next(r for r in recs if r.primary == "Both Countries")
+    assert both.pep_level == "National" and "Bangladesh" not in both.remarks
+    # an excluded office is left out on purpose and is not listed as a position that was missed
+    assert not any("Bangladesh" in x for x in info["top_unclassified"])
+
+
+def test_uploaded_pep_row_naming_bangladesh_is_dropped():
+    records, _ = pep.parse_pep_persons("Name,Position\nA Khan,Member of the Parliament of Bangladesh\n"
+                                        "B Khan,Member of the District Council Peshawar\n")
+    assert [r.primary for r in records] == ["B Khan"] and records[0].pep_level == "Local"
+    assert all("Bangladesh" not in r.remarks for r in records)
+
+
+def test_snapshot_reports_how_many_peps_were_counted_per_level():
+    snap = {"people": [
+        {"id": "Q1", "name": "A One", "positions": [{"label": "Senator"}]},
+        {"id": "Q2", "name": "B Two", "positions": [{"label": "Member of the Provincial Assembly of the Punjab"}]},
+        {"id": "Q3", "name": "C Three", "positions": [{"label": "councillor in the district council of Kasur"}]},
+        {"id": "Q4", "name": "D Four", "positions": [{"label": "Member of the Municipal Corporation of Delhi"}]},
+    ]}
+    recs, info = pep.records_from_snapshot(snap, date(2026, 10, 13), lookback_years=-1)
+    assert info["by_level"] == {"National": 1, "Provincial": 1, "Local": 1}
+    assert info["top_unclassified"] == ["Member of the Municipal Corporation of Delhi"]
+
+
+def test_politicians_with_a_recorded_office_are_counted_once_and_reported():
+    snap = {"people": [{"id": "Q1", "name": "Arsalan Islam Shaikh",
+                        "positions": [{"label": "councillor in the municipal corporation of Sukkar"}]}],
+            "politicians": [{"id": "Q1", "name": "Arsalan Islam Shaikh"}, {"id": "Q2", "name": "Only Politician"}]}
+    recs, info = pep.records_from_snapshot(snap, date(2026, 10, 13), lookback_years=-1)
+    assert len(recs) == 2
+    assert info["by_level"] == {"Local": 1, "Political figure": 1}
+    assert info["politicians_now_with_office"] == 1
+
+
+def test_level_words_keep_national_and_provincial_before_local():
+    from app.screening import pep
+    assert pep._level_from_text("Provincial Council") == pep.PROVINCIAL
+    assert pep._level_from_text("National Council") == pep.NATIONAL
+    assert pep._level_from_text("Federal") == pep.NATIONAL
+    assert pep._level_from_text("Local") == pep.LOCAL
+    assert pep._level_from_text("Municipal Corporation") == pep.LOCAL
+    assert pep._level_from_text("District Council") == pep.LOCAL
+    assert pep._level_from_text("") == ""
+
+
+# ---- review points: left-out records are reported, Hyderabad needs Pakistani context, short place names ----
+
+def test_records_left_out_for_naming_bangladesh_are_counted():
+    snap = {"people": [
+        {"id": "Q3", "name": "Only Dhaka", "positions": [{"label": "Member of the Parliament of Bangladesh"}]},
+        {"id": "Q4", "name": "Both", "positions": [{"label": "Member of the Parliament of Bangladesh"}, {"label": "Senator"}]},
+    ]}
+    _, info = pep.records_from_snapshot(snap, date(2026, 10, 13), lookback_years=-1)
+    assert info["excluded_country"] == 1          # "Both" still has a Pakistani office and stays
+    _, up = pep.parse_pep_persons("Name,Position\nA Khan,Member of the Parliament of Bangladesh\nB Khan,Senator\n")
+    assert up["excluded_country"] == 1
+
+
+def test_load_pep_tells_the_admin_how_many_were_left_out(monkeypatch):
+    from app.screening import loader
+    snap = {"fetched_at": "2026-10-13", "people": [
+        {"id": "Q3", "name": "Only Dhaka", "positions": [{"label": "Member of the Parliament of Bangladesh"}]},
+        {"id": "Q4", "name": "Real Senator", "positions": [{"label": "Senator"}]}]}
+    monkeypatch.setattr(loader, "_wikidata_snapshot", lambda: (snap, None))
+    monkeypatch.setattr(loader, "db_pep", lambda kind: None)
+    data = loader._load_pep()
+    note = " ".join(x.get("note", "") for x in data.meta)
+    assert "1 people left out" in note and "Bangladesh" in note
+
+
+def test_bare_hyderabad_needs_pakistani_context():
+    label = "Hyderabad Municipal Corporation councillor"
+    assert pep.classify_position(label) is None                              # e.g. an uploaded row: could be India's
+    assert pep.classify_position(label, pakistani=True) == ("Local", "Sindh")
+    assert pep.classify_position("Hyderabad Municipal Corporation, Sindh") == ("Local", "Sindh")
+    assert pep.classify_position("Hyderabad Municipal Corporation, Pakistan") == ("Local", "Sindh")
+    assert pep.classify_position("Greater Hyderabad Municipal Corporation", pakistani=True) is None
+    assert pep.classify_position("Hyderabad Municipal Corporation India", pakistani=True) is None
+
+
+@pytest.mark.parametrize("label,expected", [
+    ("Mayor of Wah Cantonment", None),                         # bare "Mayor of ..." with only a wordy name is not enough
+    ("Wah Cantonment Board member", ("Local", "Punjab")),
+    ("Member of the Municipal Committee of Chaman", ("Local", "Balochistan")),
+    ("Hub Town Committee member", ("Local", "Balochistan")),
+    ("Member of the district council of Swat", ("Local", "Khyber Pakhtunkhwa")),
+    ("Union Council chairman of Swat", ("Local", "Khyber Pakhtunkhwa")),
+    ("City council member, Wah, Ohio", None),                  # ambiguous name, no body next to it and no Pakistan
+    ("Union council member, Hub Chemicals Ltd", None),
+    ("Wah Pakistan Municipal Committee member", ("Local", "Punjab")),
+])
+def test_short_place_names_need_the_local_body_beside_them(label, expected):
+    assert pep.classify_position(label) == expected
+
+
+# ---- Gilgit-Baltistan Assembly website ----------------------------------------
+
+_GB_PAGE = """<table><tr><th>Tenure</th><th>Member Name</th><th>Political Party</th><th>Constituency</th><th>Seat Type</th><th>District</th></tr>
+<tr><td>2023-2025</td><td>Jamil Ahmad</td><td>Pakistan Peoples Party</td><td>GBA-2 Gilgit-II</td><td>General</td><td>Gilgit</td></tr>
+<tr><td>2020-2025</td><td>Amina Bibi</td><td>Pakistan Muslim League (N)</td><td>Women</td><td>Reserved</td><td>Skardu</td></tr>
+<tr><td>2009-2014</td><td>Old Member Khan</td><td>Independent</td><td>GBA-5</td><td>General</td><td>Diamer</td></tr>
+<tr><td>2021 - Till Date</td><td>Present Member Shah</td><td>PTI</td><td>GBA-7</td><td>General</td><td>Hunza</td></tr>
+<tr><td></td><td>No Tenure Given</td><td>PTI</td><td>GBA-8</td><td>General</td><td>Ghizer</td></tr></table>"""
+
+
+def test_gilgit_baltistan_site_is_an_official_source_and_no_longer_pending():
+    from app.screening import pep_assemblies as pa
+    official, pending = pa.official_sources()
+    gb = next(s for s in official if s["key"] == "gb_official")
+    assert gb["url"] == "https://gba.gov.pk/members/" and gb["province"] == "Gilgit-Baltistan" and gb["level"] == pep.PROVINCIAL
+    assert all(p["key"] != "gb_official" for p in pending)
+
+
+def test_gb_member_table_is_read_and_members_who_left_office_long_ago_are_dropped():
+    from app.screening import pep_assemblies as pa
+    got = pa.members_from_html(_GB_PAGE, today=date(2026, 10, 13))
+    names = [m["name"] for m in got]
+    assert names == ["Jamil Ahmad", "Amina Bibi", "Present Member Shah", "No Tenure Given"]   # 2009-2014 is dropped
+    assert got[0]["party"] == "Pakistan Peoples Party" and got[0]["constituency"] == "GBA-2 Gilgit-II"
+
+
+def test_tenure_reading_never_drops_on_a_guess():
+    from app.screening import pep_assemblies as pa
+    t = date(2026, 10, 13)
+    assert pa._tenure_is_recent("2023-2025", t) and pa._tenure_is_recent("2021 - present", t)
+    assert pa._tenure_is_recent("", t) and pa._tenure_is_recent("Fifth term", t)
+    assert not pa._tenure_is_recent("2009-2014", t)
+
+
+def test_fetch_reads_the_gb_site_and_reports_it(monkeypatch):
+    from app.screening import pep_assemblies as pa
+    rows = "".join(f"<tr><td>2020-2025</td><td>Member Number{chr(65 + i)} Khan</td><td>PPP</td><td>GBA-{i + 1}</td><td>General</td><td>Gilgit</td></tr>"
+                   for i in range(12))
+    page = _GB_PAGE.split("</table>")[0].split("<tr><td>2023")[0] + rows + "</table>"
+    src = next(s for s in pa.OFFICIAL_SOURCES if s["key"] == "gb_official")
+    assemblies, report = pa.fetch_assemblies(lambda url, params: page, "", sources=[], official=[src])
+    assert report[0]["count"] == 12 and not report[0]["error"] and report[0]["province"] == "Gilgit-Baltistan"
+    assert assemblies[0]["members"][0]["name"] == "Member NumberA Khan"

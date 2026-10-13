@@ -10,6 +10,7 @@ which is reported per source on the Lists page instead of failing the whole PEP 
 
 import json
 import re
+from datetime import date, datetime, timezone
 from html.parser import HTMLParser
 from app import config
 
@@ -74,12 +75,15 @@ OFFICIAL_SOURCES = [
     {"key": "balochistan_official", "label": "Balochistan Assembly website (pabalochistan.gov.pk)",
      "level": PROVINCIAL, "province": "Balochistan", "url": "https://pabalochistan.gov.pk/list-members",
      "parser": "profiles"},
+    # columns: Tenure, Member Name, Political Party, Constituency, Seat Type, District. The Tenure column ("2023-2025")
+    # can list members of earlier terms, so rows whose tenure ended long ago are dropped (see _tenure_is_recent)
+    {"key": "gb_official", "label": "Gilgit-Baltistan Assembly website (gba.gov.pk)", "level": PROVINCIAL,
+     "province": "Gilgit-Baltistan", "url": "https://gba.gov.pk/members/", "parser": "table"},
 ]
 
 # Assemblies whose official member list is not set up yet. They are shown on the Lists page as such (instead of
 # being silently missing) and keep their last saved members. Add each with PEP_EXTRA_SOURCES once its page is known.
 PENDING_OFFICIAL = [
-    {"key": "gb_official", "label": "Gilgit-Baltistan Assembly website"},
     {"key": "ajk_official", "label": "Azad Jammu and Kashmir Assembly website"},
 ]
 
@@ -213,6 +217,8 @@ _NAME_HEAD = re.compile(r"\b(member|members|name|mna|mpa|senator|elected|represe
 _NOT_NAME = re.compile(r"\b(constituency|party|province|district|seat|no\b|number|image|photo|picture|colou?r|notes?|"
                        r"reason|date|remarks|assumed|term|since|status|gender|reserved|type)\b", re.I)
 _SEAT_HEAD = re.compile(r"\b(constituency|seat|district|region|province)\b", re.I)
+_TENURE_HEAD = re.compile(r"\b(tenure|period)\b", re.I)
+_STILL_SERVING = re.compile(r"\b(present|till date|to date|current|incumbent|ongoing)\b", re.I)
 _PARTY_HEAD = re.compile(r"\b(party|affiliation|parliamentary|bloc|alliance)\b", re.I)
 
 _VACANT = re.compile(r"^(vacant|none|n/?a|tbd|tba|-+|—|–|\?)$|\b(seat vacant|vacant seat|disqualified|"
@@ -253,7 +259,21 @@ def _header_row(rows: list):
     return None
 
 
-def members_from_html(html: str) -> list:
+def _tenure_is_recent(text: str, today: date | None = None) -> bool:
+    """
+    False when a Tenure cell ("2015-2020") shows the member left office more than PEP_LOOKBACK_YEARS ago. A cell that
+    says "present" or "till date", or that names no year, is kept: a member is never dropped on a guess.
+    """
+    if not text or _STILL_SERVING.search(text):
+        return True
+    years = [int(y) for y in re.findall(r"\b(?:19|20)\d{2}\b", text)]
+    if not years:
+        return True
+    today = today or datetime.now(timezone.utc).date()
+    return max(years) >= today.year - config.PEP_LOOKBACK_YEARS
+
+
+def members_from_html(html: str, today: date | None = None) -> list:
     """[{name, names, constituency, party}] from every table with a member-name column."""
     out = []
     for rows in tables(html):
@@ -264,12 +284,15 @@ def members_from_html(html: str) -> list:
         name_col = next((c for c, t in enumerate(labels) if _NAME_HEAD.search(t) and not _NOT_NAME.search(t)), None)
         seat_col = next((c for c, t in enumerate(labels) if c != name_col and _SEAT_HEAD.search(t)), None)
         party_col = next((c for c, t in enumerate(labels) if c != name_col and _PARTY_HEAD.search(t)), None)
+        tenure_col = next((c for c, t in enumerate(labels) if c != name_col and _TENURE_HEAD.search(t)), None)
         for row in rows[hi + 1:]:
             if len(row) <= name_col or all(th for _t, th in row if _t) and len(row) <= 2:
                 continue            # a section heading row ("Reserved seats for women"), not a member
             names = _clean_name(row[name_col][0])
             if not names:
                 continue
+            if tenure_col is not None and len(row) > tenure_col and not _tenure_is_recent(row[tenure_col][0], today):
+                continue            # sat in an earlier term and left office long ago
             out.append({"name": names[0], "names": names,
                         "constituency": row[seat_col][0] if seat_col is not None and len(row) > seat_col else "",
                         "party": row[party_col][0] if party_col is not None and len(row) > party_col else ""})

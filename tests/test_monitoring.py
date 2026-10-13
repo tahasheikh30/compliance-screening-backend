@@ -5,8 +5,7 @@ import pytest
 
 from app import config, database, monitoring
 from app.screening import loader
-from tests import fixtures as fx
-from tests.conftest import ADMIN_ID, API_HEADERS, USER_HEADERS, USER2_HEADERS
+from tests.conftest import API_HEADERS, USER_HEADERS, USER2_HEADERS
 
 NAME = "Zebediah Quillfeather"
 

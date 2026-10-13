@@ -39,6 +39,7 @@ COL = {
     "muted": _c(0.44, 0.47, 0.51), "line": _c(0.87, 0.88, 0.89), "band": _c(0.96, 0.96, 0.95),
     "white": _c(1, 1, 1), "red": _c(0.66, 0.25, 0.23), "amber": _c(0.78, 0.57, 0.20),
     "green": _c(0.29, 0.53, 0.42), "amber_bg": _c(0.98, 0.95, 0.89), "soft": _c(0.72, 0.77, 0.82),
+    "red_bg": _c(0.98, 0.92, 0.91), "green_bg": _c(0.92, 0.96, 0.94),
 }
 
 
@@ -267,7 +268,43 @@ def evidence_filename(case_ref: str) -> str:
     return f"evidence_{re.sub(r'[^A-Za-z0-9_-]', '_', case_ref)}.pdf"
 
 
-def generate_evidence_pdf(r: dict, case_ref: str) -> tuple:
+def _plural(n: int, one: str, many: str) -> str:
+    return f"{n} {one if n == 1 else many}"
+
+
+def result_banner(r: dict, overall_status=None, pep_people: int = 0) -> tuple:
+    """
+    (headline, detail, accent colour, background) for the top of the report, so the banner says what was found.
+
+    `overall_status` is the screening's own result (ESCALATE_TO_COMPLIANCE / MANUAL_REVIEW / AUTO_CLEAR). Without it
+    the status is worked out from the findings: a sanctions or watch-list match escalates, any other finding or an
+    unscreened list needs manual review, and nothing at all is clear.
+    """
+    sh, mh = int(r.get("sanctions_hit_count") or 0), int(r.get("media_hit_count") or 0)
+    unscreened = sum(1 for x in r.get("lists") or [] if int(x.get("records") or 0) == 0)
+    reasons = []
+    if pep_people:
+        reasons.append(_plural(pep_people, "politically exposed person", "politically exposed persons"))
+    if mh:
+        reasons.append(_plural(mh, "adverse media article (an unverified lead)", "adverse media articles (unverified leads)"))
+    if unscreened:
+        reasons.append(_plural(unscreened, "list that could not be screened", "lists that could not be screened"))
+    status = overall_status or ("ESCALATE_TO_COMPLIANCE" if sh else "MANUAL_REVIEW" if reasons else "AUTO_CLEAR")
+
+    if status == "ESCALATE_TO_COMPLIANCE" or sh:
+        detail = _plural(sh, "sanctions / watch-list match needs", "sanctions / watch-list matches need") + " a decision."
+        if reasons:
+            detail += " Also to review: " + "; ".join(reasons) + "."
+        return ("RESULT: POTENTIAL MATCH on a sanctions / watch list. Escalate to compliance.", detail,
+                COL["red"], COL["red_bg"])
+    if status == "AUTO_CLEAR":
+        return ("RESULT: NO MATCH. Nothing found at the selected threshold.", "", COL["green"], COL["green_bg"])
+    detail = "No sanctions or watch-list match. "
+    detail += ("To review: " + "; ".join(reasons) + ".") if reasons else "Part of the screening could not be completed."
+    return ("RESULT: MANUAL REVIEW REQUIRED.", detail, COL["amber"], COL["amber_bg"])
+
+
+def generate_evidence_pdf(r: dict, case_ref: str, overall_status=None) -> tuple:
     """
     Build the evidence PDF for screening result `r` (the dict returned by engine.screen).
     Returns (file name, PDF bytes); nothing is written to disk.
@@ -287,11 +324,13 @@ def generate_evidence_pdf(r: dict, case_ref: str) -> tuple:
     d.txt(RIGHT - tw(id_tag, 8.5), PAGE_H - 80, id_tag, 8.5, F1, COL["soft"])
     d.y = PAGE_H - 96 - 18
 
-    d.callout("RESULT: POTENTIAL MATCH. Manual review required.", COL["amber"], COL["amber_bg"], 11, True)
-
     sh, mh = r["sanctions_hit_count"], r["media_hit_count"]
     sanction_matches = [m for m in r["matches"] if not is_pep(m)]
     pep_groups = group_pep_matches(r["matches"])
+    headline, detail, accent, accent_bg = result_banner(r, overall_status, len(pep_groups))
+    d.callout(headline, accent, accent_bg, 11, True)
+    if detail:
+        d.callout(detail, accent, accent_bg, 9)
     pep_shown = sum(len(g["members"]) for g in pep_groups)
     pep_total = max(int(r.get("pep_hit_count") or 0), pep_shown)
     d.stat_cards([

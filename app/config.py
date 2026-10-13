@@ -97,6 +97,9 @@ NACTA_MAX_AGE_DAYS = _float_env("NACTA_MAX_AGE_DAYS", 30)
 # Like the FIA Red Book: when true (the default), a NACTA list that is missing or out
 # of date sends an otherwise clear applicant to manual review.
 NACTA_REQUIRED = os.environ.get("NACTA_REQUIRED", "true").strip().lower() not in ("0", "false", "no")
+# Every source a person can switch off for their own screenings (Settings, Lists). A source that is switched off is
+# shown as such on the case, and never counts as screened.
+SWITCHABLE_SOURCES = ("UNSC", "OFAC", "UKSL", "FIA_REDBOOK", "NACTA", "PEP", "ADVERSE_MEDIA")
 
 
 # --- Politically exposed persons (PEPs), national and provincial ---------
@@ -113,7 +116,7 @@ PEP_WIKIDATA_URL = os.environ.get("PEP_WIKIDATA_URL", "https://query.wikidata.or
 PEP_WIKIDATA_COUNTRY = os.environ.get("PEP_WIKIDATA_COUNTRY", "Q843").strip()
 PEP_REFRESH_DAYS = _float_env("PEP_REFRESH_DAYS", 7)
 # Members of the National Assembly, the Senate and the provincial assemblies, read from the public member lists
-# (Wikipedia and na.gov.pk). They fill the gaps in Wikidata and are refreshed with it. PEP_ASSEMBLIES=false skips them.
+# (official sites; Wikipedia only as an opt-in fallback). They fill the gaps in Wikidata and are refreshed with it. PEP_ASSEMBLIES=false skips them.
 PEP_ASSEMBLIES_ENABLED = os.environ.get("PEP_ASSEMBLIES", "true").strip().lower() not in ("0", "false", "no")
 PEP_WIKIPEDIA_API = os.environ.get("PEP_WIKIPEDIA_API", "https://en.wikipedia.org/w/api.php").strip()
 # Wikipedia member tables are only a fallback for assemblies whose official site is not set up, and are OFF by default:

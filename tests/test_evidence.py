@@ -71,3 +71,39 @@ def test_pep_matches_get_their_own_section_and_one_person_is_shown_once():
     assert "1 (from 3 source records)" in text
     assert text.count("3 RECORDS") == 1
     assert "None at the selected threshold." in text          # the sanctions section is empty
+
+
+def _bare_result(**over):
+    r = {"applicant": {"name": "Test Person", "dob": "", "nationality": "", "cnic": "", "father_name": "", "province": ""},
+         "threshold": 85.0, "screened_at": "2026-10-12T10:00:00+00:00", "lists": [], "total_records": 10,
+         "sanctions_hit_count": 0, "media_hit_count": 0, "pep_hit_count": 0, "hit_count": 0, "hit": False,
+         "adverse_media": None, "matches": [], "truncated": False, "sources": {}}
+    r.update(over)
+    return r
+
+
+def test_banner_says_what_was_found():
+    head, detail, *_ = evidence.result_banner(_bare_result(sanctions_hit_count=2, media_hit_count=1), None, 1)
+    assert "POTENTIAL MATCH" in head and "Escalate" in head
+    assert "2 sanctions / watch-list matches need a decision" in detail and "1 politically exposed person" in detail
+
+    head, detail, *_ = evidence.result_banner(_bare_result(media_hit_count=8), None, 1)
+    assert head == "RESULT: MANUAL REVIEW REQUIRED."
+    assert detail.startswith("No sanctions or watch-list match.")
+    assert "1 politically exposed person" in detail and "8 adverse media articles" in detail
+
+    head, detail, *_ = evidence.result_banner(_bare_result(), None, 0)
+    assert head.startswith("RESULT: NO MATCH") and detail == ""
+
+
+def test_banner_follows_the_screenings_own_status_and_counts_unscreened_lists():
+    r = _bare_result(lists=[{"list": "A", "records": 5}, {"list": "B", "records": 0}])
+    head, detail, *_ = evidence.result_banner(r, "MANUAL_REVIEW", 0)
+    assert head == "RESULT: MANUAL REVIEW REQUIRED." and "1 list that could not be screened" in detail
+    assert evidence.result_banner(_bare_result(), "AUTO_CLEAR", 0)[0].startswith("RESULT: NO MATCH")
+
+
+def test_the_pdf_carries_the_banner():
+    _, pdf = evidence.generate_evidence_pdf(_bare_result(media_hit_count=3), "CS-B", overall_status="MANUAL_REVIEW")
+    _, text = _text(pdf)
+    assert "MANUAL REVIEW REQUIRED" in text and "3 adverse media articles" in text and "POTENTIAL MATCH" not in text
