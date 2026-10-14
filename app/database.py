@@ -706,6 +706,17 @@ def monitoring_state_put(source: str, fingerprint: str, rescreened: int, new_ale
             (source, fingerprint, rescreened, new_alerts))
 
 
+def monitoring_state_touch(sources: list) -> None:
+    """
+    Record that these lists were compared with their stored fingerprint just now and had not changed. Only the
+    time moves: the fingerprint, and the counts from the last real change, stay as they were. Without this the
+    "last checked" time of a list that rarely changes would look weeks old although it is compared every day.
+    """
+    if sources:
+        with pool().connection() as conn:
+            conn.execute("UPDATE monitoring_state SET checked_at = now() WHERE source = ANY(%s)", (list(sources),))
+
+
 def monitoring_counts(user_id=None) -> dict:
     """How many applicants are monitored and how many alerts are open (only the user's own, with user_id)."""
     scope, args = ("", []) if user_id is None else (" AND user_id = %s", [user_id])

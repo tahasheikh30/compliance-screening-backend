@@ -295,6 +295,8 @@ A screening is a photograph of one day. Someone who is clear today can be listed
 
 **How it decides to re-screen.** Every list has a fingerprint, a hash of its records' ids, names, dates of birth and CNICs. The fingerprint each list had when everyone was last checked is stored in the database. Every `MONITOR_INTERVAL_SECONDS` (default 86400, once a day) the current fingerprints are compared; for each list that changed, every monitored person is screened against that list only, with the same matcher, threshold, CNIC, father's name and province as their original screening.
 
+**Checked every day.** Every list that could be read is compared on every pass and marked as checked, whether or not it changed, so the Monitoring tab shows a current time for each list. A pass that fails is repeated after 15 minutes, and one where a list could not be read after an hour, instead of waiting a whole day. A server on a free plan sleeps when nobody uses it, and a sleeping server checks nothing, so `.github/workflows/monitoring-daily.yml` also calls `POST /api/admin/monitoring/run` once a day with the machine `API_KEY` (the same two repository secrets as the NACTA workflow: `SCREENING_API_URL` and `SCREENING_API_KEY`). That wakes the server and runs the check; the database lock and the stored fingerprints make a second run on the same day harmless. The workflow log lists which lists were compared, which changed, and warns about any that could not be read.
+
 **What becomes an alert.** Only a **new** potential match: not one the person already had when first screened, and not one already alerted. A match is therefore raised once, however many times a list changes, and the original screening is never rewritten.
 
 | | |
@@ -303,7 +305,7 @@ A screening is a photograph of one day. Someone who is clear today can be listed
 | `POST /api/monitoring/alerts/{id}/decision` | `{"status": "confirmed" or "dismissed" or "open", "note": "..."}`: a person's decision, with who and when |
 | `GET /api/monitoring/status` | Whether monitoring is on, how many people are watched, how many alerts are open, when each list was last checked |
 | `GET /api/admin/users/{id}/applicants` | Admin: one person's screening history, newest first (`?limit=`, `?offset=`, `X-Total-Count`). Used by the People tab |
-| `POST /api/admin/monitoring/run` | Admin: run the check now. `?force=true` re-screens everyone against every list |
+| `POST /api/admin/monitoring/run` | Admin, or the machine `API_KEY` (the daily workflow): run the check now. `?force=true` re-screens everyone against every list |
 
 **Safe by construction.**
 - A list that could not be loaded is skipped, never read as "the list became empty", and its stored fingerprint is not moved.

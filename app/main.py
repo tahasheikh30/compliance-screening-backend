@@ -48,7 +48,8 @@ Endpoints:
     GET  /api/monitoring/status           monitoring state: people watched, open alerts, last check per list
                                           (monitoring is private to the analyst who ran the screening, admins included)
     GET  /api/admin/users/{id}/applicants (admin) one user's screening history
-    POST /api/admin/monitoring/run        (admin) run the check now (?force=true re-screens everyone)
+    POST /api/admin/monitoring/run        (admin, or the secret API_KEY for the daily workflow) run the check now
+                                          (?force=true re-screens everyone)
     GET  /api/admin/audit                 (admin) who did what, paged; /api/admin/audit/verify checks the hash chain
     GET  /api/health                      unauthenticated liveness check (?deep=true also checks the database)
 """
@@ -1100,9 +1101,14 @@ def monitoring_status(request: Request, user: AuthUser = Depends(require_approve
 
 
 @app.post("/api/admin/monitoring/run")
-@limiter.limit("6/hour")
-def run_monitoring_now(request: Request, force: bool = False, user: AuthUser = Depends(require_admin)):
-    """Run the monitoring check now. `force=true` re-screens every monitored person against every list, changed or not."""
+@limiter.limit("12/hour")
+def run_monitoring_now(request: Request, force: bool = False,
+                       user: AuthUser = Depends(require_admin_or_service_key)):
+    """
+    Run the monitoring check now. `force=true` re-screens every monitored person against every list, changed or not.
+    An administrator can run it from the app; the scheduled workflow calls it every day with the secret API_KEY, which
+    also wakes a server on a free plan that has gone to sleep (a sleeping server checks nothing by itself).
+    """
     _audit(request, user, "monitoring.run_requested", detail={"force": force})
     return monitoring.run_once(force=force)
 

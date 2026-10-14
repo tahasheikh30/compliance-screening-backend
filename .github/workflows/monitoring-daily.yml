@@ -1,0 +1,58 @@
+name: Daily monitoring check
+
+# Makes sure every list is checked for the monitored people at least once a day.
+#
+# The backend also checks by itself in the background, but a server on a free plan goes to sleep when nobody is
+# using it, and a sleeping server checks nothing. This workflow calls the backend once a day: that wakes it and
+# runs the check. A list is only compared with the copy stored last time, so a second run on the same day does no
+# extra screening (and a check that is already running makes this call return "another instance is running").
+#
+# Uses the same two repository secrets as the NACTA workflow (Settings, Secrets and variables, Actions):
+#   SCREENING_API_URL  the backend address, e.g. https://your-service.onrender.com   (no trailing slash, no /api)
+#   SCREENING_API_KEY  the backend's API_KEY
+
+on:
+  schedule:
+    - cron: "30 2 * * *"    # every day, 02:30 UTC (07:30 in Pakistan)
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Run the monitoring check
+        env:
+          SCREENING_API_URL: ${{ secrets.SCREENING_API_URL }}
+          SCREENING_API_KEY: ${{ secrets.SCREENING_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SCREENING_API_URL:-}" ] || [ -z "${SCREENING_API_KEY:-}" ]; then
+            echo "::error::Set the SCREENING_API_URL and SCREENING_API_KEY repository secrets."
+            exit 1
+          fi
+          out="$(mktemp)"
+          # a sleeping free server needs a minute to wake: connection errors and 5xx answers are retried
+          code="$(curl -sS --retry 6 --retry-delay 30 --retry-connrefused --max-time 1800 \
+            -o "$out" -w '%{http_code}' -X POST \
+            -H "X-API-Key: ${SCREENING_API_KEY}" \
+            "${SCREENING_API_URL%/}/api/admin/monitoring/run")"
+          echo "HTTP ${code}"
+          cat "$out"; echo
+          if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+            echo "::error::The backend refused or failed the monitoring check (HTTP ${code})."
+            exit 1
+          fi
+          python3 - "$out" <<'PY'
+          import json, sys
+          s = json.load(open(sys.argv[1]))
+          if not s.get("ran"):
+              print("::notice::Another check was already running, so this call did nothing.")
+          else:
+              print(f"Compared: {', '.join(s.get('checked_sources', [])) or 'nothing'}")
+              print(f"Changed: {', '.join(s.get('changed_sources', [])) or 'none'}; "
+                    f"people re-screened: {s.get('applicants_checked', 0)}; new alerts: {s.get('new_alerts', 0)}")
+              if s.get("unavailable"):
+                  print("::warning::These lists could not be read and were NOT checked today: "
+                        + ", ".join(s["unavailable"]))
+          PY

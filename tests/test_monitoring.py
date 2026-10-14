@@ -288,6 +288,80 @@ def test_admin_can_run_the_check_by_hand_and_users_cannot(client, fake_sources):
     assert forced["forced"] is True and forced["applicants_checked"] == 1
 
 
+def test_the_daily_workflow_can_run_the_check_with_the_machine_key(client, fake_sources):
+    from tests.conftest import SERVICE_HEADERS
+    _screen(client, monitor=True)
+    r = client.post("/api/admin/monitoring/run", headers=SERVICE_HEADERS)
+    assert r.status_code == 200 and r.json()["ran"] is True and r.json()["checked_sources"]
+    # the app key is not a secret and never gets in on its own; neither does an ordinary user or nobody at all
+    assert client.post("/api/admin/monitoring/run", headers={"X-API-Key": "test-app-key"}).status_code in (401, 403)
+    assert client.post("/api/admin/monitoring/run", headers=USER_HEADERS).status_code == 403
+    assert client.post("/api/admin/monitoring/run").status_code in (401, 403)
+    # the run is on the audit trail, as the service
+    entries = client.get("/api/admin/audit?limit=200", headers=API_HEADERS).json()["entries"]
+    assert any(e["action"] == "monitoring.run_requested" and e["actor_email"] == "service" for e in entries)
+
+
+def test_every_list_is_marked_checked_on_every_pass_even_when_nothing_changed(client, fake_sources):
+    _screen(client, monitor=True)
+    monitoring.run_once()
+    with database.pool().connection() as conn:
+        conn.execute("UPDATE monitoring_state SET checked_at = now() - interval '3 days'")
+    before = database.monitoring_state()
+    s = monitoring.run_once()
+    after = database.monitoring_state()
+    assert s["changed_sources"] == [] and s["checked_sources"]
+    for key in s["checked_sources"]:
+        assert after[key]["checked_at"] > before[key]["checked_at"]            # compared today
+        assert after[key]["fingerprint"] == before[key]["fingerprint"]         # nothing else moved
+
+
+def test_a_list_that_could_not_be_read_is_not_marked_as_checked(client, fake_sources):
+    _screen(client, monitor=True)
+    monitoring.run_once()
+    with database.pool().connection() as conn:
+        conn.execute("UPDATE monitoring_state SET checked_at = now() - interval '3 days'")
+    before = database.monitoring_state()
+    fake_sources["fail"].add(loader.UN_URL)                       # outage
+    loader.clear_cache()
+    s = monitoring.run_once()
+    after = database.monitoring_state()
+    assert "UNSC" in s["unavailable"] and "UNSC" not in s["checked_sources"]
+    assert after["UNSC"]["checked_at"] == before["UNSC"]["checked_at"]          # the status page keeps saying so
+    assert all(after[k]["checked_at"] > before[k]["checked_at"] for k in s["checked_sources"])
+
+
+def test_the_loop_retries_sooner_after_a_failed_pass_or_an_unreadable_list(monkeypatch):
+    """A failure is retried in 15 minutes and an unreadable list within the hour, not a whole day later."""
+    outcomes = iter([RuntimeError("the pass blows up"), {"ran": True, "unavailable": ["FIA_REDBOOK"]},
+                     {"ran": True, "unavailable": []}])
+
+    def run(force=False):
+        out = next(outcomes)
+        if isinstance(out, Exception):
+            raise out
+        return out
+
+    class Clock:                                          # records how long the loop was told to wait
+        def __init__(self):
+            self.waits = []
+
+        def wait(self, seconds):
+            self.waits.append(seconds)
+            return len(self.waits) >= 4                  # the 1st wait is the start-up delay
+
+        def is_set(self):
+            return len(self.waits) >= 4
+
+    clock = Clock()
+    monkeypatch.setattr(config, "MONITOR_INTERVAL_SECONDS", 86400.0)
+    monkeypatch.setattr(monitoring, "run_once", run)
+    monkeypatch.setattr(monitoring, "_stop", clock)
+    monitoring._loop()
+    assert clock.waits == [monitoring.INITIAL_DELAY_SECONDS, monitoring.FAILURE_RETRY_SECONDS,
+                           monitoring.UNAVAILABLE_RETRY_SECONDS, 86400.0]
+
+
 def test_applicant_list_shows_who_is_monitored(client):
     _screen(client, "Alpha Person", monitor=True)
     _screen(client, "Beta Person")

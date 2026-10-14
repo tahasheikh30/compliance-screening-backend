@@ -19,6 +19,15 @@ How it works
 * A database lock means only one server instance does the check at a time.
 * A source that could not be loaded is left alone (never treated as "changed to empty"), and a source seen for
   the first time is only recorded: people screened before monitoring existed are checked when they are enrolled.
+* Every list that was read is marked as checked on every pass, changed or not, so "last checked" is honest.
+
+When it runs
+------------
+* A background thread checks every MONITOR_INTERVAL_SECONDS (default once a day), and sooner after a pass that
+  failed (15 minutes) or could not read a list (an hour).
+* A server on a free plan sleeps when nobody uses it, and a sleeping server checks nothing. So a scheduled
+  workflow (.github/workflows/monitoring-daily.yml) also calls POST /api/admin/monitoring/run every day with the
+  machine key. That wakes the server and runs the check; the lock and the fingerprints make a second run harmless.
 
 Adverse media is not part of monitoring: it is a per-person web search that would be repeated for everyone on
 every change, and its hits are unverified leads. Re-screen a person by hand when you want a fresh news check.
@@ -43,6 +52,8 @@ from app.screening.parsers import normalize_cnic, normalize_province
 
 BATCH = 500
 INITIAL_DELAY_SECONDS = 60.0     # let the lists load at start-up before the first check
+FAILURE_RETRY_SECONDS = 900.0    # after a pass that failed outright, try again in 15 minutes
+UNAVAILABLE_RETRY_SECONDS = 3600.0   # after a pass where a list could not be read, try again within the hour
 _LOCK_KEY = db.MONITORING_LOCK   # advisory lock: one instance at a time (all lock keys are listed in app/database.py)
 
 _stop = threading.Event()
@@ -152,9 +163,14 @@ def _run(force: bool) -> dict:
             changed.append(key)
     for key in first_seen:
         db.monitoring_state_put(key, fingerprints[key], 0, 0)
+    # every list that was read and compared today is marked as checked, changed or not (a list that changed is
+    # marked when everyone has been re-screened against it, below)
+    unchanged = [k for k in fingerprints if k in state and k not in changed]
+    db.monitoring_state_touch(unchanged)
 
-    summary = {"ran": True, "forced": force, "changed_sources": changed, "first_seen": first_seen,
-               "unavailable": unavailable, "applicants_checked": 0, "skipped_unscreenable": 0, "new_alerts": 0}
+    summary = {"ran": True, "forced": force, "checked_sources": sorted(fingerprints), "changed_sources": changed,
+               "first_seen": first_seen, "unavailable": unavailable, "applicants_checked": 0,
+               "skipped_unscreenable": 0, "new_alerts": 0}
     if not changed:
         return summary
 
@@ -228,11 +244,16 @@ def _loop() -> None:
     if _stop.wait(INITIAL_DELAY_SECONDS):
         return
     while not _stop.is_set():
+        wait = config.MONITOR_INTERVAL_SECONDS
         try:
-            run_once()
+            summary = run_once()
+            if summary.get("unavailable"):
+                # a list that could not be read is tried again within the hour, not a whole interval later
+                wait = min(wait, UNAVAILABLE_RETRY_SECONDS)
         except Exception:      # a failed pass must never stop monitoring
             logger.exception("Monitoring pass failed; will try again")
-        _stop.wait(config.MONITOR_INTERVAL_SECONDS)
+            wait = min(wait, FAILURE_RETRY_SECONDS)
+        _stop.wait(wait)
 
 
 def start() -> bool:
